@@ -1,0 +1,8 @@
+# Force LF line endings for shell scripts and Go source files regardless of
+# whether they are checked out on Windows. CRLF in entrypoint.sh would break
+# the container ("/usr/bin/env: ‘sh\r’: No such file or directory").
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
