@@ -2342,17 +2342,20 @@
             document.getElementById('statSuccess').textContent = d.successRequests || 0;
             document.getElementById('statFailed').textContent = d.failedRequests || 0;
             document.getElementById('statTokens').textContent = formatNum(d.totalTokens || 0);
-            document.getElementById('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
 
             const total = d.totalRequests || 0;
             const ok = d.successRequests || 0;
             const rate = total > 0 ? (ok / total * 100) : 0;
             document.getElementById('statSuccessRate').textContent = total > 0 ? rate.toFixed(1) + '%' : '-';
 
-            // Prefer server-aggregated quota numbers (added in 1.0.8-A3+) so the
-            // dashboard reflects per-account quota changes every poll without
-            // having to refetch the full account list. Fall back to a client-side
-            // sum when the server is older or accountsData is already loaded.
+            // "Credits Used" reflects what Kiro reports as actually consumed
+            // on the underlying accounts (sum of usageCurrent across all
+            // accounts). This is the number that matches between the original
+            // upstream proxy and any fork running against the same accounts —
+            // it's the only credit metric that's account-true. The proxy's
+            // run-time counter (d.totalCredits) is per-instance and naturally
+            // diverges between forks; we keep it as a fallback if the server
+            // doesn't expose quotaUsed yet.
             let limitSum = 0, currentSum = 0;
             if (typeof d.quotaTotal === 'number' && d.quotaTotal > 0) {
                 limitSum = d.quotaTotal;
@@ -2363,6 +2366,12 @@
                     if (typeof a.usageCurrent === 'number') currentSum += a.usageCurrent;
                 }
             }
+
+            // statCredits = "Credits Used" = quotaUsed (account-true).
+            // Falls back to proxy run-time counter if quota data not loaded yet.
+            const usedDisplay = currentSum > 0 ? currentSum : (d.totalCredits || 0);
+            document.getElementById('statCredits').textContent = usedDisplay.toFixed(1);
+
             document.getElementById('statCreditsTotal').textContent = limitSum > 0 ? limitSum.toFixed(0) : '-';
             const remaining = Math.max(0, limitSum - currentSum);
             const remainingEl = document.getElementById('statCreditsRemaining');
