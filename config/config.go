@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 )
@@ -195,7 +196,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A5"
+const Version = "1.0.8-A6"
 
 var (
 	cfg     *Config
@@ -219,12 +220,18 @@ func Load() error {
 		if os.IsNotExist(err) {
 			// Create default configuration.
 			// Binds to 0.0.0.0 by default for Docker/container compatibility.
+			// Filter toggles default ON so a fresh install Just Works for
+			// Claude Code without the user having to enable them manually.
+			// Existing configs are not modified — only new installs.
 			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
+				Password:              "changeme",
+				Port:                  8080,
+				Host:                  "0.0.0.0",
+				RequireApiKey:         false,
+				Accounts:              []Account{},
+				FilterClaudeCode:      true,
+				FilterEnvNoise:        true,
+				FilterStripBoundaries: true,
 			}
 			return Save()
 		}
@@ -240,13 +247,42 @@ func Load() error {
 }
 
 // Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Uses indented formatting for human readability and writes atomically
+// (temp file + rename) so a crash mid-write cannot leave config.json
+// truncated or empty.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	dir := filepath.Dir(cfgPath)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, ".config.json.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		// Best-effort cleanup if rename fails.
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, cfgPath)
 }
 
 // SetPassword updates the admin password.

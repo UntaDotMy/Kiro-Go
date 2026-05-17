@@ -125,6 +125,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
 
 	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, 0, reasoningCfg)
 
@@ -501,6 +502,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
 
 	finalOutputs := []interface{}{}
 	if reasoningStarted {

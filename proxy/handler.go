@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +39,9 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
+	// Per-account debounce for lazy quota refresh after a request completes.
+	refreshDebounceMu sync.Mutex
+	refreshScheduled  map[string]bool
 }
 
 type thinkingStreamSource int
@@ -233,12 +237,35 @@ func NewHandler() *Handler {
 	return h
 }
 
-// backgroundRefresh 后台定时刷新账户信息
+// Stop signals the background goroutines to terminate. Called from main.go
+// during graceful shutdown so the proxy doesn't leak goroutines or partial
+// config writes.
+func (h *Handler) Stop() {
+	select {
+	case <-h.stopRefresh:
+	default:
+		close(h.stopRefresh)
+	}
+	select {
+	case <-h.stopStatsSaver:
+	default:
+		close(h.stopStatsSaver)
+	}
+	// One last stats flush so the latest counters survive the restart.
+	h.saveStats()
+}
+
+// backgroundRefresh runs a periodic global refresh of every enabled account's
+// quota and the model list. Default cadence is short (5 minutes) so the
+// dashboard's per-account quota numbers are reasonably fresh; per-request
+// lazy refresh (triggerAccountRefresh) provides finer granularity for
+// accounts that are actively used.
 func (h *Handler) backgroundRefresh() {
-	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	// 启动时延迟 10 秒后执行一次
+	// Initial refresh after a small delay so the proxy can start serving
+	// immediately without waiting on upstream account info.
 	time.Sleep(10 * time.Second)
 	h.refreshModelsCache()
 	h.refreshAllAccounts()
@@ -252,6 +279,53 @@ func (h *Handler) backgroundRefresh() {
 			return
 		}
 	}
+}
+
+// triggerAccountRefresh schedules a debounced background quota refresh for a
+// single account. Called from request-completion paths so an account that
+// just served a request gets a fresh usageCurrent within ~30 seconds, while
+// idle accounts only refresh on the global ticker.
+func (h *Handler) triggerAccountRefresh(accountID string) {
+	if accountID == "" {
+		return
+	}
+	h.refreshDebounceMu.Lock()
+	if h.refreshScheduled == nil {
+		h.refreshScheduled = make(map[string]bool)
+	}
+	if h.refreshScheduled[accountID] {
+		h.refreshDebounceMu.Unlock()
+		return
+	}
+	h.refreshScheduled[accountID] = true
+	h.refreshDebounceMu.Unlock()
+
+	go func(id string) {
+		// Debounce: coalesce bursts of requests into a single refresh.
+		select {
+		case <-time.After(30 * time.Second):
+		case <-h.stopRefresh:
+			h.refreshDebounceMu.Lock()
+			delete(h.refreshScheduled, id)
+			h.refreshDebounceMu.Unlock()
+			return
+		}
+
+		h.refreshDebounceMu.Lock()
+		delete(h.refreshScheduled, id)
+		h.refreshDebounceMu.Unlock()
+
+		acc := h.pool.GetByID(id)
+		if acc == nil || !acc.Enabled || acc.AccessToken == "" {
+			return
+		}
+		info, err := RefreshAccountInfo(acc)
+		if err != nil {
+			logger.Debugf("[LazyRefresh] Failed to refresh %s: %v", acc.Email, err)
+			return
+		}
+		_ = config.UpdateAccountInfo(acc.ID, *info)
+	}(accountID)
 }
 
 // refreshAllAccounts 刷新所有账户信息
@@ -318,7 +392,7 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		providedKey = apiKeyHeader
 	}
 
-	return providedKey == expectedKey
+	return subtle.ConstantTimeCompare([]byte(providedKey), []byte(expectedKey)) == 1
 }
 
 // ServeHTTP 路由分发
@@ -1254,6 +1328,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
@@ -1323,6 +1398,11 @@ func (h *Handler) addCredits(credits float64) {
 }
 
 // 统计记录 (使用原子操作)
+// recordSuccess updates the global counters AND triggers a debounced quota
+// refresh for the account that just served the request, so the dashboard
+// reflects new usage within ~30 seconds without waiting for the 5-minute
+// global tick. accountID is optional (passed by the success-path callers
+// that have it).
 func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.successRequests, 1)
@@ -1412,6 +1492,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	responseThinkingContent := rawThinkingContent
@@ -1864,6 +1945,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
 
 	// 发送结束
 	finishReason := "stop"
@@ -1946,6 +2028,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2019,7 +2102,7 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
