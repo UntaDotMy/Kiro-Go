@@ -12,7 +12,7 @@ If this project helps you, a Star would mean a lot.
 
 ## Features
 
-- Anthropic `/v1/messages` & OpenAI `/v1/chat/completions`
+- Anthropic `/v1/messages`, OpenAI `/v1/chat/completions` and `/v1/responses` (Codex CLI)
 - Multi-account pool with round-robin load balancing
 - Auto token refresh, SSE streaming, Web admin panel
 - Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), SSO Token, local cache, credentials JSON
@@ -24,28 +24,30 @@ If this project helps you, a Star would mean a lot.
 ### Docker Compose (Recommended)
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/UntaDotMy/Kiro-Go.git
 cd Kiro-Go
 mkdir -p data
-docker-compose up -d
+docker compose up -d
 ```
+
+By default the compose file maps host port **8989** to container `8080` so this fork can run side-by-side with the upstream image (which uses `8080`). Edit `docker-compose.yml` to change the host port if you prefer.
 
 ### Docker Run
 
 ```bash
 docker run -d \
   --name kiro-go \
-  -p 8080:8080 \
+  -p 8989:8080 \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/quorinex/kiro-go:latest
+  ghcr.io/untadotmy/kiro-go:latest
 ```
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/UntaDotMy/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
@@ -55,20 +57,26 @@ Config is auto-created at `data/config.json`. Mount `/app/data` for persistence.
 
 ## Usage
 
-Open `http://localhost:8080/admin`, log in, add accounts, then call the API:
+Open `http://localhost:8989/admin` (or whichever host port you mapped), log in, add accounts, then call the API:
 
 ```bash
 # Claude
-curl http://localhost:8080/v1/messages \
+curl http://localhost:8989/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-sonnet-4.5","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"claude-sonnet-4-5-20251101","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
 
-# OpenAI
-curl http://localhost:8080/v1/chat/completions \
+# OpenAI Chat Completions
+curl http://localhost:8989/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer any" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
+
+# OpenAI Responses (Codex CLI)
+curl http://localhost:8989/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer any" \
+  -d '{"model":"claude-opus-4-7","input":"Hello!"}'
 ```
 
 ## Thinking Mode

@@ -12,7 +12,7 @@
 
 ## 功能特性
 
-- Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions`
+- Anthropic `/v1/messages`、OpenAI `/v1/chat/completions` 与 `/v1/responses`（Codex CLI）
 - 多账号池轮询负载均衡
 - 自动 Token 刷新、SSE 流式输出、Web 管理面板
 - 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
@@ -24,28 +24,30 @@
 ### Docker Compose（推荐）
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/UntaDotMy/Kiro-Go.git
 cd Kiro-Go
 mkdir -p data
-docker-compose up -d
+docker compose up -d
 ```
+
+默认 compose 文件将主机端口 **8989** 映射到容器内的 `8080`，方便与上游镜像（占用主机 `8080`）并行运行。如需修改主机端口，请编辑 `docker-compose.yml`。
 
 ### Docker 运行
 
 ```bash
 docker run -d \
   --name kiro-go \
-  -p 8080:8080 \
+  -p 8989:8080 \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/quorinex/kiro-go:latest
+  ghcr.io/untadotmy/kiro-go:latest
 ```
 
 ### 源码编译
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/UntaDotMy/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
@@ -55,20 +57,26 @@ go build -o kiro-go .
 
 ## 使用方法
 
-访问 `http://localhost:8080/admin` 登录、添加账号，然后调用 API：
+访问 `http://localhost:8989/admin`（或你映射的主机端口）登录、添加账号，然后调用 API：
 
 ```bash
 # Claude
-curl http://localhost:8080/v1/messages \
+curl http://localhost:8989/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-sonnet-4.5","max_tokens":1024,"messages":[{"role":"user","content":"你好！"}]}'
+  -d '{"model":"claude-sonnet-4-5-20251101","max_tokens":1024,"messages":[{"role":"user","content":"你好！"}]}'
 
-# OpenAI
-curl http://localhost:8080/v1/chat/completions \
+# OpenAI Chat Completions
+curl http://localhost:8989/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer any" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好！"}]}'
+
+# OpenAI Responses（Codex CLI）
+curl http://localhost:8989/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer any" \
+  -d '{"model":"claude-opus-4-7","input":"你好！"}'
 ```
 
 ## 思考模式
