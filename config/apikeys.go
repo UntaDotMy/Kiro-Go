@@ -307,6 +307,99 @@ func FindAPIKeyBySecret(secret string) *APIKey {
 	return nil
 }
 
+// CheckAPIKeyLimit returns (rejected, reason) without committing any usage.
+// Used as a pre-flight gate before the upstream call so an exhausted key is
+// refused with HTTP 429 instead of burning a Kiro account quota slot. This
+// function may roll over per-minute / per-hour / periodic buckets if the
+// window has crossed (which is correct behaviour — the counter starts fresh
+// in the new window), but it never increments any request counter.
+//
+// Token / credit limits are checked against the current totals + 0 because
+// the upstream call hasn't happened yet; the actual values are committed by
+// ConsumeAPIKey on the success path.
+func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.APIKeys {
+		if cfg.APIKeys[i].ID != id {
+			continue
+		}
+		k := &cfg.APIKeys[i]
+		now := time.Now().Unix()
+		if !k.Enabled {
+			return true, "key disabled"
+		}
+		if k.ExpiresAt > 0 && now > k.ExpiresAt {
+			k.Enabled = false
+			_ = Save()
+			return true, "key expired"
+		}
+		if k.LazyExpirySeconds > 0 && k.FirstUsedAt > 0 && now > k.FirstUsedAt+k.LazyExpirySeconds {
+			k.Enabled = false
+			_ = Save()
+			return true, "key expired (lazy)"
+		}
+		if len(k.Models) > 0 && model != "" {
+			allowed := false
+			for _, m := range k.Models {
+				if m == model {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return true, "model '" + model + "' not allowed for this key"
+			}
+		}
+		curMin := minuteBucket(k.ResetTZ)
+		if k.minuteBucketKey != curMin {
+			k.minuteBucketKey = curMin
+			k.MinuteRequests = 0
+		}
+		curHour := hourBucket(k.ResetTZ)
+		if k.hourBucketKey != curHour {
+			k.hourBucketKey = curHour
+			k.HourRequests = 0
+		}
+		if k.MinuteReqLimit > 0 && k.MinuteRequests+1 > k.MinuteReqLimit {
+			return true, "per-minute rate limit reached"
+		}
+		if k.HourReqLimit > 0 && k.HourRequests+1 > k.HourReqLimit {
+			return true, "per-hour rate limit reached"
+		}
+		bucket := periodBucketKey(k.ResetPeriod, k.ResetTZ)
+		if k.CountersDate != bucket {
+			k.CountersDate = bucket
+			k.DailyRequests = 0
+			k.DailyTokens = 0
+			k.DailyCredits = 0
+		}
+		if k.DailyReqLimit > 0 && k.DailyRequests+1 > k.DailyReqLimit {
+			return true, "periodic request limit reached"
+		}
+		if k.LifetimeReqLimit > 0 && k.TotalRequests+1 > k.LifetimeReqLimit {
+			return true, "lifetime request limit reached"
+		}
+		// Token / credit limits checked again on commit with real values; here
+		// we only verify the current totals haven't already crossed the line.
+		if k.DailyTokLimit > 0 && k.DailyTokens >= k.DailyTokLimit {
+			return true, "periodic token limit reached"
+		}
+		if k.DailyCredLimit > 0 && k.DailyCredits >= k.DailyCredLimit {
+			return true, "periodic credit limit reached"
+		}
+		if k.LifetimeTokLimit > 0 && k.TotalTokens >= k.LifetimeTokLimit {
+			return true, "lifetime token limit reached"
+		}
+		if k.LifetimeCredLimit > 0 && k.TotalCredits >= k.LifetimeCredLimit {
+			return true, "lifetime credit limit reached"
+		}
+		_ = Save() // persist any bucket roll-over zeroing
+		return false, ""
+	}
+	return false, ""
+}
+
 // ConsumeAPIKey records request usage against a key's counters and lifetime
 // totals. Order of checks (any failure rejects without consuming):
 //

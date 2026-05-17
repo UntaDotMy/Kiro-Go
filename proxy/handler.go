@@ -454,38 +454,36 @@ func matchedAPIKey(r *http.Request) *config.APIKey {
 	return nil
 }
 
-// ConsumeMatchedAPIKey debits the per-key daily counters for the APIKey that
-// authorised this request. Called from the success path. Returns true if a
-// limit was exceeded (in which case the caller should treat the response as
-// rate-limited; we still record the usage to keep the counter accurate, but
-// signal so the caller can surface 429 next time).
-func (h *Handler) consumeMatchedAPIKey(r *http.Request, model string, tokens int, credits float64) {
-	k := matchedAPIKey(r)
-	if k == nil {
-		return
+// matchedAPIKeyID returns the id of the key that authenticated this request,
+// or "" if unauthenticated / using the legacy permissive fallback.
+func matchedAPIKeyID(r *http.Request) string {
+	if k, ok := r.Context().Value(apiKeyCtxKey{}).(*config.APIKey); ok && k != nil {
+		return k.ID
 	}
-	_, _ = config.ConsumeAPIKey(k.ID, tokens, credits, model)
+	return ""
 }
 
-// preflightAPIKey checks before the upstream call whether the matched key has
-// already exhausted any of its daily limits. Returns (false, "") to proceed,
-// or (true, reason) to refuse with 429 immediately.
-func (h *Handler) preflightAPIKey(r *http.Request, model string) (bool, string) {
+// enforceAPIKeyLimit is the pre-flight gate: if the request was authenticated
+// by a multi-key entry, run CheckAPIKeyLimit before we burn upstream quota.
+// Returns true when the request was rejected (429 already written).
+func (h *Handler) enforceAPIKeyLimit(w http.ResponseWriter, r *http.Request, model string) bool {
 	k := matchedAPIKey(r)
 	if k == nil {
-		return false, ""
+		return false
 	}
-	// Use a no-op consume (zero tokens / credits) to surface model-whitelist
-	// or already-exceeded request-count rejection without recording anything.
-	rejected, reason := config.ConsumeAPIKey(k.ID, 0, 0, model)
-	if rejected {
-		return true, reason
+	rejected, reason := config.CheckAPIKeyLimit(k.ID, model)
+	if !rejected {
+		return false
 	}
-	// The 0,0 consume already incremented DailyRequests. We need to undo that
-	// but ConsumeAPIKey commits unconditionally. Workaround: add a separate
-	// path that only checks. For now accept the small overcount: each request
-	// counts as +1 even if upstream fails. A future patch can split.
-	return false, ""
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"type":    "rate_limit_error",
+			"message": "API key limit reached: " + reason,
+		},
+	})
+	return true
 }
 
 // ServeHTTP 路由分发
@@ -993,6 +991,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
+
+	// Per-key pre-flight gate. If the matched API key is exhausted on any
+	// dimension (rate, periodic, lifetime, expiry), reject with 429 BEFORE
+	// we burn an upstream Kiro account quota slot.
+	if h.enforceAPIKeyLimit(w, r, req.Model) {
 		return
 	}
 
@@ -1675,6 +1680,11 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if msg := validateOpenAIRequestShape(&req); msg != "" {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
+		return
+	}
+
+	// Per-key pre-flight gate (see handleClaude).
+	if h.enforceAPIKeyLimit(w, r, req.Model) {
 		return
 	}
 

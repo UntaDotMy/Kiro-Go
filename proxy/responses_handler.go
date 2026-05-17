@@ -34,6 +34,11 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		req.Model = "claude-sonnet-4.5"
 	}
 
+	if h.enforceAPIKeyLimit(w, r, req.Model) {
+		return
+	}
+	apiKeyID := matchedAPIKeyID(r)
+
 	// Translate to Claude shape, then run the same pipeline as /v1/messages.
 	claudeReq := ResponsesToClaudeRequest(&req)
 
@@ -67,15 +72,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		h.handleResponsesStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning)
+		h.handleResponsesStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
 	} else {
-		h.handleResponsesNonStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning)
+		h.handleResponsesNonStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
 	}
 }
 
 // handleResponsesNonStream blocks until upstream is done, then returns one
 // JSON Responses payload.
-func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason) {
+func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
 	var content, reasoning string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
@@ -100,7 +105,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.recordFailure(model, "")
+		h.recordFailure(model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		h.sendResponsesError(w, 500, "server_error", err.Error())
@@ -122,11 +127,12 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	}
 	outputTokens = estimateClaudeOutputTokens(finalContent, reasoning, toolUses)
 
-	h.recordSuccess(model, "", inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	recordModelUsage(model, inputTokens+outputTokens, credits)
+	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
 	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, 0, reasoningCfg)
 
@@ -151,7 +157,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 // Reasoning, when present, is emitted as a separate output_item BEFORE the
 // message item, with reasoning_summary_text deltas. Function calls are emitted
 // as their own output_items with function_call_arguments deltas.
-func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason) {
+func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -468,7 +474,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.recordFailure(model, "")
+		h.recordFailure(model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		// Emit failure events Codex understands.
@@ -500,11 +506,12 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	}
 	outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
 
-	h.recordSuccess(model, "", inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	recordModelUsage(model, inputTokens+outputTokens, credits)
+	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
 	finalOutputs := []interface{}{}
 	if reasoningStarted {

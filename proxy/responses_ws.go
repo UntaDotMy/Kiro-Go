@@ -88,6 +88,17 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		req.Model = "claude-sonnet-4.5"
 	}
 
+	apiKeyID := matchedAPIKeyID(r)
+	if apiKeyID != "" {
+		if rejected, reason := config.CheckAPIKeyLimit(apiKeyID, req.Model); rejected {
+			_ = conn.WriteJSON(map[string]interface{}{
+				"event": "error",
+				"data": map[string]interface{}{"type": "rate_limit_error", "message": "API key limit reached: " + reason},
+			})
+			return
+		}
+	}
+
 	claudeReq := ResponsesToClaudeRequest(&req)
 	thinkingCfg := config.GetThinkingConfig()
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
@@ -175,7 +186,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
-		h.recordFailure(req.Model, "")
+		h.recordFailure(req.Model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
@@ -191,11 +202,12 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	if outputTokens <= 0 {
 		outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
 	}
-	h.recordSuccess(req.Model, "", inputTokens, outputTokens, credits)
+	h.recordSuccess(req.Model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	recordModelUsage(req.Model, inputTokens+outputTokens, credits)
+	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model) }
 
 	send("response.completed", map[string]interface{}{
 		"type":            "response.completed",
