@@ -520,9 +520,16 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 	}
 	result["cache_creation_input_tokens"] = usage.CacheCreationInputTokens
 	result["cache_read_input_tokens"] = usage.CacheReadInputTokens
-	result["cache_creation"] = map[string]int{
-		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
-		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
+	// Per Anthropic prompt-caching docs, the cache_creation envelope is only
+	// meaningful when at least one breakpoint passed the cacheable-tokens
+	// floor. Emitting it with all-zero values previously confused some
+	// SDK consumers that expected the field to be absent when no caching
+	// happened on this call.
+	if usage.CacheCreation5mInputTokens > 0 || usage.CacheCreation1hInputTokens > 0 {
+		result["cache_creation"] = map[string]int{
+			"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
+			"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
+		}
 	}
 	return result
 }

@@ -198,7 +198,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A17"
+const Version = "1.0.8-A18"
 
 var (
 	cfg     *Config
@@ -342,12 +342,6 @@ func SetPassword(password string) {
 	cfg.Password = password
 }
 
-func Get() *Config {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	return cfg
-}
-
 func GetPassword() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -476,21 +470,6 @@ func IsApiKeyRequired() bool {
 	return cfg.RequireApiKey
 }
 
-func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.ApiKey = apiKey
-	cfg.RequireApiKey = requireApiKey
-	if password != "" {
-		cfg.Password = password
-	}
-	return Save()
-}
-
-// UpdateSettingsPartial applies a patch — fields left nil are not changed.
-// Used by the admin /api/settings PUT so the dashboard can save individual
-// toggles (e.g. only the over-usage flag, only the password) without
-// clobbering the rest of the auth state.
 func UpdateSettingsPartial(apiKey *string, requireApiKey *bool, password *string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -777,13 +756,6 @@ func GetLogLevel() string {
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.
-func UpdateLogLevel(level string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.LogLevel = level
-	return Save()
-}
-
 type KiroClientConfig struct {
 	KiroVersion   string
 	SystemVersion string

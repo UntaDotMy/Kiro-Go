@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -123,30 +124,12 @@ func periodBucketKey(period, tz string) string {
 	case "weekly":
 		// ISO week: year-Wweekno.
 		year, week := now.ISOWeek()
-		return formatYearWeek(year, week)
+		return fmt.Sprintf("%04d-W%02d", year, week)
 	case "monthly":
 		return now.Format("2006-01")
 	default: // "daily" or ""
 		return now.Format("2006-01-02")
 	}
-}
-
-func formatYearWeek(year, week int) string {
-	// time has no native year-week formater — manual zero-padding.
-	if week < 10 {
-		return formatYearAndPaddedWeek(year, week)
-	}
-	return formatYearAndPaddedWeek(year, week)
-}
-
-func formatYearAndPaddedWeek(year, week int) string {
-	const digits = "0123456789"
-	w := []byte{digits[(week/10)%10], digits[week%10]}
-	y := []byte{
-		digits[(year/1000)%10], digits[(year/100)%10],
-		digits[(year/10)%10], digits[year%10],
-	}
-	return string(y) + "-W" + string(w)
 }
 
 // minuteBucket / hourBucket return integer keys identifying the current

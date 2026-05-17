@@ -252,9 +252,9 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
 	// 启动后台刷新
-	go h.backgroundRefresh()
+	safeGo("backgroundRefresh", h.backgroundRefresh)
 	// 启动后台统计保存 (每30秒保存一次)
-	go h.backgroundStatsSaver()
+	safeGo("backgroundStatsSaver", h.backgroundStatsSaver)
 	return h
 }
 
@@ -321,7 +321,7 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 	h.refreshScheduled[accountID] = true
 	h.refreshDebounceMu.Unlock()
 
-	go func(id string) {
+	safeGoArg("triggerAccountRefresh", accountID, func(id string) {
 		// Debounce: coalesce bursts of requests into a single refresh.
 		select {
 		case <-time.After(30 * time.Second):
@@ -346,7 +346,7 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 			return
 		}
 		_ = config.UpdateAccountInfo(acc.ID, *info)
-	}(accountID)
+	})
 }
 
 // refreshAllAccounts 刷新所有账户信息
@@ -500,6 +500,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Debug-level request trace for fine-grained visibility
 	logger.Debugf("[HTTP] %s %s from %s", r.Method, path, r.RemoteAddr)
+
+	// Request correlation id — use the client's X-Request-ID if present,
+	// otherwise generate one. Anthropic's docs require this header on every
+	// response; LiteLLM and many SDKs surface it in errors for support
+	// triage. Echoed in our own error envelopes via setRequestID helper.
+	reqID := r.Header.Get("X-Request-ID")
+	if reqID == "" {
+		reqID = "req_" + uuid.New().String()
+	}
+	w.Header().Set("X-Request-ID", reqID)
+	w.Header().Set("Request-Id", reqID)
 
 	// CORS - 完整的头部支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -2178,10 +2189,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
+	// OpenAI's documented error envelope includes both `code` and `param`.
+	// SDKs (langchain, openai-python, litellm) inspect them for retry / tool
+	// validation logic, so we surface them even when they're nil.
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]interface{}{
 			"type":    errType,
 			"message": message,
+			"code":    nil,
+			"param":   nil,
 		},
 	})
 }

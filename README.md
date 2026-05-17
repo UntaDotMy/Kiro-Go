@@ -101,6 +101,23 @@ The setting takes effect immediately without restarting.
 | `DATA_DIR` | (entrypoint) Path to chown to runtime UID/GID before drop | `/app/data` |
 | `RUN_UID` / `RUN_GID` | (entrypoint) UID/GID to drop privileges to | `1000` / `1000` |
 
+## Backup and restore
+
+Two files in `data/` carry all state:
+
+- `data/config.json` — accounts, OAuth tokens, API keys, every setting. **Treat as a secret.** File mode 0600 is enforced on save.
+- `data/stats.db` — persistent usage history (SQLite WAL). Safe to lose; the proxy will recreate it.
+
+For a hot backup, just copy the directory while the service is running. SQLite's WAL plus our atomic `temp + rename` save mean you'll get a consistent snapshot 99 % of the time. For a guaranteed-consistent snapshot, stop the container first:
+
+```bash
+docker stop kiro-go-patch
+cp -r ./data ./data.backup-$(date +%F)
+docker start kiro-go-patch
+```
+
+Restore is symmetric: stop, replace `data/`, start. Container UID 1000 must own the files (the entrypoint chowns on first start).
+
 ## Contributing
 
 Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
