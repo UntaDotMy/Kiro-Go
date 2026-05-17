@@ -197,7 +197,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A11"
+const Version = "1.0.8-A12"
 
 var (
 	cfg     *Config
@@ -244,6 +244,24 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// Auto-migrate the legacy single-key field into the multi-key list so the
+	// dashboard's "API Keys" tab is the single source of truth. Triggers only
+	// when ApiKey is set AND APIKeys is empty (i.e. existing users coming up
+	// from a pre-A7 config). Idempotent on subsequent restarts.
+	if cfg.ApiKey != "" && len(cfg.APIKeys) == 0 {
+		cfg.APIKeys = []APIKey{{
+			ID:        generateAPIKeyID(),
+			Name:      "legacy",
+			Key:       cfg.ApiKey,
+			Enabled:   true,
+			CreatedAt: 0,
+		}}
+		// Keep cfg.ApiKey populated for backward-compat clients that read
+		// /admin/api/settings.apiKey, but it now mirrors APIKeys[0] rather
+		// than being the only source.
+		_ = Save()
+	}
 	return nil
 }
 
