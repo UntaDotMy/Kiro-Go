@@ -150,24 +150,23 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 	}
 }
 
-func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *testing.T) {
+func TestCloneClaudeRequestForThinkingNoLongerInjectsEnvelope(t *testing.T) {
 	req := &ClaudeRequest{
 		Model:  "claude-sonnet-4.6",
 		System: "Follow the user instructions.",
 	}
 
 	cloned := cloneClaudeRequestForThinking(req, true)
-	blocks, ok := cloned.System.([]interface{})
-	if !ok {
-		t.Fatalf("expected cloned system prompt to be structured blocks, got %T", cloned.System)
+	if cloned == req {
+		t.Fatalf("expected a clone, got the same pointer")
 	}
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
-	}
-	gotPrompt := extractSystemPrompt(cloned.System)
-	expected := ThinkingModePrompt + "\n\nFollow the user instructions."
-	if gotPrompt != expected {
-		t.Fatalf("expected injected system prompt %q, got %q", expected, gotPrompt)
+	// The clone must NOT prepend any thinking-mode envelope to the system
+	// prompt. Earlier revisions added "<thinking_mode>..." or natural-prose
+	// token-budget directives; both were fingerprinted by the upstream model
+	// as fake harness signals.
+	got := extractSystemPrompt(cloned.System)
+	if got != "Follow the user instructions." {
+		t.Fatalf("expected system prompt to be unchanged after clone, got %q", got)
 	}
 	if original, ok := req.System.(string); !ok || original != "Follow the user instructions." {
 		t.Fatalf("expected original request system prompt to stay unchanged, got %#v", req.System)
@@ -194,24 +193,25 @@ func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing
 	if !ok {
 		t.Fatalf("expected structured system blocks, got %T", cloned.System)
 	}
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
+	// No injection: the cloned slice should pass through the original blocks
+	// unchanged (cache_control intact).
+	if len(blocks) != 1 {
+		t.Fatalf("expected exactly 1 system block (no injection), got %d", len(blocks))
 	}
 	first, ok := blocks[0].(map[string]interface{})
-	if !ok || first["text"] != ThinkingModePrompt+"\n" {
-		t.Fatalf("expected first block to be thinking prompt, got %#v", blocks[0])
-	}
-	second, ok := blocks[1].(map[string]interface{})
 	if !ok {
-		t.Fatalf("expected original system block to remain a map, got %T", blocks[1])
+		t.Fatalf("expected original system block to remain a map, got %T", blocks[0])
 	}
-	cacheControl, ok := second["cache_control"].(map[string]interface{})
+	if first["text"] != "cached system" {
+		t.Fatalf("expected original block text to be preserved, got %#v", first["text"])
+	}
+	cacheControl, ok := first["cache_control"].(map[string]interface{})
 	if !ok || cacheControl["type"] != "ephemeral" {
-		t.Fatalf("expected original cache_control to be preserved, got %#v", second["cache_control"])
+		t.Fatalf("expected original cache_control to be preserved, got %#v", first["cache_control"])
 	}
 }
 
-func TestThinkingPromptAffectsClaudeTokenEstimate(t *testing.T) {
+func TestThinkingFlagDoesNotInflateClaudeTokenEstimate(t *testing.T) {
 	req := &ClaudeRequest{
 		Model:    "claude-sonnet-4.6",
 		Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
@@ -220,8 +220,9 @@ func TestThinkingPromptAffectsClaudeTokenEstimate(t *testing.T) {
 	baseTokens := estimateClaudeRequestInputTokens(req)
 	thinkingTokens := estimateClaudeRequestInputTokens(cloneClaudeRequestForThinking(req, true))
 
-	if thinkingTokens <= baseTokens {
-		t.Fatalf("expected thinking tokens (%d) to exceed base tokens (%d)", thinkingTokens, baseTokens)
+	// thinking flag is now a no-op for the input shape; tokens must match.
+	if thinkingTokens != baseTokens {
+		t.Fatalf("expected thinking tokens (%d) to equal base tokens (%d) after no-op clone", thinkingTokens, baseTokens)
 	}
 }
 

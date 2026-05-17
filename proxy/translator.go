@@ -42,14 +42,28 @@ var modelMapOrdered = []modelMapping{
 	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
 }
 
-// ThinkingModePrompt is plain-prose guidance prepended to the system prompt
-// when thinking mode is on. It deliberately avoids tag-shaped envelopes
-// (e.g. <thinking_mode>...</thinking_mode>) so the upstream model does not
-// fingerprint it as a synthetic harness signal and surface "envelope artifact"
-// commentary back to the user.
-const ThinkingModePrompt = `Reason carefully step by step before answering complex requests. You may use up to 200000 tokens of internal deliberation when needed.`
+// Thinking mode no longer injects any envelope into the system prompt.
+//
+// Earlier revisions added "<thinking_mode>...</thinking_mode>" tags or
+// natural-prose token-budget directives to cue the upstream model. Both
+// shapes were correctly identified by Claude as fake harness signals (no
+// real Anthropic / Bedrock API exposes a token budget inside the system
+// prompt — the budget is a request-level "thinking.budget_tokens" field that
+// Kiro's payload doesn't accept).
+//
+// The "-thinking" suffix and the request "thinking" config still flag the
+// proxy's response-side parsing (extractThinkingFromContent / reasoning_content
+// stream callback / OpenAI thinking format) so that any reasoning the model
+// emits via <think> tags or reasoning events is surfaced correctly. We just
+// no longer prepend a synthetic cue.
 
-const minimalFallbackUserContent = "."
+// minimalFallbackUserContent is the placeholder used when the user-facing
+// content of a turn is empty (e.g. only structured tool results). Earlier
+// revisions used "." which the upstream model recognized as a synthetic
+// filler period and called out. Empty string lets the structured fields
+// (UserInputMessageContext.ToolResults, Images) carry the meaning without
+// the model seeing a lone period as input.
+const minimalFallbackUserContent = ""
 
 // ParseModelAndThinking 解析模型名称，返回实际模型和是否启用 thinking
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
@@ -297,43 +311,68 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 }
 
 func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+	// Note: `thinking` is intentionally unused for input shaping. Reasoning is
+	// surfaced response-side (extractThinkingFromContent + reasoning_content
+	// callbacks); we no longer inject a system-prompt cue.
+	_ = thinking
 	systemPrompt := extractSystemPrompt(system)
-	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
-		return systemPrompt
-	}
-	if systemPrompt == "" {
-		return ThinkingModePrompt
-	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return applySystemPromptFilters(systemPrompt)
 }
 
-// applyPromptFilters applies all enabled prompt filter rules to the system prompt.
-// Order: (1) Claude Code detection → full replacement, (2) strip boundary markers,
-// (3) strip env noise, (4) user-defined regex/line-filter rules.
-func applyPromptFilters(prompt string) string {
+// applySystemPromptFilters runs the full filter chain on a system prompt:
+//
+//  1. Detect Claude Code CLI system prompt -> replace with claudeCodeBackendPrompt
+//     (gated by FilterClaudeCode toggle).
+//  2. Strip "--- SYSTEM PROMPT ---" boundary markers (gated by FilterStripBoundaries).
+//  3. Strip environment-noise lines and <system-reminder> blocks (gated by FilterEnvNoise).
+//  4. Apply user-defined regex / line-filter rules.
+//
+// Use this only on the system prompt. For user-message text use
+// applyUserMessageFilters which deliberately skips step 1 (we must never
+// replace the user's actual question with the proxy's backend prompt).
+func applySystemPromptFilters(prompt string) string {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return ""
 	}
 
 	// 1. Detect Claude Code CLI system prompt → replace with minimal backend prompt.
-	//    Run before other filters so we don't waste time stripping a prompt we'll replace anyway.
 	if config.GetFilterClaudeCode() && isClaudeCodeSystemPrompt(prompt) {
 		return claudeCodeBackendPrompt
 	}
 
-	// 2. Strip --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- boundary markers.
+	return applySharedFilters(prompt)
+}
+
+// applyUserMessageFilters runs only the noise-stripping subset of the filter
+// chain, so a user message that happens to look like a Claude Code system
+// prompt (e.g. when the user asks Claude to review a system prompt) does not
+// get its content replaced with the backend prompt. Strips:
+//
+//   - <system-reminder>...</system-reminder> blocks injected by Claude Code 2.x
+//   - x-anthropic-billing-header lines
+//   - "--- SYSTEM PROMPT ---" boundary markers (when FilterStripBoundaries is on)
+//   - ## Environment / ## auto memory sections (when FilterEnvNoise is on)
+//   - User-defined regex / line-filter rules
+//
+// It does NOT replace the prompt with claudeCodeBackendPrompt.
+func applyUserMessageFilters(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return ""
+	}
+	return applySharedFilters(prompt)
+}
+
+// applySharedFilters runs the noise-strip and user-rule steps shared between
+// system-prompt and user-message filtering.
+func applySharedFilters(prompt string) string {
 	if config.GetFilterStripBoundaries() {
 		prompt = stripBoundaryMarkers(prompt)
 	}
-
-	// 3. Strip environment metadata lines (git status, env sections, etc.).
 	if config.GetFilterEnvNoise() {
 		prompt = stripEnvNoiseLines(prompt)
 	}
-
-	// 4. User-defined rules (regex find/replace or line-level substring filter).
 	rules := config.GetPromptFilterRules()
 	for _, rule := range rules {
 		if !rule.Enabled || prompt == "" {
@@ -341,8 +380,14 @@ func applyPromptFilters(prompt string) string {
 		}
 		prompt = applyFilterRule(prompt, rule)
 	}
-
 	return strings.TrimSpace(prompt)
+}
+
+// applyPromptFilters is retained as a backward-compatible alias for the
+// system-prompt filter chain. New code should call applySystemPromptFilters
+// or applyUserMessageFilters explicitly.
+func applyPromptFilters(prompt string) string {
+	return applySystemPromptFilters(prompt)
 }
 
 // applyFilterRule applies a single user-defined filter rule.
@@ -593,75 +638,18 @@ func collapseBlankLines(s string) string {
 	return strings.Join(out, "\n")
 }
 
+// cloneClaudeRequestForThinking returns a shallow clone of req. It used to
+// prepend a thinking-mode envelope when thinking was on; that injection has
+// been removed (the upstream model fingerprinted it as a fake harness signal),
+// so this function is now a near no-op kept for API compatibility with the
+// callers that use the cloned struct for token estimation / cache profiling.
 func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeRequest {
 	if req == nil {
 		return nil
 	}
-
+	_ = thinking
 	cloned := *req
-	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
-	}
 	return &cloned
-}
-
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
-	if hasClaudeSystemContent(system) {
-		thinkingText += "\n"
-	}
-	thinkingBlock := map[string]interface{}{
-		"type": "text",
-		"text": thinkingText,
-	}
-
-	switch v := system.(type) {
-	case nil:
-		return []interface{}{thinkingBlock}
-	case string:
-		if v == "" {
-			return []interface{}{thinkingBlock}
-		}
-		return []interface{}{
-			thinkingBlock,
-			map[string]interface{}{
-				"type": "text",
-				"text": v,
-			},
-		}
-	case []interface{}:
-		blocks := make([]interface{}, 0, len(v)+1)
-		blocks = append(blocks, thinkingBlock)
-		blocks = append(blocks, v...)
-		return blocks
-	case []string:
-		blocks := make([]interface{}, 0, len(v)+1)
-		blocks = append(blocks, thinkingBlock)
-		for _, block := range v {
-			blocks = append(blocks, map[string]interface{}{
-				"type": "text",
-				"text": block,
-			})
-		}
-		return blocks
-	default:
-		return []interface{}{thinkingBlock}
-	}
-}
-
-func hasClaudeSystemContent(system interface{}) bool {
-	switch v := system.(type) {
-	case nil:
-		return false
-	case string:
-		return v != ""
-	case []interface{}:
-		return len(v) > 0
-	case []string:
-		return len(v) > 0
-	default:
-		return true
-	}
 }
 
 func extractSystemPrompt(system interface{}) string {
@@ -691,7 +679,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 	var toolResults []KiroToolResult
 
 	if s, ok := content.(string); ok {
-		return applyPromptFilters(s), nil, nil
+		return applyUserMessageFilters(s), nil, nil
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -705,7 +693,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			switch blockType {
 			case "text", "input_text":
 				if t, ok := block["text"].(string); ok {
-					text += applyPromptFilters(t)
+					text += applyUserMessageFilters(t)
 				}
 			case "image", "image_url", "input_image":
 				if img := extractImageFromClaudeBlock(block); img != nil {
@@ -1079,12 +1067,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// Run the same filter chain Claude requests use, so OpenAI-shaped clients
 	// (Roo/Cline/Continue/etc. wrapping Claude Code) get the same protection.
-	systemPrompt = applyPromptFilters(systemPrompt)
+	systemPrompt = applySystemPromptFilters(systemPrompt)
 
-	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
-	}
+	// thinking flag no longer alters the outbound system prompt; the proxy
+	// surfaces reasoning response-side.
+	_ = thinking
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -1230,7 +1217,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 	if s, ok := content.(string); ok {
-		return applyPromptFilters(s), nil
+		return applyUserMessageFilters(s), nil
 	}
 
 	var text string
@@ -1238,7 +1225,7 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 
 	if part, ok := content.(map[string]interface{}); ok {
 		if t, ok := extractOpenAITextPart(part); ok {
-			text += applyPromptFilters(t)
+			text += applyUserMessageFilters(t)
 		}
 		if img := extractImageFromOpenAIPart(part); img != nil {
 			images = append(images, *img)
@@ -1253,7 +1240,7 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 			}
 
 			if t, ok := extractOpenAITextPart(part); ok {
-				text += applyPromptFilters(t)
+				text += applyUserMessageFilters(t)
 			}
 			if img := extractImageFromOpenAIPart(part); img != nil {
 				images = append(images, *img)
