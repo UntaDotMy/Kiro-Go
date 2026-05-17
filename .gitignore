@@ -1,0 +1,20 @@
+# Build artifacts
+kiro-go
+kiro-go.exe
+*.exe
+*.test
+*.out
+
+# Runtime data (config, accounts, stats, logs)
+data/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Go workspace
+go.work
+go.work.sum

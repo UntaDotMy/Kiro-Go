@@ -232,7 +232,14 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建最终内容
 	finalContent := ""
 	if systemPrompt != "" {
-		finalContent = "--- SYSTEM PROMPT ---\n" + systemPrompt + "\n--- END SYSTEM PROMPT ---\n\n"
+		// When the user has FilterStripBoundaries enabled, drop the outbound
+		// "--- SYSTEM PROMPT ---" wrap entirely (otherwise the proxy was
+		// re-emitting the very markers the toggle is supposed to remove).
+		if config.GetFilterStripBoundaries() {
+			finalContent = systemPrompt + "\n\n"
+		} else {
+			finalContent = "--- SYSTEM PROMPT ---\n" + systemPrompt + "\n--- END SYSTEM PROMPT ---\n\n"
+		}
 	}
 	if currentContent != "" {
 		finalContent += currentContent
@@ -372,10 +379,72 @@ func stripBoundaryMarkers(prompt string) string {
 	return strings.TrimSpace(strings.Join(out, "\n"))
 }
 
-// stripEnvNoiseLines removes environment metadata lines and sections from a system prompt.
-// Strips: # Environment / # auto memory sections, gitStatus lines, fast_mode_info tags,
-// recent commits, knowledge cutoff notices, and similar Claude Code CLI injected noise.
+// systemReminderBlockRe matches a full <system-reminder>...</system-reminder>
+// block, including any whitespace/newlines inside. Claude Code 2.x injects these
+// into both the system prompt and the first user message; the contents
+// (deferred-tool catalog, skills index, currentDate, auto memory, environment,
+// etc.) are exactly what trips Kiro / Bedrock content moderation.
+var systemReminderBlockRe = regexp.MustCompile(`(?is)<system-reminder>.*?</system-reminder>`)
+
+// billingHeaderLineRe matches the Claude Code attribution line in any position
+// (line start, indented, quoted, embedded). Bedrock rejects this string with
+// 400 "x-anthropic-billing-header is a reserved keyword and may not be used in
+// the system prompt", so it must be removed wherever it appears.
+var billingHeaderLineRe = regexp.MustCompile(`(?im)^[ \t>"']*x-anthropic-billing-header:[^\n]*\n?`)
+var billingHeaderInlineRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^\n]*`)
+
+// claudeCodeNoisySectionPrefixes lists heading lines whose entire section
+// (until the next heading at the same or higher level) should be dropped.
+// Match is case-insensitive and tolerates one or two leading hashes.
+var claudeCodeNoisySectionPrefixes = []string{
+	"# environment",
+	"## environment",
+	"# auto memory",
+	"## auto memory",
+	"# session-specific guidance",
+	"## session-specific guidance",
+}
+
+// isNoisySectionHeading reports whether a heading line begins a section that
+// should be skipped. Returns true for "# Environment", "## Environment",
+// "# auto memory", "## auto memory", etc.
+func isNoisySectionHeading(trimmed string) bool {
+	lower := strings.ToLower(trimmed)
+	for _, p := range claudeCodeNoisySectionPrefixes {
+		if lower == p || strings.HasPrefix(lower, p+" ") || strings.HasPrefix(lower, p+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// isAnyHeading reports whether a line is a markdown heading at any level
+// (used to terminate a noisy section skip).
+func isAnyHeading(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "# ") || strings.HasPrefix(trimmed, "## ") ||
+		strings.HasPrefix(trimmed, "### ") || strings.HasPrefix(trimmed, "#### ")
+}
+
+// stripEnvNoiseLines removes environment metadata lines and sections from a
+// system prompt or user-message text block.
+//
+// Strips:
+//   - <system-reminder>...</system-reminder> blocks (entire block, multiline)
+//   - x-anthropic-billing-header: ... lines (Bedrock reserved keyword)
+//   - # Environment / ## Environment / # auto memory / ## auto memory sections
+//   - # session-specific guidance / ## session-specific guidance sections
+//   - gitStatus, Recent commits, knowledge cutoff, fast_mode_info, etc.
+//   - Various inline "Claude Code" identity markers
 func stripEnvNoiseLines(prompt string) string {
+	// 1. Block-level: drop whole <system-reminder>...</system-reminder> blocks.
+	prompt = systemReminderBlockRe.ReplaceAllString(prompt, "")
+
+	// 2. Line-level: drop the Bedrock reserved keyword wherever it appears,
+	//    even if Claude Code emits it indented or wrapped.
+	prompt = billingHeaderLineRe.ReplaceAllString(prompt, "")
+	prompt = billingHeaderInlineRe.ReplaceAllString(prompt, "")
+
+	// 3. Walk remaining lines and skip noisy sections + individual lines.
 	lines := strings.Split(prompt, "\n")
 	out := make([]string, 0, len(lines))
 	skipSection := false
@@ -383,13 +452,12 @@ func stripEnvNoiseLines(prompt string) string {
 		trimmed := strings.TrimSpace(line)
 		lower := strings.ToLower(trimmed)
 
-		// Skip well-known noisy top-level sections until the next heading.
-		if trimmed == "# Environment" || trimmed == "# auto memory" {
+		if isNoisySectionHeading(trimmed) {
 			skipSection = true
 			continue
 		}
 		if skipSection {
-			if strings.HasPrefix(trimmed, "# ") {
+			if isAnyHeading(trimmed) {
 				skipSection = false
 				// fall through — include the new heading
 			} else {
@@ -401,14 +469,26 @@ func stripEnvNoiseLines(prompt string) string {
 		if strings.HasPrefix(trimmed, "gitStatus:") ||
 			strings.HasPrefix(trimmed, "Recent commits:") ||
 			strings.HasPrefix(trimmed, "Assistant knowledge cutoff") ||
-			strings.HasPrefix(trimmed, "x-anthropic-billing-header:") ||
 			strings.HasPrefix(trimmed, "<fast_mode_info>") ||
 			strings.HasPrefix(trimmed, "</fast_mode_info>") ||
+			strings.HasPrefix(trimmed, "<command-name>") ||
+			strings.HasPrefix(trimmed, "<command-message>") ||
+			strings.HasPrefix(trimmed, "<command-args>") ||
+			strings.HasPrefix(trimmed, "<env>") ||
+			strings.HasPrefix(trimmed, "</env>") ||
+			strings.HasPrefix(trimmed, "<cwd>") ||
+			strings.HasPrefix(trimmed, "<git>") ||
+			strings.HasPrefix(trimmed, "<is_directory>") ||
+			strings.HasPrefix(trimmed, "<platform>") ||
+			strings.HasPrefix(trimmed, "<os_version>") ||
 			strings.Contains(lower, "you are claude code") ||
+			strings.Contains(lower, "anthropic's official cli") ||
 			strings.Contains(trimmed, ".claude/projects/") ||
 			strings.Contains(trimmed, "git status at the start of the conversation") ||
 			strings.Contains(trimmed, "has been invoked in the following environment") ||
-			strings.Contains(trimmed, "powered by the model named") {
+			strings.Contains(lower, "powered by the model named") ||
+			strings.Contains(lower, "the most recent claude model family") ||
+			strings.Contains(lower, "fast mode for claude code") {
 			continue
 		}
 
@@ -426,15 +506,32 @@ Keep responses concise and actionable.`
 
 // isClaudeCodeSystemPrompt returns true when the prompt matches ≥2 characteristic
 // markers of the Claude Code CLI built-in system prompt.
+//
+// Markers cover both the legacy v1.x prompt shape (# Doing tasks / # Tone and style)
+// and the current v2.x shape (# Harness / ## Session-specific guidance / ## auto memory
+// / ## Environment / x-anthropic-billing-header / Powered by the model named).
 func isClaudeCodeSystemPrompt(prompt string) bool {
 	lower := strings.ToLower(prompt)
 	markers := []string{
+		// v1.x markers
 		"you are an interactive agent that helps users with software engineering tasks",
 		"# doing tasks",
 		"# using your tools",
 		"# tone and style",
 		"claude code",
 		"anthropic's official cli",
+		// v2.x markers
+		"# harness",
+		"# text output",
+		"## session-specific guidance",
+		"## auto memory",
+		"## environment",
+		"x-anthropic-billing-header",
+		"<system-reminder>",
+		"you are powered by the model named",
+		".claude/projects/",
+		"# tools",
+		"## agent",
 	}
 	matches := 0
 	for _, m := range markers {
@@ -562,7 +659,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 	var toolResults []KiroToolResult
 
 	if s, ok := content.(string); ok {
-		return s, nil, nil
+		return applyPromptFilters(s), nil, nil
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -576,7 +673,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			switch blockType {
 			case "text", "input_text":
 				if t, ok := block["text"].(string); ok {
-					text += t
+					text += applyPromptFilters(t)
 				}
 			case "image", "image_url", "input_image":
 				if img := extractImageFromClaudeBlock(block); img != nil {
@@ -948,6 +1045,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	// Run the same filter chain Claude requests use, so OpenAI-shaped clients
+	// (Roo/Cline/Continue/etc. wrapping Claude Code) get the same protection.
+	systemPrompt = applyPromptFilters(systemPrompt)
+
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
 		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
@@ -1093,7 +1194,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 	if s, ok := content.(string); ok {
-		return s, nil
+		return applyPromptFilters(s), nil
 	}
 
 	var text string
@@ -1101,7 +1202,7 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 
 	if part, ok := content.(map[string]interface{}); ok {
 		if t, ok := extractOpenAITextPart(part); ok {
-			text += t
+			text += applyPromptFilters(t)
 		}
 		if img := extractImageFromOpenAIPart(part); img != nil {
 			images = append(images, *img)
@@ -1116,7 +1217,7 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 			}
 
 			if t, ok := extractOpenAITextPart(part); ok {
-				text += t
+				text += applyPromptFilters(t)
 			}
 			if img := extractImageFromOpenAIPart(part); img != nil {
 				images = append(images, *img)

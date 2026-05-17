@@ -4,7 +4,10 @@ services:
   kiro-go:
     build: .
     ports:
-      - "8080:8080"
+      # Host 8989 -> container 8080. Run side-by-side with the original
+      # (which uses 8080 on the host); flip back to "8080:8080" once you
+      # decommission the upstream container.
+      - "8989:8080"
     volumes:
       - ./data:/app/data
     environment:

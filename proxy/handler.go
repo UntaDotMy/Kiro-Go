@@ -360,6 +360,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleOpenAIChat(w, r)
+	case path == "/v1/responses" || path == "/responses" || path == "/openai/v1/responses":
+		if !h.validateApiKey(r) {
+			h.sendResponsesError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
+		h.handleResponses(w, r)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
@@ -462,11 +468,16 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	}
 
 	models := make([]map[string]interface{}, 0, len(cached)*2)
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
+	for _, m := range cached {
+		supportsImage := modelSupportsImage(m.InputTypes)
+		// Emit the canonical Anthropic dashed / dated id (e.g. claude-opus-4-7-20251101)
+		// so Claude Code recognizes the model in its picker. Also include the raw
+		// Kiro id as an alias for clients that ask by the upstream id.
+		anthropicID := kiroModelToAnthropicID(m.ModelId)
+		models = append(models, buildModelInfo(anthropicID, "anthropic", supportsImage))
+		models = append(models, buildModelInfo(anthropicID+thinkingSuffix, "anthropic", supportsImage))
+		if anthropicID != m.ModelId {
 			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
 			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
 		}
 	}
@@ -474,22 +485,50 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+	// Canonical Anthropic dashed / dated ids — what Claude Code 2.x expects.
+	ids := []string{
+		"claude-opus-4-7-20251101",
+		"claude-opus-4-7",
+		"claude-sonnet-4-6-20251101",
+		"claude-sonnet-4-6",
+		"claude-haiku-4-5-20251001",
+		"claude-haiku-4-5",
+		"claude-sonnet-4-5-20251101",
+		"claude-sonnet-4-5",
+		"claude-opus-4-5-20251101",
+		"claude-opus-4-5",
+		"claude-sonnet-4-20250514",
 	}
+	out := make([]map[string]interface{}, 0, len(ids)*2)
+	for _, id := range ids {
+		out = append(out, buildModelInfo(id, "anthropic", true))
+		out = append(out, buildModelInfo(id+thinkingSuffix, "anthropic", true))
+	}
+	return out
+}
+
+// kiroModelToAnthropicID converts Kiro's internal dotted model id (e.g.
+// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed /
+// dated form Claude Code recognizes in its model picker.
+func kiroModelToAnthropicID(kiroID string) string {
+	switch strings.ToLower(strings.TrimSpace(kiroID)) {
+	case "claude-opus-4.7":
+		return "claude-opus-4-7"
+	case "claude-opus-4.6":
+		return "claude-opus-4-6"
+	case "claude-opus-4.5":
+		return "claude-opus-4-5-20251101"
+	case "claude-sonnet-4.6":
+		return "claude-sonnet-4-6"
+	case "claude-sonnet-4.5":
+		return "claude-sonnet-4-5-20251101"
+	case "claude-sonnet-4":
+		return "claude-sonnet-4-20250514"
+	case "claude-haiku-4.5":
+		return "claude-haiku-4-5-20251001"
+	}
+	// Already in dashed form, or unknown — return as-is.
+	return kiroID
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -742,7 +781,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	req.Model = actualModel
+	_ = actualModel // mapping is performed internally by ClaudeToKiro for the Kiro upstream call
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
 	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -799,7 +838,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	req.Model = actualModel
+	_ = actualModel // mapping happens inside ClaudeToKiro; keep req.Model as the
+	// original id (e.g. "claude-opus-4-7-20251101") so the response echoes the
+	// exact id the client (e.g. Claude Code) sent.
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -1455,7 +1496,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	req.Model = actualModel
+	_ = actualModel // OpenAIToKiro maps the model internally for the Kiro upstream call;
+	// keep req.Model as the original id so the response echoes what the client sent.
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)

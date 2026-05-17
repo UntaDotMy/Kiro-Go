@@ -360,14 +360,21 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		InputTypes: []string{"text", "image"},
 	}}, "-thinking")
 
-	if len(models) != 2 {
-		t.Fatalf("expected base model and thinking variant, got %d", len(models))
+	// Expect: Anthropic dashed/dated id + thinking variant + Kiro dotted alias + thinking variant.
+	if len(models) != 4 {
+		t.Fatalf("expected anthropic primary + alias (and thinking variants for each), got %d", len(models))
 	}
-	if models[0]["id"] != "claude-sonnet-4.5" {
-		t.Fatalf("unexpected base model id: %#v", models[0]["id"])
+	if models[0]["id"] != "claude-sonnet-4-5-20251101" {
+		t.Fatalf("expected primary id to be canonical Anthropic dashed/dated form, got %#v", models[0]["id"])
 	}
-	if models[1]["id"] != "claude-sonnet-4.5-thinking" {
-		t.Fatalf("unexpected thinking model id: %#v", models[1]["id"])
+	if models[1]["id"] != "claude-sonnet-4-5-20251101-thinking" {
+		t.Fatalf("unexpected primary thinking id: %#v", models[1]["id"])
+	}
+	if models[2]["id"] != "claude-sonnet-4.5" {
+		t.Fatalf("expected dotted Kiro id alias, got %#v", models[2]["id"])
+	}
+	if models[3]["id"] != "claude-sonnet-4.5-thinking" {
+		t.Fatalf("unexpected dotted thinking id: %#v", models[3]["id"])
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])

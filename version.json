@@ -1,5 +1,5 @@
 {
-  "version": "1.0.8",
-  "changelog": "✨ Added and fixed several improvements across the project.\n✨ 新增并修复了一些内容，包含若干功能改进与问题修复。",
-  "download": "https://github.com/Quorinex/Kiro-Go"
+  "version": "1.0.8-A1",
+  "changelog": "Fork patches A1:\n- Prompt filter logic now correctly catches Claude Code 2.x <system-reminder> blocks, x-anthropic-billing-header, and ## Environment / ## auto memory sections; filtering applies to system prompt AND user messages so Kiro/Bedrock no longer rejects requests.\n- Response model field preserves the exact id sent by the client (e.g. claude-opus-4-7-20251101) so Claude Code recognizes the model.\n- /v1/models returns canonical Anthropic dashed/dated ids; Kiro dotted form kept as alias.\n- New /v1/responses endpoint compatible with OpenAI Responses API (Codex CLI), full streaming SSE event sequence.\n- Dashboard refresh: clear stat cards (Available / Success Rate / Credits Used / Credits Total + remaining / Uptime), restrained single-palette modern style, account cards show status via colored left rail.\n- i18n parity (zh + en) verified at 309 keys each.",
+  "download": "https://github.com/UntaDotMy/Kiro-Go"
 }

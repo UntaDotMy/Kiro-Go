@@ -62,6 +62,7 @@ func main() {
 	logger.Infof("Admin panel: http://%s/admin", addr)
 	logger.Infof("Claude API: http://%s/v1/messages", addr)
 	logger.Infof("OpenAI API: http://%s/v1/chat/completions", addr)
+	logger.Infof("Responses API: http://%s/v1/responses (Codex CLI)", addr)
 
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		logger.Fatalf("Server failed: %v", err)
