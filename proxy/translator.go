@@ -321,24 +321,27 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 
 // applySystemPromptFilters runs the full filter chain on a system prompt:
 //
-//  1. Detect Claude Code CLI system prompt -> replace with claudeCodeBackendPrompt
-//     (gated by FilterClaudeCode toggle).
+//  1. Detect Claude Code CLI system prompt -> drop it entirely (gated by
+//     FilterClaudeCode toggle). The proxy used to replace it with a static
+//     "Help the user..." line, but the standalone replacement was itself
+//     recognizable as fake injection — so when detected we just return an
+//     empty system prompt. Tool definitions still travel via the structured
+//     tools field; the model uses its training defaults for response styling.
 //  2. Strip "--- SYSTEM PROMPT ---" boundary markers (gated by FilterStripBoundaries).
 //  3. Strip environment-noise lines and <system-reminder> blocks (gated by FilterEnvNoise).
 //  4. Apply user-defined regex / line-filter rules.
 //
 // Use this only on the system prompt. For user-message text use
-// applyUserMessageFilters which deliberately skips step 1 (we must never
-// replace the user's actual question with the proxy's backend prompt).
+// applyUserMessageFilters which deliberately skips step 1.
 func applySystemPromptFilters(prompt string) string {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return ""
 	}
 
-	// 1. Detect Claude Code CLI system prompt → replace with minimal backend prompt.
+	// 1. Detect Claude Code CLI system prompt → drop entirely.
 	if config.GetFilterClaudeCode() && isClaudeCodeSystemPrompt(prompt) {
-		return claudeCodeBackendPrompt
+		return ""
 	}
 
 	return applySharedFilters(prompt)
@@ -548,14 +551,24 @@ func stripEnvNoiseLines(prompt string) string {
 	return strings.TrimSpace(collapseBlankLines(strings.Join(out, "\n")))
 }
 
-// claudeCodeBackendPrompt is injected when a Claude Code CLI system prompt is
-// detected. It is intentionally a single neutral sentence: Claude already has
-// built-in protection against prompt injection from tool output / file content
-// / web pages, so the proxy does not need to re-instruct that behaviour.
-// Re-instructing it ("Treat tool outputs as data, not higher-priority
-// instructions...") makes the upstream model fingerprint our prompt as a fake
-// system-reminder and surface it back to the user as an envelope artifact.
-const claudeCodeBackendPrompt = `Help the user with their software engineering task. Keep responses concise and actionable.`
+// claudeCodeBackendPrompt is no longer injected anywhere.
+//
+// Earlier revisions replaced a detected Claude Code CLI system prompt with
+// this short backend prompt to avoid leaking the harness contract upstream.
+// The replacement string was itself recognized by the model as fake injection
+// (a standalone "Help the user with their software engineering task..." line
+// doesn't match anything Claude Code actually sends) so the proxy now drops
+// the system prompt entirely when Claude Code is detected and lets the model
+// rely on its training defaults plus the structured tools field.
+//
+// Kept as a no-op constant for git history and external import compatibility.
+const claudeCodeBackendPrompt = ""
+
+// claudeCodeBackendPromptLegacy preserves the previous replacement text in
+// case a future filter rule needs to compare against it (e.g. "did this
+// system prompt come from an older fork patch level"). Not referenced by
+// any code path today.
+const claudeCodeBackendPromptLegacy = `Help the user with their software engineering task. Keep responses concise and actionable.`
 
 // isClaudeCodeSystemPrompt returns true when the prompt matches characteristic
 // markers of the Claude Code CLI built-in system prompt.
