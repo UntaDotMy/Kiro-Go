@@ -48,23 +48,40 @@ func (h *Handler) apiCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiUpdateAPIKey patches a key's metadata. Any field omitted is left alone.
-// Use enabled=false to revoke without deleting (preserves history).
+// Use enabled=false to revoke without deleting (preserves history). All
+// fields documented on APIKey are patchable here.
 func (h *Handler) apiUpdateAPIKey(w http.ResponseWriter, r *http.Request, id string) {
 	var req struct {
-		Name           *string   `json:"name,omitempty"`
-		Enabled        *bool     `json:"enabled,omitempty"`
-		Models         *[]string `json:"models,omitempty"`
-		DailyReqLimit  *int      `json:"dailyReqLimit,omitempty"`
-		DailyTokLimit  *int      `json:"dailyTokLimit,omitempty"`
-		DailyCredLimit *float64  `json:"dailyCredLimit,omitempty"`
-		ExpiresAt      *int64    `json:"expiresAt,omitempty"`
+		Name              *string   `json:"name,omitempty"`
+		Enabled           *bool     `json:"enabled,omitempty"`
+		Models            *[]string `json:"models,omitempty"`
+		ExpiresAt         *int64    `json:"expiresAt,omitempty"`
+		LazyExpirySeconds *int64    `json:"lazyExpirySeconds,omitempty"`
+		ResetPeriod       *string   `json:"resetPeriod,omitempty"`
+		ResetTZ           *string   `json:"resetTZ,omitempty"`
+		DailyReqLimit     *int      `json:"dailyReqLimit,omitempty"`
+		DailyTokLimit     *int      `json:"dailyTokLimit,omitempty"`
+		DailyCredLimit    *float64  `json:"dailyCredLimit,omitempty"`
+		MinuteReqLimit    *int      `json:"minuteReqLimit,omitempty"`
+		HourReqLimit      *int      `json:"hourReqLimit,omitempty"`
+		LifetimeReqLimit  *int      `json:"lifetimeReqLimit,omitempty"`
+		LifetimeTokLimit  *int      `json:"lifetimeTokLimit,omitempty"`
+		LifetimeCredLimit *float64  `json:"lifetimeCredLimit,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-	if !config.UpdateAPIKey(id, req.Name, req.Enabled, req.Models, req.DailyReqLimit, req.DailyTokLimit, req.DailyCredLimit, req.ExpiresAt) {
+	opts := config.UpdateAPIKeyOptions{
+		Name: req.Name, Enabled: req.Enabled, Models: req.Models,
+		ExpiresAt: req.ExpiresAt, LazyExpirySeconds: req.LazyExpirySeconds,
+		ResetPeriod: req.ResetPeriod, ResetTZ: req.ResetTZ,
+		DailyReqLimit: req.DailyReqLimit, DailyTokLimit: req.DailyTokLimit, DailyCredLimit: req.DailyCredLimit,
+		MinuteReqLimit: req.MinuteReqLimit, HourReqLimit: req.HourReqLimit,
+		LifetimeReqLimit: req.LifetimeReqLimit, LifetimeTokLimit: req.LifetimeTokLimit, LifetimeCredLimit: req.LifetimeCredLimit,
+	}
+	if !config.UpdateAPIKey(id, opts) {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Key not found"})
 		return

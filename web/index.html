@@ -1624,6 +1624,29 @@
                 'tabs.apikeys': 'API 密钥',
                 'tabs.analytics': '分析',
                 'apikeys.title': 'API 密钥',
+                'apikeys.section.basic': '基础',
+                'apikeys.section.periodic': '周期配额',
+                'apikeys.section.burst': '突发限速',
+                'apikeys.section.lifetime': '终身上限',
+                'apikeys.section.expiry': '过期设置',
+                'apikeys.resetPeriod': '重置周期',
+                'apikeys.resetTZ': '时区',
+                'apikeys.period.daily': '每日',
+                'apikeys.period.weekly': '每周（周一）',
+                'apikeys.period.monthly': '每月（1 号）',
+                'apikeys.minuteReq': '每分钟请求',
+                'apikeys.hourReq': '每小时请求',
+                'apikeys.lifetimeReq': '终身请求',
+                'apikeys.lifetimeTok': '终身 Tokens',
+                'apikeys.lifetimeCred': '终身 Credits',
+                'apikeys.lifetimeHint': '达到终身上限后该密钥会自动禁用，不会自动重置；适合一次性配额。',
+                'apikeys.absoluteExpiry': '绝对过期时间',
+                'apikeys.absoluteHint': '留空表示不按绝对时间过期',
+                'apikeys.lazyExpiry': '首次使用后多少天过期（懒过期）',
+                'apikeys.lazyHint': '0 表示禁用；该计时从首次成功调用起算，密钥未使用则不会过期',
+                'apikeys.lazyExpiryFlag': '懒过期',
+                'apikeys.expiresAt': '过期于',
+                'apikeys.fromFirstUse': '自首次使用',
                 'apikeys.create': '创建密钥',
                 'apikeys.empty': '尚未创建任何 API 密钥',
                 'apikeys.hint': '为不同的客户端创建独立的 API 密钥并设置每日上限（请求 / Tokens / Credits）。0 表示不限制该项。',
@@ -1959,6 +1982,29 @@
                 'tabs.apikeys': 'API Keys',
                 'tabs.analytics': 'Analytics',
                 'apikeys.title': 'API Keys',
+                'apikeys.section.basic': 'Basic',
+                'apikeys.section.periodic': 'Periodic budget',
+                'apikeys.section.burst': 'Burst rate limits',
+                'apikeys.section.lifetime': 'Lifetime caps',
+                'apikeys.section.expiry': 'Expiry',
+                'apikeys.resetPeriod': 'Reset period',
+                'apikeys.resetTZ': 'Timezone',
+                'apikeys.period.daily': 'Daily',
+                'apikeys.period.weekly': 'Weekly (Mon)',
+                'apikeys.period.monthly': 'Monthly (1st)',
+                'apikeys.minuteReq': 'Req/min',
+                'apikeys.hourReq': 'Req/hour',
+                'apikeys.lifetimeReq': 'Lifetime req',
+                'apikeys.lifetimeTok': 'Lifetime tokens',
+                'apikeys.lifetimeCred': 'Lifetime credits',
+                'apikeys.lifetimeHint': 'When any non-zero lifetime cap is hit the key auto-disables and never resets — useful for one-shot allowances.',
+                'apikeys.absoluteExpiry': 'Absolute expiry',
+                'apikeys.absoluteHint': 'Leave empty to skip absolute expiry',
+                'apikeys.lazyExpiry': 'Expire N days after first use (lazy)',
+                'apikeys.lazyHint': '0 disables. Countdown starts on the first successful call; an unused key never expires this way.',
+                'apikeys.lazyExpiryFlag': 'Lazy',
+                'apikeys.expiresAt': 'Expires',
+                'apikeys.fromFirstUse': 'from first use',
                 'apikeys.create': 'Create Key',
                 'apikeys.empty': 'No API keys yet',
                 'apikeys.hint': 'Create separate keys for different clients with optional daily limits (requests / tokens / credits). 0 = unlimited for that dimension.',
@@ -3098,12 +3144,30 @@
                         '<div class="usage-bar"><div class="usage-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
                         '<div class="usage-text"><span>' + used.toFixed(used < 10 ? 2 : 0) + ' / ' + lim.toFixed(0) + '</span><span>' + pct.toFixed(0) + '%</span></div></div>';
                 };
+                const periodLabel = t('apikeys.period.' + (k.resetPeriod || 'daily'));
+                const tzLabel = k.resetTZ || 'UTC';
                 const lastUsed = k.lastUsedAt ? new Date(k.lastUsedAt * 1000).toLocaleString() : '-';
                 const created = k.createdAt ? new Date(k.createdAt * 1000).toLocaleString() : '-';
+                // Compose flags row showing rate-limit / lifetime / expiry policies
+                const flags = [];
+                if (k.minuteReqLimit > 0) flags.push(t('apikeys.minuteReq') + ': ' + (k.minuteRequests || 0) + ' / ' + k.minuteReqLimit);
+                if (k.hourReqLimit > 0) flags.push(t('apikeys.hourReq') + ': ' + (k.hourRequests || 0) + ' / ' + k.hourReqLimit);
+                if (k.lifetimeReqLimit > 0) flags.push(t('apikeys.lifetimeReq') + ': ' + (k.totalRequests || 0) + ' / ' + k.lifetimeReqLimit);
+                if (k.lifetimeTokLimit > 0) flags.push(t('apikeys.lifetimeTok') + ': ' + (k.totalTokens || 0) + ' / ' + k.lifetimeTokLimit);
+                if (k.lifetimeCredLimit > 0) flags.push(t('apikeys.lifetimeCred') + ': ' + (k.totalCredits || 0).toFixed(1) + ' / ' + k.lifetimeCredLimit);
+                if (k.expiresAt > 0) flags.push(t('apikeys.expiresAt') + ': ' + new Date(k.expiresAt * 1000).toLocaleString());
+                if (k.lazyExpirySeconds > 0) {
+                    const days = (k.lazyExpirySeconds / 86400).toFixed(0);
+                    flags.push(t('apikeys.lazyExpiryFlag') + ': ' + days + 'd' + (k.firstUsedAt ? ' (' + t('apikeys.fromFirstUse') + ')' : ''));
+                }
+                const flagsRow = flags.length === 0 ? '' :
+                    '<div style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0;font-size:11px">' +
+                    flags.map(f => '<span style="background:#f1f5f9;padding:2px 8px;border-radius:10px;color:#475569">' + f + '</span>').join('') +
+                    '</div>';
                 return '<div class="account-card ' + statusClass + '">' +
                     '<div class="account-header">' +
                     '<div class="account-info">' +
-                    '<div class="account-email">' + (k.name || '(unnamed)') + ' ' + statusBadge + '</div>' +
+                    '<div class="account-email">' + (k.name || '(unnamed)') + ' ' + statusBadge + ' <span style="color:#94a3b8;font-size:11px;margin-left:6px">' + periodLabel + ' · ' + tzLabel + '</span></div>' +
                     '<div class="account-meta"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:11px">' + k.key + '</code><button class="btn btn-sm btn-secondary" onclick="navigator.clipboard.writeText(\'' + k.key + '\').then(()=>alert(t(\'common.copied\')))" style="padding:2px 8px;font-size:11px">' + t('common.copy') + '</button></div>' +
                     '</div>' +
                     '<div class="account-actions">' +
@@ -3113,6 +3177,7 @@
                         : '<button class="btn btn-sm btn-success" onclick="toggleApiKey(\'' + k.id + '\', true)">' + t('apikeys.enable') + '</button>') +
                     '<button class="btn btn-sm btn-danger" onclick="deleteApiKey(\'' + k.id + '\')">' + t('common.delete') + '</button>' +
                     '</div></div>' +
+                    flagsRow +
                     limitRow(t('apikeys.dailyRequests'), reqUsed, reqLim) +
                     limitRow(t('apikeys.dailyTokens'), tokUsed, tokLim) +
                     limitRow(t('apikeys.dailyCredits'), credUsed, credLim) +
@@ -3124,32 +3189,106 @@
                     '</div></div>';
             }).join('');
         }
+        function buildApiKeyForm(prefix, k) {
+            // prefix is "new" or "ed". k is undefined for create, the existing key for edit.
+            const v = (path, def) => (k && k[path] != null ? k[path] : def);
+            const escape = s => String(s == null ? '' : s).replace(/"/g, '&quot;');
+            const tzList = ['UTC', 'Asia/Singapore', 'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Jakarta',
+                'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'America/New_York', 'America/Los_Angeles',
+                'Australia/Sydney'];
+            const curTZ = v('resetTZ', 'UTC');
+            const tzOptions = tzList.map(z => '<option value="' + z + '"' + (z === curTZ ? ' selected' : '') + '>' + z + '</option>').join('');
+            const curPeriod = v('resetPeriod', 'daily');
+            const expiresAt = v('expiresAt', 0);
+            const expiresAtIso = expiresAt > 0 ? new Date(expiresAt * 1000).toISOString().slice(0, 16) : '';
+            const lazy = v('lazyExpirySeconds', 0);
+            const lazyDays = lazy > 0 ? (lazy / 86400) : '';
+            const sectionStyle = 'border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px;background:#fafbfc';
+            const sectionTitle = (txt) => '<div style="font-weight:600;color:#1f2937;font-size:13px;margin-bottom:8px">' + txt + '</div>';
+            return (
+                // Basic
+                '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.basic')) +
+                '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="' + prefix + 'KeyName" value="' + escape(v('name', '')) + '" placeholder="my-app"></div>' +
+                '</div>' +
+                // Periodic
+                '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.periodic')) +
+                '<div class="form-group" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' +
+                '<div><label>' + t('apikeys.resetPeriod') + '</label><select id="' + prefix + 'KeyPeriod">' +
+                ['daily', 'weekly', 'monthly'].map(p => '<option value="' + p + '"' + (p === curPeriod ? ' selected' : '') + '>' + t('apikeys.period.' + p) + '</option>').join('') +
+                '</select></div>' +
+                '<div><label>' + t('apikeys.resetTZ') + '</label><select id="' + prefix + 'KeyTZ">' + tzOptions + '</select></div>' +
+                '</div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyRequests') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyReqLim" value="' + (v('dailyReqLimit', 0)) + '" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyTokens') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyTokLim" value="' + (v('dailyTokLimit', 0)) + '" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyCredits') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyCredLim" value="' + (v('dailyCredLimit', 0)) + '" min="0" step="0.01"></div>' +
+                '</div>' +
+                // Burst
+                '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.burst')) +
+                '<div class="form-group" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' +
+                '<div><label>' + t('apikeys.minuteReq') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyMin" value="' + (v('minuteReqLimit', 0)) + '" min="0"></div>' +
+                '<div><label>' + t('apikeys.hourReq') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyHour" value="' + (v('hourReqLimit', 0)) + '" min="0"></div>' +
+                '</div></div>' +
+                // Lifetime
+                '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.lifetime')) +
+                '<small style="color:#64748b;font-size:12px;display:block;margin-bottom:8px">' + t('apikeys.lifetimeHint') + '</small>' +
+                '<div class="form-group"><label>' + t('apikeys.lifetimeReq') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyLifeReq" value="' + (v('lifetimeReqLimit', 0)) + '" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.lifetimeTok') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyLifeTok" value="' + (v('lifetimeTokLimit', 0)) + '" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.lifetimeCred') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyLifeCred" value="' + (v('lifetimeCredLimit', 0)) + '" min="0" step="0.01"></div>' +
+                '</div>' +
+                // Expiry
+                '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.expiry')) +
+                '<div class="form-group"><label>' + t('apikeys.absoluteExpiry') + '</label><input type="datetime-local" id="' + prefix + 'KeyExpAbs" value="' + expiresAtIso + '"><small style="color:#64748b;font-size:12px">' + t('apikeys.absoluteHint') + '</small></div>' +
+                '<div class="form-group"><label>' + t('apikeys.lazyExpiry') + '</label><input type="number" id="' + prefix + 'KeyLazyDays" value="' + lazyDays + '" min="0" step="1" placeholder="0"><small style="color:#64748b;font-size:12px">' + t('apikeys.lazyHint') + '</small></div>' +
+                '</div>'
+            );
+        }
+        function readApiKeyForm(prefix) {
+            const tzVal = document.getElementById(prefix + 'KeyTZ').value || 'UTC';
+            const periodVal = document.getElementById(prefix + 'KeyPeriod').value || 'daily';
+            const expIso = document.getElementById(prefix + 'KeyExpAbs').value;
+            const expiresAt = expIso ? Math.floor(new Date(expIso).getTime() / 1000) : 0;
+            const lazyDays = parseFloat(document.getElementById(prefix + 'KeyLazyDays').value) || 0;
+            const lazyExpirySeconds = lazyDays > 0 ? Math.floor(lazyDays * 86400) : 0;
+            return {
+                name: document.getElementById(prefix + 'KeyName').value.trim(),
+                resetPeriod: periodVal,
+                resetTZ: tzVal,
+                dailyReqLimit: parseInt(document.getElementById(prefix + 'KeyReqLim').value) || 0,
+                dailyTokLimit: parseInt(document.getElementById(prefix + 'KeyTokLim').value) || 0,
+                dailyCredLimit: parseFloat(document.getElementById(prefix + 'KeyCredLim').value) || 0,
+                minuteReqLimit: parseInt(document.getElementById(prefix + 'KeyMin').value) || 0,
+                hourReqLimit: parseInt(document.getElementById(prefix + 'KeyHour').value) || 0,
+                lifetimeReqLimit: parseInt(document.getElementById(prefix + 'KeyLifeReq').value) || 0,
+                lifetimeTokLimit: parseInt(document.getElementById(prefix + 'KeyLifeTok').value) || 0,
+                lifetimeCredLimit: parseFloat(document.getElementById(prefix + 'KeyLifeCred').value) || 0,
+                expiresAt,
+                lazyExpirySeconds
+            };
+        }
         function showCreateApiKey() {
             const body = document.getElementById('modalBody');
             document.getElementById('modalTitle').textContent = t('apikeys.create');
-            body.innerHTML =
-                '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="newKeyName" placeholder="my-app"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.dailyRequests') + ' (0 = ∞)</label><input type="number" id="newKeyReqLim" value="0" min="0"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.dailyTokens') + ' (0 = ∞)</label><input type="number" id="newKeyTokLim" value="0" min="0"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.dailyCredits') + ' (0 = ∞)</label><input type="number" id="newKeyCredLim" value="0" min="0" step="0.01"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.expiresIn') + '</label><select id="newKeyExpiry"><option value="0">' + t('apikeys.noExpiry') + '</option><option value="7">7d</option><option value="30">30d</option><option value="90">90d</option></select></div>' +
+            body.innerHTML = buildApiKeyForm('new', null) +
                 '<div class="modal-footer"><button class="btn btn-primary" onclick="submitCreateApiKey()">' + t('common.create') + '</button></div>';
             document.getElementById('addModal').classList.add('active');
         }
         async function submitCreateApiKey() {
-            const name = document.getElementById('newKeyName').value.trim();
-            const dailyReqLimit = parseInt(document.getElementById('newKeyReqLim').value) || 0;
-            const dailyTokLimit = parseInt(document.getElementById('newKeyTokLim').value) || 0;
-            const dailyCredLimit = parseFloat(document.getElementById('newKeyCredLim').value) || 0;
-            const expiryDays = parseInt(document.getElementById('newKeyExpiry').value) || 0;
-            const expiresAt = expiryDays > 0 ? Math.floor(Date.now() / 1000) + expiryDays * 86400 : 0;
+            const payload = readApiKeyForm('new');
             const res = await fetch('/admin/api/apikeys', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ name, dailyReqLimit, dailyTokLimit, dailyCredLimit, expiresAt })
+                body: JSON.stringify(payload)
             });
             const d = await res.json();
             if (d.id) {
+                // Patch the new key with the burst/lifetime/expiry/period fields the
+                // backend create endpoint doesn't accept directly (kept narrow for
+                // backward compat). One follow-up PUT covers the rest.
+                await fetch('/admin/api/apikeys/' + d.id, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify(payload)
+                });
                 closeModal();
                 alert(t('apikeys.created') + ': ' + d.key);
                 loadApiKeys();
@@ -3162,21 +3301,12 @@
             if (!k) return;
             const body = document.getElementById('modalBody');
             document.getElementById('modalTitle').textContent = t('common.edit') + ': ' + (k.name || k.id);
-            body.innerHTML =
-                '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="edKeyName" value="' + (k.name || '') + '"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.dailyRequests') + ' (0 = ∞)</label><input type="number" id="edKeyReqLim" value="' + (k.dailyReqLimit || 0) + '" min="0"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.dailyTokens') + ' (0 = ∞)</label><input type="number" id="edKeyTokLim" value="' + (k.dailyTokLimit || 0) + '" min="0"></div>' +
-                '<div class="form-group"><label>' + t('apikeys.dailyCredits') + ' (0 = ∞)</label><input type="number" id="edKeyCredLim" value="' + (k.dailyCredLimit || 0) + '" min="0" step="0.01"></div>' +
+            body.innerHTML = buildApiKeyForm('ed', k) +
                 '<div class="modal-footer"><button class="btn btn-primary" onclick="submitEditApiKey(\'' + id + '\')">' + t('common.save') + '</button></div>';
             document.getElementById('addModal').classList.add('active');
         }
         async function submitEditApiKey(id) {
-            const payload = {
-                name: document.getElementById('edKeyName').value.trim(),
-                dailyReqLimit: parseInt(document.getElementById('edKeyReqLim').value) || 0,
-                dailyTokLimit: parseInt(document.getElementById('edKeyTokLim').value) || 0,
-                dailyCredLimit: parseFloat(document.getElementById('edKeyCredLim').value) || 0
-            };
+            const payload = readApiKeyForm('ed');
             const res = await fetch('/admin/api/apikeys/' + id, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
