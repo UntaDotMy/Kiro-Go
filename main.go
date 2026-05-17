@@ -22,6 +22,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"kiro-go/proxy"
+	"kiro-go/stats"
 	"log"
 	"net/http"
 	"os"
@@ -52,6 +53,16 @@ func main() {
 	}
 
 	logger.Init(config.GetLogLevel())
+
+	// Persistent statistics. Stored alongside config.json so the existing
+	// data volume / mount path covers it. Stats record best-effort: a failure
+	// to open the DB is logged but does not block startup.
+	statsPath := filepath.Join(filepath.Dir(configPath), "stats.db")
+	if err := stats.Init(statsPath); err != nil {
+		logger.Errorf("Failed to open stats DB at %s: %v (statistics will not persist)", statsPath, err)
+	} else {
+		logger.Infof("Statistics DB: %s", statsPath)
+	}
 
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
@@ -115,6 +126,7 @@ func main() {
 			logger.Errorf("Graceful shutdown error: %v", err)
 		}
 		handler.Stop()
+		_ = stats.Close()
 		logger.Infof("Bye.")
 	}
 }

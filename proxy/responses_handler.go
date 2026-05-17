@@ -100,7 +100,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.recordFailure()
+		h.recordFailure(model, "")
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		h.sendResponsesError(w, 500, "server_error", err.Error())
@@ -122,7 +122,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	}
 	outputTokens = estimateClaudeOutputTokens(finalContent, reasoning, toolUses)
 
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(model, "", inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
@@ -468,7 +468,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.recordFailure()
+		h.recordFailure(model, "")
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		// Emit failure events Codex understands.
@@ -500,7 +500,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	}
 	outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
 
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(model, "", inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)

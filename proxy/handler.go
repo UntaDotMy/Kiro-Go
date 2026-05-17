@@ -10,6 +10,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"kiro-go/stats"
 	"net/http"
 	"strings"
 	"sync"
@@ -219,6 +220,17 @@ func NewHandler() *Handler {
 	applyProxyConfig(config.GetProxyURL())
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
+	// Prefer the persisted SQLite totals when available — they accumulate
+	// across restarts and represent the true historical numbers. Falls back
+	// to the legacy config.GetStats() values if the stats DB is empty (first
+	// run after upgrade) or unavailable.
+	if t, err := stats.AllTimeTotals("global", ""); err == nil && t.Requests > 0 {
+		totalReq = t.Requests
+		successReq = t.Success
+		failedReq = t.Failed
+		totalTokens = t.TokensIn + t.TokensOut
+		totalCredits = t.Credits
+	}
 	h := &Handler{
 		pool:            pool.GetPool(),
 		totalRequests:   int64(totalReq),
@@ -1388,7 +1400,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure()
+		h.recordFailure(model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
 		h.checkOverageError(err, account.ID)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
@@ -1421,7 +1433,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 	outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
@@ -1500,17 +1512,20 @@ func (h *Handler) addCredits(credits float64) {
 // refresh for the account that just served the request, so the dashboard
 // reflects new usage within ~30 seconds without waiting for the 5-minute
 // global tick. accountID is optional (passed by the success-path callers
-// that have it).
-func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) {
+// that have it). Also records to the persistent SQLite stats so per-day
+// rollups survive restarts.
+func (h *Handler) recordSuccess(model, apiKeyID string, inputTokens, outputTokens int, credits float64) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
+	stats.Record(model, apiKeyID, true, inputTokens, outputTokens, credits)
 }
 
-func (h *Handler) recordFailure() {
+func (h *Handler) recordFailure(model, apiKeyID string) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
+	stats.Record(model, apiKeyID, false, 0, 0, 0)
 }
 
 // checkOverageError 检测 402 超额错误，自动关闭对应账号的超额使用
@@ -1562,7 +1577,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure()
+		h.recordFailure(model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		h.sendClaudeError(w, 500, "api_error", err.Error())
@@ -1587,7 +1602,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	}
 	outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
@@ -2015,7 +2030,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure()
+		h.recordFailure(model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		return
@@ -2047,7 +2062,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		outputTokens += estimateApproxTokens(tc.Function.Arguments)
 	}
 
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
@@ -2110,7 +2125,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure()
+		h.recordFailure(model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.checkOverageError(err, account.ID)
 		h.sendOpenAIError(w, 500, "server_error", err.Error())
@@ -2132,7 +2147,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	}
 	outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
@@ -2303,6 +2318,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiDeleteAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
 	case path == "/modelstats" && r.Method == "GET":
 		h.apiGetModelStats(w, r)
+	case path == "/stats/totals" && r.Method == "GET":
+		h.apiGetStatsTotals(w, r)
+	case path == "/stats/history" && r.Method == "GET":
+		h.apiGetStatsHistory(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":

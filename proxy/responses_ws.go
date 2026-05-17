@@ -175,7 +175,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
-		h.recordFailure()
+		h.recordFailure(req.Model, "")
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
@@ -191,7 +191,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	if outputTokens <= 0 {
 		outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
 	}
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(req.Model, "", inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)

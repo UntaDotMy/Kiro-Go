@@ -3,7 +3,9 @@ package proxy
 import (
 	"encoding/json"
 	"kiro-go/config"
+	"kiro-go/stats"
 	"net/http"
+	"strconv"
 )
 
 // apiListAPIKeys returns all configured API keys with their counters and
@@ -100,11 +102,61 @@ func (h *Handler) apiDeleteAPIKey(w http.ResponseWriter, r *http.Request, id str
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// apiGetModelStats returns the per-model running counters (requests, tokens,
-// credits, lastUsed) so the dashboard can render a per-model usage breakdown.
-// Counters are in-memory only — they reset on restart.
+// apiGetModelStats returns the persisted per-model totals (lifetime). Each
+// entry includes lastUsed so the dashboard can render "last seen" timestamps.
+// Backed by the SQLite stats table — survives restarts.
 func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"models": snapshotModelStats(),
-	})
+	byModel, _ := stats.ByModel()
+	out := make(map[string]map[string]interface{}, len(byModel))
+	for model, t := range byModel {
+		out[model] = map[string]interface{}{
+			"requests": t.Requests,
+			"success":  t.Success,
+			"failed":   t.Failed,
+			"tokens":   t.TokensIn + t.TokensOut,
+			"credits":  t.Credits,
+			"lastUsed": t.LastAt,
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
+}
+
+// apiGetStatsTotals returns the persisted lifetime global counters loaded
+// from SQLite. Used by the dashboard's top stat cards so the numbers reflect
+// the true historical total instead of the post-restart in-memory window.
+func (h *Handler) apiGetStatsTotals(w http.ResponseWriter, r *http.Request) {
+	t, _ := stats.AllTimeTotals("global", "")
+	json.NewEncoder(w).Encode(t)
+}
+
+// apiGetStatsHistory returns the daily time series for any scope.
+//
+//	GET /admin/api/stats/history?scope=global&days=28
+//	GET /admin/api/stats/history?scope=model&id=claude-sonnet-4.5&days=28
+//	GET /admin/api/stats/history?scope=key&id=<key id>&days=28
+//
+// days defaults to 28; days=0 returns the full history.
+func (h *Handler) apiGetStatsHistory(w http.ResponseWriter, r *http.Request) {
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "global"
+	}
+	id := r.URL.Query().Get("id")
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	if days < 0 {
+		days = 28
+	}
+	if days == 0 && r.URL.Query().Get("days") == "" {
+		days = 28
+	}
+	rows, err := stats.History(scope, id, days)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if rows == nil {
+		rows = []stats.DailyEntry{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"entries": rows})
 }
