@@ -3200,7 +3200,16 @@
             const tzOptions = tzList.map(z => '<option value="' + z + '"' + (z === curTZ ? ' selected' : '') + '>' + z + '</option>').join('');
             const curPeriod = v('resetPeriod', 'daily');
             const expiresAt = v('expiresAt', 0);
-            const expiresAtIso = expiresAt > 0 ? new Date(expiresAt * 1000).toISOString().slice(0, 16) : '';
+            // datetime-local expects local time formatted as YYYY-MM-DDTHH:mm.
+            // toISOString() returns UTC and would drift the field by the user's
+            // TZ offset on every edit roundtrip — format manually instead.
+            const expiresAtIso = (() => {
+                if (expiresAt <= 0) return '';
+                const d = new Date(expiresAt * 1000);
+                const pad = n => String(n).padStart(2, '0');
+                return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+                       'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+            })();
             const lazy = v('lazyExpirySeconds', 0);
             const lazyDays = lazy > 0 ? (lazy / 86400) : '';
             const sectionStyle = 'border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px;background:#fafbfc';

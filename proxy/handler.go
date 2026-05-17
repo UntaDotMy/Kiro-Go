@@ -412,13 +412,11 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		providedKey = apiKeyHeader
 	}
 
-	// Backward-compat: if a legacy single key is set, accept it.
-	legacyKey := config.GetApiKey()
-	if legacyKey != "" && subtle.ConstantTimeCompare([]byte(providedKey), []byte(legacyKey)) == 1 {
-		return true
-	}
-
 	// Multi-key path: walk configured keys and constant-time compare each.
+	// (After A12, the legacy single key is auto-migrated into APIKeys[0],
+	// so we no longer need a separate legacy fast-path. Going through the
+	// multi-key loop ensures the matched key gets stashed in the request
+	// context for per-key statistics tracking.)
 	keys := config.GetAPIKeys()
 	for i := range keys {
 		k := keys[i]
@@ -437,7 +435,10 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		}
 	}
 
-	// Fall back to "no keys configured at all" -> permissive.
+	// Fall back to "no keys configured at all" -> permissive. Catches the
+	// pre-A7 state where neither the legacy single key nor any multi-key
+	// entries exist.
+	legacyKey := config.GetApiKey()
 	if legacyKey == "" && len(keys) == 0 {
 		return true
 	}
