@@ -17,17 +17,24 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags="-s -w" -o kiro-go .
 
 FROM alpine:3.19
-RUN apk --no-cache add ca-certificates wget tini && \
+# tini reaps zombies and forwards signals; su-exec drops privileges before
+# starting the application; wget is for the HEALTHCHECK; ca-certificates
+# for outbound TLS to Kiro / Bedrock.
+RUN apk --no-cache add ca-certificates wget tini su-exec && \
     addgroup -g 1000 kiro && \
     adduser -D -u 1000 -G kiro -h /app kiro
 
 WORKDIR /app
-COPY --from=builder --chown=kiro:kiro /app/kiro-go .
-COPY --from=builder --chown=kiro:kiro /app/web ./web
+COPY --from=builder /app/kiro-go .
+COPY --from=builder /app/web ./web
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-# Run unprivileged. The data volume is owned by uid 1000 too.
-USER 1000:1000
-
+# Run as root briefly so the entrypoint can fix data-volume ownership when
+# migrating from the upstream image (which ran the proxy as root). The
+# entrypoint then drops to uid 1000:1000 before exec'ing the binary, so the
+# application itself never runs as root. Override RUN_UID / RUN_GID env
+# vars to use a different non-root identity.
 EXPOSE 8080
 VOLUME /app/data
 
@@ -36,6 +43,4 @@ VOLUME /app/data
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD wget -q -O - http://127.0.0.1:8080/health || exit 1
 
-# tini reaps zombies and forwards signals so graceful shutdown works.
-ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["./kiro-go"]
+ENTRYPOINT ["/entrypoint.sh"]
