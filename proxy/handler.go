@@ -1418,6 +1418,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	recordModelUsage(model, inputTokens+outputTokens, credits)
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
@@ -1583,6 +1584,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	recordModelUsage(model, inputTokens+outputTokens, credits)
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	responseThinkingContent := rawThinkingContent
@@ -2042,6 +2044,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	recordModelUsage(model, inputTokens+outputTokens, credits)
 
 	// 发送结束
 	finishReason := "stop"
@@ -2126,6 +2129,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	recordModelUsage(model, inputTokens+outputTokens, credits)
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2289,6 +2293,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
 	case strings.HasPrefix(path, "/apikeys/") && r.Method == "DELETE":
 		h.apiDeleteAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
+	case path == "/modelstats" && r.Method == "GET":
+		h.apiGetModelStats(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -3072,6 +3078,7 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	h.totalCredits = 0
 	h.creditsMu.Unlock()
 	config.UpdateStats(0, 0, 0, 0, 0)
+	resetModelStats()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 

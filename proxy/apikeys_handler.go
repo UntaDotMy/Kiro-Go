@@ -82,3 +82,12 @@ func (h *Handler) apiDeleteAPIKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
+
+// apiGetModelStats returns the per-model running counters (requests, tokens,
+// credits, lastUsed) so the dashboard can render a per-model usage breakdown.
+// Counters are in-memory only — they reset on restart.
+func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"models": snapshotModelStats(),
+	})
+}

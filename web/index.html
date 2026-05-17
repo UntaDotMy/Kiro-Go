@@ -1319,6 +1319,8 @@
         </div>
         <div class="tabs">
             <div class="tab active" data-tab="accounts" data-i18n="tabs.accounts"></div>
+            <div class="tab" data-tab="apikeys" data-i18n="tabs.apikeys"></div>
+            <div class="tab" data-tab="analytics" data-i18n="tabs.analytics"></div>
             <div class="tab" data-tab="settings" data-i18n="tabs.settings"></div>
             <div class="tab" data-tab="api" data-i18n="tabs.api"></div>
         </div>
@@ -1361,6 +1363,30 @@
                     </div>
                 </div>
                 <div id="accountsList"></div>
+            </div>
+        </div>
+        <div id="tabApikeys" class="tab-content hidden">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title" data-i18n="apikeys.title"></span>
+                    <div class="card-actions">
+                        <button class="btn btn-primary btn-sm" onclick="showCreateApiKey()" data-i18n="apikeys.create"></button>
+                    </div>
+                </div>
+                <p style="font-size:12px;color:#64748b;padding:0 0 12px" data-i18n="apikeys.hint"></p>
+                <div id="apikeysList"></div>
+            </div>
+        </div>
+        <div id="tabAnalytics" class="tab-content hidden">
+            <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="analytics.byModel"></span></div>
+                <p style="font-size:12px;color:#64748b;padding:0 0 12px" data-i18n="analytics.byModelHint"></p>
+                <div id="modelStatsList"></div>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="analytics.byKey"></span></div>
+                <p style="font-size:12px;color:#64748b;padding:0 0 12px" data-i18n="analytics.byKeyHint"></p>
+                <div id="keyStatsList"></div>
             </div>
         </div>
         <div id="tabSettings" class="tab-content hidden">
@@ -1591,6 +1617,38 @@
                 'stats.creditsRemaining': '剩余',
                 'stats.uptime': '运行时长',
                 'tabs.accounts': '账号',
+                'tabs.apikeys': 'API 密钥',
+                'tabs.analytics': '分析',
+                'apikeys.title': 'API 密钥',
+                'apikeys.create': '创建密钥',
+                'apikeys.empty': '尚未创建任何 API 密钥',
+                'apikeys.hint': '为不同的客户端创建独立的 API 密钥并设置每日上限（请求 / Tokens / Credits）。0 表示不限制该项。',
+                'apikeys.name': '名称',
+                'apikeys.dailyRequests': '每日请求上限',
+                'apikeys.dailyTokens': '每日 Tokens 上限',
+                'apikeys.dailyCredits': '每日 Credits 上限',
+                'apikeys.expiresIn': '有效期',
+                'apikeys.noExpiry': '永不过期',
+                'apikeys.created': '已创建，请保存此密钥',
+                'apikeys.confirmDelete': '确定要永久删除该密钥？请考虑改为禁用。',
+                'apikeys.revoke': '禁用',
+                'apikeys.enable': '启用',
+                'apikeys.revoked': '已禁用',
+                'apikeys.active': '启用中',
+                'apikeys.totalReq': '累计请求',
+                'apikeys.totalTok': '累计 Tokens',
+                'apikeys.totalCred': '累计 Credits',
+                'apikeys.lastUsed': '最近使用',
+                'analytics.byModel': '按模型统计',
+                'analytics.byModelHint': '展示每个模型自代理启动以来的请求数、Tokens 与 Credits（重启后归零）。',
+                'analytics.byKey': '按密钥统计',
+                'analytics.byKeyHint': '展示各 API 密钥的累计使用情况（持久化保存）。',
+                'analytics.empty': '暂无数据，开始使用代理后会显示',
+                'analytics.noKeys': '暂无密钥使用记录',
+                'common.create': '创建',
+                'common.edit': '编辑',
+                'common.delete': '删除',
+                'common.copied': '已复制',
                 'tabs.settings': '设置',
                 'tabs.api': 'API',
                 'accounts.title': '账号列表',
@@ -1890,6 +1948,38 @@
                 'stats.creditsRemaining': 'Remaining',
                 'stats.uptime': 'Uptime',
                 'tabs.accounts': 'Accounts',
+                'tabs.apikeys': 'API Keys',
+                'tabs.analytics': 'Analytics',
+                'apikeys.title': 'API Keys',
+                'apikeys.create': 'Create Key',
+                'apikeys.empty': 'No API keys yet',
+                'apikeys.hint': 'Create separate keys for different clients with optional daily limits (requests / tokens / credits). 0 = unlimited for that dimension.',
+                'apikeys.name': 'Name',
+                'apikeys.dailyRequests': 'Daily Requests',
+                'apikeys.dailyTokens': 'Daily Tokens',
+                'apikeys.dailyCredits': 'Daily Credits',
+                'apikeys.expiresIn': 'Expires In',
+                'apikeys.noExpiry': 'Never',
+                'apikeys.created': 'Created — save this key now',
+                'apikeys.confirmDelete': 'Permanently delete this key? Consider revoking instead.',
+                'apikeys.revoke': 'Revoke',
+                'apikeys.enable': 'Enable',
+                'apikeys.revoked': 'Revoked',
+                'apikeys.active': 'Active',
+                'apikeys.totalReq': 'Lifetime Req',
+                'apikeys.totalTok': 'Lifetime Tok',
+                'apikeys.totalCred': 'Lifetime Cred',
+                'apikeys.lastUsed': 'Last used',
+                'analytics.byModel': 'Usage by model',
+                'analytics.byModelHint': 'Requests, tokens and credits per model since the proxy started (resets on restart).',
+                'analytics.byKey': 'Usage by key',
+                'analytics.byKeyHint': 'Lifetime per-key usage (persisted across restarts).',
+                'analytics.empty': 'No data yet — show up after the first request',
+                'analytics.noKeys': 'No keys have served requests yet',
+                'common.create': 'Create',
+                'common.edit': 'Edit',
+                'common.delete': 'Delete',
+                'common.copied': 'Copied',
                 'tabs.settings': 'Settings',
                 'tabs.api': 'API',
                 'accounts.title': 'Account List',
@@ -2963,6 +3053,193 @@
                 if (acc) acc.weight = weight;
             } catch (e) { /* silent */ }
         }
+
+        // ==================== API Keys tab ====================
+        let apikeysData = [];
+        async function loadApiKeys() {
+            const res = await fetch('/admin/api/apikeys', { headers: { 'X-Admin-Password': password } });
+            const d = await res.json();
+            apikeysData = d.keys || [];
+            renderApiKeys();
+        }
+        function renderApiKeys() {
+            const container = document.getElementById('apikeysList');
+            if (!container) return;
+            if (apikeysData.length === 0) {
+                container.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:30px 0">' + t('apikeys.empty') + '</p>';
+                return;
+            }
+            container.innerHTML = apikeysData.map(k => {
+                const reqUsed = k.dailyRequests || 0;
+                const reqLim = k.dailyReqLimit || 0;
+                const tokUsed = k.dailyTokens || 0;
+                const tokLim = k.dailyTokLimit || 0;
+                const credUsed = k.dailyCredits || 0;
+                const credLim = k.dailyCredLimit || 0;
+                const statusClass = !k.enabled ? 'is-disabled' : '';
+                const statusBadge = !k.enabled ? '<span class="badge badge-error" data-i18n="apikeys.revoked">' + t('apikeys.revoked') + '</span>' : '<span class="badge badge-success">' + t('apikeys.active') + '</span>';
+                const limitRow = (label, used, lim) => {
+                    if (lim === 0) return '<div class="usage-text"><span>' + label + '</span><span>' + used.toFixed(0) + ' / ∞</span></div>';
+                    const pct = Math.min(100, used / lim * 100);
+                    const cls = pct > 90 ? 'critical' : pct > 70 ? 'high' : '';
+                    return '<div class="account-usage"><div class="usage-label">' + label + '</div>' +
+                        '<div class="usage-bar"><div class="usage-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
+                        '<div class="usage-text"><span>' + used.toFixed(used < 10 ? 2 : 0) + ' / ' + lim.toFixed(0) + '</span><span>' + pct.toFixed(0) + '%</span></div></div>';
+                };
+                const lastUsed = k.lastUsedAt ? new Date(k.lastUsedAt * 1000).toLocaleString() : '-';
+                const created = k.createdAt ? new Date(k.createdAt * 1000).toLocaleString() : '-';
+                return '<div class="account-card ' + statusClass + '">' +
+                    '<div class="account-header">' +
+                    '<div class="account-info">' +
+                    '<div class="account-email">' + (k.name || '(unnamed)') + ' ' + statusBadge + '</div>' +
+                    '<div class="account-meta"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:11px">' + k.key + '</code><button class="btn btn-sm btn-secondary" onclick="navigator.clipboard.writeText(\'' + k.key + '\').then(()=>alert(t(\'common.copied\')))" style="padding:2px 8px;font-size:11px">' + t('common.copy') + '</button></div>' +
+                    '</div>' +
+                    '<div class="account-actions">' +
+                    '<button class="btn btn-sm btn-secondary" onclick="editApiKey(\'' + k.id + '\')">' + t('common.edit') + '</button>' +
+                    (k.enabled
+                        ? '<button class="btn btn-sm btn-secondary" onclick="toggleApiKey(\'' + k.id + '\', false)">' + t('apikeys.revoke') + '</button>'
+                        : '<button class="btn btn-sm btn-success" onclick="toggleApiKey(\'' + k.id + '\', true)">' + t('apikeys.enable') + '</button>') +
+                    '<button class="btn btn-sm btn-danger" onclick="deleteApiKey(\'' + k.id + '\')">' + t('common.delete') + '</button>' +
+                    '</div></div>' +
+                    limitRow(t('apikeys.dailyRequests'), reqUsed, reqLim) +
+                    limitRow(t('apikeys.dailyTokens'), tokUsed, tokLim) +
+                    limitRow(t('apikeys.dailyCredits'), credUsed, credLim) +
+                    '<div class="account-stats" style="grid-template-columns:repeat(4,1fr)">' +
+                    '<div class="account-stat"><div class="account-stat-value">' + (k.totalRequests || 0) + '</div><div class="account-stat-label">' + t('apikeys.totalReq') + '</div></div>' +
+                    '<div class="account-stat"><div class="account-stat-value">' + formatNum(k.totalTokens || 0) + '</div><div class="account-stat-label">' + t('apikeys.totalTok') + '</div></div>' +
+                    '<div class="account-stat"><div class="account-stat-value">' + (k.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + t('apikeys.totalCred') + '</div></div>' +
+                    '<div class="account-stat"><div class="account-stat-value" style="font-size:11px">' + lastUsed + '</div><div class="account-stat-label">' + t('apikeys.lastUsed') + '</div></div>' +
+                    '</div></div>';
+            }).join('');
+        }
+        function showCreateApiKey() {
+            const body = document.getElementById('modalBody');
+            document.getElementById('modalTitle').textContent = t('apikeys.create');
+            body.innerHTML =
+                '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="newKeyName" placeholder="my-app"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyRequests') + ' (0 = ∞)</label><input type="number" id="newKeyReqLim" value="0" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyTokens') + ' (0 = ∞)</label><input type="number" id="newKeyTokLim" value="0" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyCredits') + ' (0 = ∞)</label><input type="number" id="newKeyCredLim" value="0" min="0" step="0.01"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.expiresIn') + '</label><select id="newKeyExpiry"><option value="0">' + t('apikeys.noExpiry') + '</option><option value="7">7d</option><option value="30">30d</option><option value="90">90d</option></select></div>' +
+                '<div class="modal-footer"><button class="btn btn-primary" onclick="submitCreateApiKey()">' + t('common.create') + '</button></div>';
+            document.getElementById('addModal').classList.add('active');
+        }
+        async function submitCreateApiKey() {
+            const name = document.getElementById('newKeyName').value.trim();
+            const dailyReqLimit = parseInt(document.getElementById('newKeyReqLim').value) || 0;
+            const dailyTokLimit = parseInt(document.getElementById('newKeyTokLim').value) || 0;
+            const dailyCredLimit = parseFloat(document.getElementById('newKeyCredLim').value) || 0;
+            const expiryDays = parseInt(document.getElementById('newKeyExpiry').value) || 0;
+            const expiresAt = expiryDays > 0 ? Math.floor(Date.now() / 1000) + expiryDays * 86400 : 0;
+            const res = await fetch('/admin/api/apikeys', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ name, dailyReqLimit, dailyTokLimit, dailyCredLimit, expiresAt })
+            });
+            const d = await res.json();
+            if (d.id) {
+                closeModal();
+                alert(t('apikeys.created') + ': ' + d.key);
+                loadApiKeys();
+            } else {
+                alert(d.error || 'Failed');
+            }
+        }
+        function editApiKey(id) {
+            const k = apikeysData.find(x => x.id === id);
+            if (!k) return;
+            const body = document.getElementById('modalBody');
+            document.getElementById('modalTitle').textContent = t('common.edit') + ': ' + (k.name || k.id);
+            body.innerHTML =
+                '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="edKeyName" value="' + (k.name || '') + '"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyRequests') + ' (0 = ∞)</label><input type="number" id="edKeyReqLim" value="' + (k.dailyReqLimit || 0) + '" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyTokens') + ' (0 = ∞)</label><input type="number" id="edKeyTokLim" value="' + (k.dailyTokLimit || 0) + '" min="0"></div>' +
+                '<div class="form-group"><label>' + t('apikeys.dailyCredits') + ' (0 = ∞)</label><input type="number" id="edKeyCredLim" value="' + (k.dailyCredLimit || 0) + '" min="0" step="0.01"></div>' +
+                '<div class="modal-footer"><button class="btn btn-primary" onclick="submitEditApiKey(\'' + id + '\')">' + t('common.save') + '</button></div>';
+            document.getElementById('addModal').classList.add('active');
+        }
+        async function submitEditApiKey(id) {
+            const payload = {
+                name: document.getElementById('edKeyName').value.trim(),
+                dailyReqLimit: parseInt(document.getElementById('edKeyReqLim').value) || 0,
+                dailyTokLimit: parseInt(document.getElementById('edKeyTokLim').value) || 0,
+                dailyCredLimit: parseFloat(document.getElementById('edKeyCredLim').value) || 0
+            };
+            const res = await fetch('/admin/api/apikeys/' + id, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+            if (d.success) { closeModal(); loadApiKeys(); }
+            else alert(d.error || 'Failed');
+        }
+        async function toggleApiKey(id, enabled) {
+            const res = await fetch('/admin/api/apikeys/' + id, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ enabled })
+            });
+            if ((await res.json()).success) loadApiKeys();
+        }
+        async function deleteApiKey(id) {
+            if (!confirm(t('apikeys.confirmDelete'))) return;
+            const res = await fetch('/admin/api/apikeys/' + id, {
+                method: 'DELETE',
+                headers: { 'X-Admin-Password': password }
+            });
+            if ((await res.json()).success) loadApiKeys();
+        }
+
+        // ==================== Analytics tab ====================
+        async function loadAnalytics() {
+            const res = await fetch('/admin/api/modelstats', { headers: { 'X-Admin-Password': password } });
+            const d = await res.json();
+            renderModelStats(d.models || {});
+            renderKeyStats();
+        }
+        function renderModelStats(models) {
+            const container = document.getElementById('modelStatsList');
+            if (!container) return;
+            const entries = Object.entries(models).sort((a, b) => (b[1].credits || 0) - (a[1].credits || 0));
+            if (entries.length === 0) {
+                container.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:30px 0">' + t('analytics.empty') + '</p>';
+                return;
+            }
+            const maxCredits = Math.max(...entries.map(e => e[1].credits || 0)) || 1;
+            container.innerHTML = entries.map(([model, s]) => {
+                const pct = ((s.credits || 0) / maxCredits) * 100;
+                return '<div style="margin-bottom:12px">' +
+                    '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">' +
+                    '<span style="font-weight:500">' + model + '</span>' +
+                    '<span style="color:#64748b;font-variant-numeric:tabular-nums">' + (s.requests || 0) + ' req · ' + formatNum(s.tokens || 0) + ' tok · ' + (s.credits || 0).toFixed(2) + ' cr</span>' +
+                    '</div>' +
+                    '<div class="usage-bar"><div class="usage-fill" style="width:' + pct + '%"></div></div>' +
+                    '</div>';
+            }).join('');
+        }
+        function renderKeyStats() {
+            const container = document.getElementById('keyStatsList');
+            if (!container) return;
+            const keys = (apikeysData || []).filter(k => (k.totalRequests || 0) > 0);
+            if (keys.length === 0) {
+                container.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:30px 0">' + t('analytics.noKeys') + '</p>';
+                return;
+            }
+            keys.sort((a, b) => (b.totalCredits || 0) - (a.totalCredits || 0));
+            const maxCredits = Math.max(...keys.map(k => k.totalCredits || 0)) || 1;
+            container.innerHTML = keys.map(k => {
+                const pct = ((k.totalCredits || 0) / maxCredits) * 100;
+                return '<div style="margin-bottom:12px">' +
+                    '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">' +
+                    '<span style="font-weight:500">' + (k.name || k.id) + '</span>' +
+                    '<span style="color:#64748b;font-variant-numeric:tabular-nums">' + (k.totalRequests || 0) + ' req · ' + formatNum(k.totalTokens || 0) + ' tok · ' + (k.totalCredits || 0).toFixed(2) + ' cr</span>' +
+                    '</div>' +
+                    '<div class="usage-bar"><div class="usage-fill" style="width:' + pct + '%"></div></div>' +
+                    '</div>';
+            }).join('');
+        }
+
         async function loadSettings() {
             const res = await fetch('/admin/api/settings', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
@@ -3150,6 +3427,13 @@
             document.querySelectorAll('.tab').forEach(tabEl => tabEl.classList.toggle('active', tabEl.dataset.tab === tab));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
             document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+            // Lazy-load tab data so we don't pay the fetch cost until the user
+            // opens the tab.
+            if (tab === 'apikeys') loadApiKeys();
+            else if (tab === 'analytics') {
+                if (apikeysData.length === 0) loadApiKeys();
+                loadAnalytics();
+            }
         }
         async function toggleAccount(id, enabled) {
             await fetch('/admin/api/accounts/' + id, {
