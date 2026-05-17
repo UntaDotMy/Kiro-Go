@@ -1,8 +1,14 @@
 version: '3.8'
 
 services:
-  kiro-go:
+  kiro-go-patch:
+    # When testing locally with `docker compose up --build`, this builds from
+    # source. For deployments, comment out `build:` and uncomment `image:`
+    # below to pull the prebuilt fork image from ghcr.io.
     build: .
+    # image: ghcr.io/untadotmy/kiro-go:latest
+    container_name: kiro-go-patch
+    pull_policy: always
     ports:
       # Host 8989 -> container 8080. Run side-by-side with the original
       # (which uses 8080 on the host); flip back to "8080:8080" once you

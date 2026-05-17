@@ -36,7 +36,7 @@ docker compose up -d
 
 ```bash
 docker run -d \
-  --name kiro-go \
+  --name kiro-go-patch \
   -p 8989:8080 \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \

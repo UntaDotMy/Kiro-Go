@@ -36,7 +36,7 @@ By default the compose file maps host port **8989** to container `8080` so this 
 
 ```bash
 docker run -d \
-  --name kiro-go \
+  --name kiro-go-patch \
   -p 8989:8080 \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
