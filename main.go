@@ -79,6 +79,17 @@ func main() {
 		os.Exit(2)
 	}
 
+	// If this was a fresh install, log the auto-generated starter API key
+	// loud-and-clear so the operator can copy it. The same key is also
+	// visible on the dashboard's "API Keys" tab on first login.
+	if k := config.FirstRunStarterKey(); k != "" {
+		logger.Infof("============================================================")
+		logger.Infof("First-run setup: created default admin API key")
+		logger.Infof("  Key: %s", k)
+		logger.Infof("  Save this now. You can rotate / revoke it from /admin -> API Keys")
+		logger.Infof("============================================================")
+	}
+
 	pool.GetPool()
 
 	handler := proxy.NewHandler()

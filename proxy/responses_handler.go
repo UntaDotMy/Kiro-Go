@@ -19,7 +19,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendResponsesError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -131,7 +131,6 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	recordModelUsage(model, inputTokens+outputTokens, credits)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
 	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, 0, reasoningCfg)
@@ -510,7 +509,6 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	recordModelUsage(model, inputTokens+outputTokens, credits)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
 	finalOutputs := []interface{}{}

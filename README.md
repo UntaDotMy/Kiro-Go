@@ -95,6 +95,11 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `LOG_LEVEL` | Log verbosity: `debug` / `info` / `warn` / `error` | `info` |
+| `KIRO_ALLOW_DEFAULT_PASSWORD` | Set to `1` to allow startup with the default password (not recommended in production) | - |
+| `KIRO_WS_ALLOW_ANY_ORIGIN` | Set to `1` to revert WebSocket Origin check to permissive (older A11 behaviour) | - |
+| `DATA_DIR` | (entrypoint) Path to chown to runtime UID/GID before drop | `/app/data` |
+| `RUN_UID` / `RUN_GID` | (entrypoint) UID/GID to drop privileges to | `1000` / `1000` |
 
 ## Contributing
 

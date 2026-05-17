@@ -9,13 +9,33 @@ import (
 )
 
 // apiListAPIKeys returns all configured API keys with their counters and
-// limits. The full secret is included so the dashboard can re-display it on
-// demand. Production deployments may want to mask all but the last 4 chars
-// — current admin panel is password-gated so we surface them in full.
+// limits. Secrets are masked to the last 4 characters of each key (e.g.
+// "sk-kg-...abcd") so an admin XSS / accidental screenshare cannot leak
+// the full secret. The full secret is returned only by apiCreateAPIKey,
+// once, at creation. To rotate a lost key, delete it and create a new one.
 func (h *Handler) apiListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys := config.GetAPIKeys()
+	for i := range keys {
+		keys[i].Key = maskAPIKeySecret(keys[i].Key)
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"keys": config.GetAPIKeys(),
+		"keys": keys,
 	})
+}
+
+// maskAPIKeySecret turns "sk-kg-abcdef...wxyz" into "sk-kg-...wxyz". For very
+// short keys (< 8 chars total) we mask everything to avoid leaking the
+// majority of the secret.
+func maskAPIKeySecret(s string) string {
+	if len(s) <= 8 {
+		return "********"
+	}
+	prefix := "sk-kg-"
+	suffix := s[len(s)-4:]
+	if len(s) > len(prefix) && s[:len(prefix)] == prefix {
+		return prefix + "..." + suffix
+	}
+	return "..." + suffix
 }
 
 // apiCreateAPIKey creates a new key. Body fields:

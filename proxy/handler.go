@@ -22,6 +22,14 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// maxRequestBodyBytes caps every JSON request body the proxy will read into
+// memory. 32 MiB is more than any reasonable Claude / OpenAI / Responses
+// payload (largest practical conversations top out around 5–10 MiB even with
+// long histories) while still defending the server from a malicious client
+// streaming an unbounded body. Wraped via http.MaxBytesReader at every
+// io.ReadAll(r.Body) call site.
+const maxRequestBodyBytes int64 = 32 * 1024 * 1024
+
 // Handler HTTP 处理器
 type Handler struct {
 	pool *pool.AccountPool
@@ -936,7 +944,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -978,7 +986,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 读取请求
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -1444,7 +1452,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
-	recordModelUsage(model, inputTokens+outputTokens, credits)
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
@@ -1613,7 +1620,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
-	recordModelUsage(model, inputTokens+outputTokens, credits)
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	responseThinkingContent := rawThinkingContent
@@ -1667,7 +1673,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -2078,7 +2084,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
-	recordModelUsage(model, inputTokens+outputTokens, credits)
 
 	// 发送结束
 	finishReason := "stop"
@@ -2163,7 +2168,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
-	recordModelUsage(model, inputTokens+outputTokens, credits)
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -2228,20 +2232,31 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 // ==================== 管理 API ====================
 
 func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
-	// 验证密码
+	// Header-only auth — explicitly drop the legacy cookie path. The cookie
+	// branch was a CSRF surface (any sibling subdomain that could plant
+	// admin_password gained admin), and the dashboard already stores the
+	// password in localStorage and sends it as X-Admin-Password on every
+	// fetch. Header auth forces preflight on cross-origin POSTs, killing
+	// the CSRF vector.
 	password := r.Header.Get("X-Admin-Password")
-	if password == "" {
-		cookie, _ := r.Cookie("admin_password")
-		if cookie != nil {
-			password = cookie.Value
-		}
+
+	// Per-IP failure rate-limit. After 10 wrong-password attempts within a
+	// rolling 5-minute window, refuse further attempts from that IP for the
+	// remainder of the window. In-memory only; resets on restart.
+	if !h.allowAdminAttempt(r) {
+		w.WriteHeader(429)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Too many failed attempts; try again later"})
+		return
 	}
 
 	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
+		h.recordAdminFailure(r)
+		logger.Warnf("[Admin] failed auth from %s for %s", clientIP(r), r.URL.Path)
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
 	}
+	h.resetAdminFailures(r)
 
 	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -3001,11 +3016,11 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
-		"totalRequests":   h.totalRequests,
-		"successRequests": h.successRequests,
-		"failedRequests":  h.failedRequests,
-		"totalTokens":     h.totalTokens,
-		"totalCredits":    h.totalCredits,
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
 		"quotaTotal":      quotaTotal,
 		"quotaUsed":       quotaUsed,
 		"uptime":          time.Now().Unix() - h.startTime,
@@ -3066,11 +3081,16 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	// All fields are pointers so the dashboard can PATCH a single field
+	// (e.g. just AllowOverUsage when toggling over-usage) without clobbering
+	// the others. Pre-A17 used a non-pointer struct, so saving "just the
+	// password" silently set RequireApiKey=false and ApiKey="".
 	var req struct {
-		ApiKey         string `json:"apiKey"`
-		RequireApiKey  bool   `json:"requireApiKey"`
-		Password       string `json:"password"`
-		AllowOverUsage *bool  `json:"allowOverUsage,omitempty"`
+		ApiKey          *string `json:"apiKey,omitempty"`
+		RequireApiKey   *bool   `json:"requireApiKey,omitempty"`
+		Password        *string `json:"password,omitempty"`
+		CurrentPassword *string `json:"currentPassword,omitempty"`
+		AllowOverUsage  *bool   `json:"allowOverUsage,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3078,7 +3098,19 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := config.UpdateSettings(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
+	// If the password is being changed, require the current password to be
+	// supplied and verified — otherwise an XSS-stolen session cookie or a
+	// CSRF-able admin endpoint could rotate the password silently.
+	if req.Password != nil && *req.Password != "" {
+		if req.CurrentPassword == nil ||
+			subtle.ConstantTimeCompare([]byte(*req.CurrentPassword), []byte(config.GetPassword())) != 1 {
+			w.WriteHeader(403)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Current password incorrect"})
+			return
+		}
+	}
+
+	if err := config.UpdateSettingsPartial(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -3116,7 +3148,6 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	h.totalCredits = 0
 	h.creditsMu.Unlock()
 	config.UpdateStats(0, 0, 0, 0, 0)
-	resetModelStats()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 

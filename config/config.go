@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -197,13 +198,28 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A16"
+const Version = "1.0.8-A17"
 
 var (
 	cfg     *Config
 	cfgLock sync.RWMutex
 	cfgPath string
+	// firstRunStarterKey is set non-empty exactly once when Load() bootstraps
+	// a new config.json. main.go logs it loudly so the operator can copy the
+	// generated default API key on first run.
+	firstRunStarterKey string
 )
+
+// FirstRunStarterKey returns the API key generated on first-run bootstrap, or
+// "" if the config was loaded from an existing file. main.go calls this once
+// after config.Init to log the key for the operator. The value is not
+// persisted in this variable across restarts — config.json is the durable
+// home.
+func FirstRunStarterKey() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return firstRunStarterKey
+}
 
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
@@ -223,12 +239,26 @@ func Load() error {
 			// Binds to 0.0.0.0 by default for Docker/container compatibility.
 			// Filter toggles default ON so a fresh install Just Works for
 			// Claude Code without the user having to enable them manually.
-			// Existing configs are not modified — only new installs.
+			// RequireApiKey defaults to true and a starter API key is
+			// generated on first run, so the proxy is secure-by-default
+			// even when the user runs `docker compose up` and does nothing
+			// else. The generated key is logged once at startup so the
+			// operator can copy it; the same key is also visible in the
+			// admin panel's "API Keys" tab on first login.
+			starterKey, _ := generateAPIKeySecret()
+			firstRunStarterKey = starterKey
 			cfg = &Config{
 				Password:              "changeme",
 				Port:                  8080,
 				Host:                  "0.0.0.0",
-				RequireApiKey:         false,
+				RequireApiKey:         true,
+				APIKeys: []APIKey{{
+					ID:        generateAPIKeyID(),
+					Name:      "default",
+					Key:       starterKey,
+					Enabled:   true,
+					CreatedAt: time.Now().Unix(),
+				}},
 				Accounts:              []Account{},
 				FilterClaudeCode:      true,
 				FilterEnvNoise:        true,
@@ -453,6 +483,25 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	cfg.RequireApiKey = requireApiKey
 	if password != "" {
 		cfg.Password = password
+	}
+	return Save()
+}
+
+// UpdateSettingsPartial applies a patch — fields left nil are not changed.
+// Used by the admin /api/settings PUT so the dashboard can save individual
+// toggles (e.g. only the over-usage flag, only the password) without
+// clobbering the rest of the auth state.
+func UpdateSettingsPartial(apiKey *string, requireApiKey *bool, password *string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if apiKey != nil {
+		cfg.ApiKey = *apiKey
+	}
+	if requireApiKey != nil {
+		cfg.RequireApiKey = *requireApiKey
+	}
+	if password != nil && *password != "" {
+		cfg.Password = *password
 	}
 	return Save()
 }

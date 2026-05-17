@@ -5,6 +5,8 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 
 	"github.com/google/uuid"
@@ -19,11 +21,37 @@ import (
 // Origin check is permissive because Codex doesn't set Origin and the
 // admin-side API key (when configured) is the actual auth boundary. If you
 // expose the proxy on the public internet, set up a reverse proxy that
-// restricts WS origins.
+// restricts WS origins. The default CheckOrigin enforces same-origin for
+// browser clients (Origin header present must match Host) but allows
+// non-browser clients like Codex CLI (no Origin header). Set the
+// KIRO_WS_ALLOW_ANY_ORIGIN env var to "1" to revert to the permissive
+// behaviour of older releases.
 var responsesWsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     checkResponsesWsOrigin,
+}
+
+// checkResponsesWsOrigin enforces same-origin for browser-initiated WS
+// upgrades while allowing CLI clients that don't set an Origin header.
+func checkResponsesWsOrigin(r *http.Request) bool {
+	if os.Getenv("KIRO_WS_ALLOW_ANY_ORIGIN") == "1" {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser client (Codex CLI doesn't set Origin). API-key auth is
+		// the boundary for these.
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	// Match Origin host[:port] to Host. The browser sets Host to the proxy's
+	// own address, so a same-page client succeeds and a cross-origin tab
+	// fails.
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // isWebSocketUpgrade returns true when the request includes the WebSocket
@@ -47,10 +75,6 @@ func isWebSocketUpgrade(r *http.Request) bool {
 // containing the JSON envelope { "event": "<name>", "data": <json> }. Codex
 // CLI's WS transport understands this format.
 func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		// Some clients use POST upgrade; accept either. Standard WS is GET.
-	}
-
 	// Validate API key from query string OR Authorization header (clients
 	// don't always set headers on WS upgrade in browsers; Codex CLI does).
 	if !h.validateApiKey(r) {
@@ -59,6 +83,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	conn, err := responsesWsUpgrader.Upgrade(w, r, nil)
+	if err == nil { conn.SetReadLimit(maxRequestBodyBytes) }
 	if err != nil {
 		logger.Warnf("[ResponsesWS] upgrade failed: %v", err)
 		return
@@ -183,11 +208,13 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		},
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
 		OnCredits:  func(c float64) { credits = c },
+		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
 	}
 
 	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
 		h.recordFailure(req.Model, apiKeyID)
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+		h.checkOverageError(err, account.ID)
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
 			"sequence_number": nextSeq(),
@@ -206,7 +233,6 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	recordModelUsage(req.Model, inputTokens+outputTokens, credits)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model) }
 
 	send("response.completed", map[string]interface{}{
