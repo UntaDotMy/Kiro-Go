@@ -114,8 +114,9 @@ type Config struct {
 	Password      string    `json:"password"`         // Admin panel password
 	Port          int       `json:"port"`             // HTTP server port (default: 8080)
 	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"` // API key for client authentication
+	ApiKey        string    `json:"apiKey,omitempty"` // Legacy single API key (kept for backward compatibility)
 	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
+	APIKeys       []APIKey  `json:"apiKeys,omitempty"` // Multi API keys with per-key limits
 	KiroVersion   string    `json:"kiroVersion,omitempty"`
 	SystemVersion string    `json:"systemVersion,omitempty"`
 	NodeVersion   string    `json:"nodeVersion,omitempty"`
@@ -196,7 +197,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A6"
+const Version = "1.0.8-A7"
 
 var (
 	cfg     *Config
