@@ -2753,6 +2753,19 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
+	// Aggregate per-account subscription quotas so the dashboard can show
+	// "Credits Total" / "Remaining" alongside the cumulative "Credits Used"
+	// without having to refetch the full /accounts list every poll.
+	var quotaTotal, quotaUsed float64
+	for _, a := range config.GetAccounts() {
+		if a.UsageLimit > 0 {
+			quotaTotal += a.UsageLimit
+		}
+		if a.UsageCurrent > 0 {
+			quotaUsed += a.UsageCurrent
+		}
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
@@ -2761,6 +2774,8 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  h.failedRequests,
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
+		"quotaTotal":      quotaTotal,
+		"quotaUsed":       quotaUsed,
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }

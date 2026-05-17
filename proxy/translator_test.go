@@ -76,15 +76,19 @@ func TestOpenAIToKiroPreservesStructuredAssistantAndToolContent(t *testing.T) {
 	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
-	if !strings.Contains(cur.Content, "tool-result-structured") {
-		t.Fatalf("expected tool-result continuation content, got %q", cur.Content)
-	}
+	// Structured tool results live in UserInputMessageContext.ToolResults, NOT
+	// in the prose content. Older revisions also synthesized a "Tool results:"
+	// prose envelope inside cur.Content; that has been removed because the
+	// upstream model fingerprinted it as a fake harness signal.
 	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
 		t.Fatalf("expected one tool result in current context")
 	}
 	gotToolText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
 	if gotToolText != "tool-result-structured" {
 		t.Fatalf("expected structured tool result text, got %q", gotToolText)
+	}
+	if strings.Contains(cur.Content, "Tool results:") {
+		t.Fatalf("did not expect prose tool-results envelope in cur.Content, got %q", cur.Content)
 	}
 }
 
@@ -251,6 +255,16 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 }
 
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
+	t.Skip("retired: tool results no longer travel as a 'Tool results:' prose envelope; see TestOpenAIToolResultsTravelInStructuredField")
+}
+
+// TestOpenAIToolResultsTravelInStructuredField verifies that when the OpenAI
+// path receives a tool result as the final turn, it is forwarded via
+// UserInputMessageContext.ToolResults rather than synthesized into a
+// "Tool results:" prose envelope inside userInputMessage.Content. The prose
+// envelope was an older convention the upstream model fingerprinted as a
+// fake harness signal.
+func TestOpenAIToolResultsTravelInStructuredField(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
 		Messages: []OpenAIMessage{
@@ -268,12 +282,18 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	}
 
 	payload := OpenAIToKiro(req, false)
-	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 
-	if !strings.Contains(content, toolResultsContinuationPrefix) {
-		t.Fatalf("expected tool continuation prefix, got %q", content)
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected one tool result in current context, got %#v", cur.UserInputMessageContext)
 	}
-	if !strings.Contains(content, "result-1") {
-		t.Fatalf("expected tool result text in continuation content, got %q", content)
+	if got := cur.UserInputMessageContext.ToolResults[0].Content[0].Text; got != "result-1" {
+		t.Fatalf("expected structured tool result text 'result-1', got %q", got)
+	}
+	if strings.Contains(cur.Content, "Tool results:") {
+		t.Fatalf("did not expect 'Tool results:' prose envelope in cur.Content, got %q", cur.Content)
+	}
+	if strings.Contains(cur.Content, "result-1") {
+		t.Fatalf("did not expect tool-result text duplicated in cur.Content, got %q", cur.Content)
 	}
 }
