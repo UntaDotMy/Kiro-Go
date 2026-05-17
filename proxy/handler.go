@@ -514,7 +514,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleOpenAIChat(w, r)
-	case path == "/v1/responses" || path == "/responses" || path == "/openai/v1/responses":
+	case path == "/v1/responses" || path == "/responses" || path == "/openai/v1/responses" || path == "/backend-api/codex/responses":
+		// Codex CLI uses /backend-api/codex/responses; the OpenAI Responses
+		// API path is /v1/responses. Both routes accept either HTTP POST
+		// (SSE streaming) or a WebSocket upgrade — Codex CLI's experimental
+		// "responses_websockets" feature flag uses the WS variant.
+		if isWebSocketUpgrade(r) {
+			h.handleResponsesWebSocket(w, r)
+			return
+		}
 		if !h.validateApiKey(r) {
 			h.sendResponsesError(w, 401, "authentication_error", "Invalid or missing API key")
 			return

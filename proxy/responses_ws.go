@@ -1,0 +1,208 @@
+package proxy
+
+import (
+	"encoding/json"
+	"kiro-go/config"
+	"kiro-go/logger"
+	"net/http"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+)
+
+// responsesWsUpgrader accepts WebSocket upgrades on /v1/responses for Codex
+// CLI's experimental "responses_websockets" / "responses_websockets_v2"
+// transport. Codex sends one request frame and expects the same SSE event
+// shape we already emit in HTTP streaming, just delivered as text messages.
+//
+// Origin check is permissive because Codex doesn't set Origin and the
+// admin-side API key (when configured) is the actual auth boundary. If you
+// expose the proxy on the public internet, set up a reverse proxy that
+// restricts WS origins.
+var responsesWsUpgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin:     func(r *http.Request) bool { return true },
+}
+
+// isWebSocketUpgrade returns true when the request includes the WebSocket
+// upgrade headers, regardless of casing.
+func isWebSocketUpgrade(r *http.Request) bool {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	connection := r.Header.Get("Connection")
+	for _, part := range strings.Split(connection, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "upgrade") {
+			return true
+		}
+	}
+	return false
+}
+
+// handleResponsesWebSocket upgrades an HTTP request to a WebSocket and runs
+// the same Responses streaming pipeline as the SSE path, except every "event:
+// <name>\ndata: <json>\n\n" is delivered as a single WebSocket text message
+// containing the JSON envelope { "event": "<name>", "data": <json> }. Codex
+// CLI's WS transport understands this format.
+func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		// Some clients use POST upgrade; accept either. Standard WS is GET.
+	}
+
+	// Validate API key from query string OR Authorization header (clients
+	// don't always set headers on WS upgrade in browsers; Codex CLI does).
+	if !h.validateApiKey(r) {
+		w.WriteHeader(401)
+		return
+	}
+
+	conn, err := responsesWsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Warnf("[ResponsesWS] upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Read the initial request frame. Codex sends one JSON message containing
+	// the full ResponsesRequest body.
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		logger.Warnf("[ResponsesWS] read initial frame: %v", err)
+		return
+	}
+
+	var req ResponsesRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		_ = conn.WriteJSON(map[string]interface{}{
+			"event": "error",
+			"data": map[string]interface{}{
+				"type":    "invalid_request_error",
+				"message": "Invalid JSON: " + err.Error(),
+			},
+		})
+		return
+	}
+	if strings.TrimSpace(req.Model) == "" {
+		req.Model = "claude-sonnet-4.5"
+	}
+
+	claudeReq := ResponsesToClaudeRequest(&req)
+	thinkingCfg := config.GetThinkingConfig()
+	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
+	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
+
+	account := h.pool.GetNextForModel(mappedModel)
+	if account == nil {
+		_ = conn.WriteJSON(map[string]interface{}{
+			"event": "error",
+			"data":  map[string]interface{}{"type": "server_error", "message": "No available accounts"},
+		})
+		return
+	}
+	if err := h.ensureValidToken(account); err != nil {
+		_ = conn.WriteJSON(map[string]interface{}{
+			"event": "error",
+			"data":  map[string]interface{}{"type": "server_error", "message": "Token refresh failed: " + err.Error()},
+		})
+		return
+	}
+
+	estimatedInputTokens := estimateClaudeRequestInputTokens(claudeReq)
+	if estimatedInputTokens < 1 {
+		estimatedInputTokens = 1
+	}
+	kiroPayload := ClaudeToKiro(claudeReq, thinking)
+
+	includeReasoning := true
+	if req.Reasoning != nil && strings.EqualFold(strings.TrimSpace(req.Reasoning.Summary), "none") {
+		includeReasoning = false
+	}
+
+	// Stream events over the WS connection by adapting the same logic the
+	// SSE streaming handler uses. We reuse a minimal state machine that
+	// emits the Codex envelope shape; this is intentionally a stripped-down
+	// mirror of handleResponsesStream so future changes there don't have to
+	// be replicated here field-for-field.
+	respID := "resp_" + uuid.New().String()
+	send := func(event string, data interface{}) {
+		_ = conn.WriteJSON(map[string]interface{}{"event": event, "data": data})
+	}
+	send("response.created", map[string]interface{}{
+		"type": "response.created",
+		"response": map[string]interface{}{
+			"id": respID, "object": "response", "status": "in_progress", "model": req.Model,
+		},
+	})
+
+	var (
+		seq          int
+		messageBuf   strings.Builder
+		reasoningBuf strings.Builder
+		inputTokens  int
+		outputTokens int
+		credits      float64
+	)
+	nextSeq := func() int { seq++; return seq }
+
+	callback := &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				if !includeReasoning {
+					return
+				}
+				reasoningBuf.WriteString(text)
+				send("response.reasoning_summary_text.delta", map[string]interface{}{
+					"type": "response.reasoning_summary_text.delta", "sequence_number": nextSeq(), "delta": text,
+				})
+				return
+			}
+			messageBuf.WriteString(text)
+			send("response.output_text.delta", map[string]interface{}{
+				"type": "response.output_text.delta", "sequence_number": nextSeq(), "delta": text,
+			})
+		},
+		OnToolUse: func(tu KiroToolUse) {
+			argsStr, _ := json.Marshal(tu.Input)
+			send("response.function_call_arguments.done", map[string]interface{}{
+				"type": "response.function_call_arguments.done", "sequence_number": nextSeq(),
+				"call_id": tu.ToolUseID, "name": tu.Name, "arguments": string(argsStr),
+			})
+		},
+		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
+		OnCredits:  func(c float64) { credits = c },
+	}
+
+	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
+		h.recordFailure()
+		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+		send("response.failed", map[string]interface{}{
+			"type":            "response.failed",
+			"sequence_number": nextSeq(),
+			"response":        map[string]interface{}{"id": respID, "status": "failed", "error": map[string]interface{}{"type": "server_error", "message": err.Error()}},
+		})
+		return
+	}
+
+	if inputTokens <= 0 {
+		inputTokens = estimatedInputTokens
+	}
+	if outputTokens <= 0 {
+		outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
+	}
+	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.pool.RecordSuccess(account.ID)
+	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.triggerAccountRefresh(account.ID)
+	recordModelUsage(req.Model, inputTokens+outputTokens, credits)
+
+	send("response.completed", map[string]interface{}{
+		"type":            "response.completed",
+		"sequence_number": nextSeq(),
+		"response": map[string]interface{}{
+			"id": respID, "status": "completed", "model": req.Model,
+			"usage": map[string]interface{}{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": inputTokens + outputTokens},
+		},
+	})
+}
