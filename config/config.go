@@ -198,7 +198,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A19"
+const Version = "1.0.8-A20"
 
 var (
 	cfg     *Config
@@ -663,6 +663,27 @@ func GetThinkingConfig() ThinkingConfig {
 		Suffix:       suffix,
 		OpenAIFormat: openaiFormat,
 		ClaudeFormat: claudeFormat,
+	}
+}
+
+// GetThinkingConfigOrEmpty is a nil-safe variant of GetThinkingConfig usable
+// from helpers that may run before config.Init (e.g. unit tests covering the
+// model translator). Returns nil when cfg has not been initialised so the
+// caller can fall back to defaults rather than panic on a nil dereference.
+func GetThinkingConfigOrEmpty() *ThinkingConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	suffix := cfg.ThinkingSuffix
+	if suffix == "" {
+		suffix = "-thinking"
+	}
+	return &ThinkingConfig{
+		Suffix:       suffix,
+		OpenAIFormat: cfg.OpenAIThinkingFormat,
+		ClaudeFormat: cfg.ClaudeThinkingFormat,
 	}
 }
 

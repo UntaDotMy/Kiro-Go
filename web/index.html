@@ -2496,14 +2496,20 @@
             const rate = total > 0 ? (ok / total * 100) : 0;
             document.getElementById('statSuccessRate').textContent = total > 0 ? rate.toFixed(1) + '%' : '-';
 
-            // "Credits Used" reflects what Kiro reports as actually consumed
-            // on the underlying accounts (sum of usageCurrent across all
-            // accounts). This is the number that matches between the original
-            // upstream proxy and any fork running against the same accounts —
-            // it's the only credit metric that's account-true. The proxy's
-            // run-time counter (d.totalCredits) is per-instance and naturally
-            // diverges between forks; we keep it as a fallback if the server
-            // doesn't expose quotaUsed yet.
+            // "Credits Used" and "Credits Total" come straight from Kiro's
+            // account-info endpoint (each account.UsageCurrent / UsageLimit,
+            // summed across all configured accounts). This is the only
+            // account-true number — it tells you what Kiro itself thinks
+            // you've spent and what your subscription cap is, so you always
+            // know how much is left.
+            //
+            // The proxy refreshes Kiro's account-info ~3 seconds after each
+            // request (lazy debounced refresh) plus a global tick every
+            // 30 minutes, so the displayed number lags real life by at most
+            // a few seconds during active use. The proxy's in-memory
+            // run-time counter (d.totalCredits) is shown as a separate "live"
+            // value and is only used as a fallback when accounts haven't
+            // been refreshed yet (fresh process before the first refresh).
             let limitSum = 0, currentSum = 0;
             if (typeof d.quotaTotal === 'number' && d.quotaTotal > 0) {
                 limitSum = d.quotaTotal;
@@ -2515,8 +2521,8 @@
                 }
             }
 
-            // statCredits = "Credits Used" = quotaUsed (account-true).
-            // Falls back to proxy run-time counter if quota data not loaded yet.
+            // Real Kiro number first (currentSum). Fall back to proxy run-time
+            // counter only if accounts haven't been polled yet.
             const usedDisplay = currentSum > 0 ? currentSum : (d.totalCredits || 0);
             document.getElementById('statCredits').textContent = usedDisplay.toFixed(1);
 
@@ -3900,7 +3906,10 @@
                 } else alert(t('common.failed') + ': ' + d.error);
             }
         }
-        setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
+        // Poll every 3 seconds while the dashboard is open so the live
+        // counters (Requests / Tokens / Credits) feel real-time after each
+        // request. Was 10 s before A20.
+        setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 3000);
 
         // ==================== 版本检查 ====================
         let currentVersion = '';

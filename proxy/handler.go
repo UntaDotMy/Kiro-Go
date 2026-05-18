@@ -323,8 +323,12 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 
 	safeGoArg("triggerAccountRefresh", accountID, func(id string) {
 		// Debounce: coalesce bursts of requests into a single refresh.
+		// 3 seconds is short enough that the dashboard's verified `quotaUsed`
+		// number catches up almost in real-time, while still coalescing
+		// rapid-fire requests onto a single Kiro account-info refresh.
+		// Was 30 s before A20 — that was too slow for a "live" dashboard UX.
 		select {
-		case <-time.After(30 * time.Second):
+		case <-time.After(3 * time.Second):
 		case <-h.stopRefresh:
 			h.refreshDebounceMu.Lock()
 			delete(h.refreshScheduled, id)
@@ -743,27 +747,170 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"output": []string{"text"},
 	}
 
-	return map[string]interface{}{
-		"id":               id,
-		"object":           "model",
-		"owned_by":         ownedBy,
-		"supports_image":   supportsImage,
-		"input_modalities": modalities,
-		"modalities":       modalitiesMap,
+	// Claude Code 2.x reads these capability fields from /v1/models to decide:
+	//   - whether to show the model in the picker as "available" (vs grayed out)
+	//   - whether to enable the effort / thinking control
+	//   - whether to surface it in /model command instead of falling back to a
+	//     stale "Opus 4 has been updated to the latest" placeholder
+	// The thinking suffix is what tells the upstream proxy to flip Kiro into
+	// extended-thinking mode; when it's present in the model id, Claude Code
+	// also wants supports_extended_thinking=true on the response so the
+	// effort slider activates. We avoid calling config.GetThinkingConfig()
+	// inside this function so it stays pure / testable.
+	thinkingSuffix := ""
+	if c := config.GetThinkingConfigOrEmpty(); c != nil {
+		thinkingSuffix = c.Suffix
+	}
+	supportsExtendedThinking := thinkingSuffix != "" && strings.HasSuffix(id, thinkingSuffix)
+	contextWindow := getContextWindowSize(id)
+	maxOutputTokens := 8192
+	if strings.Contains(strings.ToLower(id), "opus") {
+		maxOutputTokens = 32000
+	}
+
+	createdAt := modelCreatedAt(id)
+
+	out := map[string]interface{}{
+		// Anthropic spec fields (https://docs.claude.com/en/api/models-list)
+		"id":           id,
+		"type":         "model",
+		"display_name": modelDisplayName(id, supportsExtendedThinking),
+		"created_at":   createdAt,
+		// Legacy OpenAI-shaped fields kept for SDKs that walk both keys.
+		"object":   "model",
+		"owned_by": ownedBy,
+		"created":  modelCreatedUnix(id),
+		// Capability flags Claude Code 2.x and many SDKs introspect.
+		"supports_image":             supportsImage,
+		"supports_vision":            supportsImage,
+		"supports_extended_thinking": supportsExtendedThinking,
+		"supports_tools":             true,
+		"supports_streaming":         true,
+		"supports_function_calling":  true,
+		"max_tokens":                 maxOutputTokens,
+		"max_output_tokens":          maxOutputTokens,
+		"context_window":             contextWindow,
+		"context_length":             contextWindow,
+		"input_modalities":           modalities,
+		"output_modalities":          []string{"text"},
+		"modalities":                 modalitiesMap,
 		"capabilities": map[string]bool{
-			"vision":       supportsImage,
-			"image":        supportsImage,
-			"image_vision": supportsImage,
+			"vision":             supportsImage,
+			"image":              supportsImage,
+			"image_vision":       supportsImage,
+			"tools":              true,
+			"streaming":          true,
+			"function_calling":   true,
+			"extended_thinking":  supportsExtendedThinking,
+			"reasoning":          supportsExtendedThinking,
 		},
 		"info": map[string]interface{}{
 			"meta": map[string]interface{}{
 				"capabilities": map[string]bool{
-					"vision":       supportsImage,
-					"image_vision": supportsImage,
+					"vision":            supportsImage,
+					"image_vision":      supportsImage,
+					"extended_thinking": supportsExtendedThinking,
+					"reasoning":         supportsExtendedThinking,
 				},
 			},
 		},
 	}
+	return out
+}
+
+// modelDisplayName builds a human-friendly label from the canonical id so
+// Claude Code's picker shows e.g. "Claude Opus 4.7 (Thinking)" instead of
+// the raw "claude-opus-4-7-20251101-thinking".
+func modelDisplayName(id string, withThinking bool) string {
+	base := id
+	suffix := ""
+	if c := config.GetThinkingConfigOrEmpty(); c != nil {
+		suffix = c.Suffix
+	}
+	if suffix != "" {
+		base = strings.TrimSuffix(base, suffix)
+	}
+	// Drop YYYYMMDD date stamp if present — keep the family + version.
+	if idx := strings.LastIndex(base, "-"); idx > 0 && len(base)-idx == 9 {
+		tail := base[idx+1:]
+		allDigits := true
+		for _, r := range tail {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			base = base[:idx]
+		}
+	}
+	parts := strings.Split(base, "-")
+	cap := func(s string) string {
+		if s == "" {
+			return s
+		}
+		return strings.ToUpper(s[:1]) + s[1:]
+	}
+	pretty := make([]string, 0, len(parts))
+	for _, p := range parts {
+		switch p {
+		case "claude":
+			pretty = append(pretty, "Claude")
+		case "opus", "sonnet", "haiku":
+			pretty = append(pretty, cap(p))
+		default:
+			// Re-merge the version digits with a dot ("4-7" -> "4.7").
+			if len(p) == 1 && p[0] >= '0' && p[0] <= '9' && len(pretty) > 0 {
+				pretty[len(pretty)-1] = pretty[len(pretty)-1] + "." + p
+				continue
+			}
+			pretty = append(pretty, p)
+		}
+	}
+	label := strings.Join(pretty, " ")
+	if withThinking {
+		label += " (Thinking)"
+	}
+	return label
+}
+
+// modelCreatedAt returns an RFC3339 timestamp for the model. Claude Code uses
+// this as a tie-breaker when multiple variants share a family. We extract the
+// YYYYMMDD suffix when present, otherwise return today's date so the model is
+// always treated as current.
+func modelCreatedAt(id string) string {
+	suffix := ""
+	if c := config.GetThinkingConfigOrEmpty(); c != nil {
+		suffix = c.Suffix
+	}
+	base := id
+	if suffix != "" {
+		base = strings.TrimSuffix(base, suffix)
+	}
+	if idx := strings.LastIndex(base, "-"); idx > 0 && len(base)-idx == 9 {
+		tail := base[idx+1:]
+		allDigits := true
+		for _, r := range tail {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits && len(tail) == 8 {
+			return tail[:4] + "-" + tail[4:6] + "-" + tail[6:8] + "T00:00:00Z"
+		}
+	}
+	return time.Now().UTC().Format("2006-01-02T15:04:05Z")
+}
+
+// modelCreatedUnix returns the OpenAI-shaped Unix-seconds variant of the
+// created_at timestamp.
+func modelCreatedUnix(id string) int64 {
+	t, err := time.Parse(time.RFC3339, modelCreatedAt(id))
+	if err != nil {
+		return time.Now().Unix()
+	}
+	return t.Unix()
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
