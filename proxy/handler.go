@@ -1544,6 +1544,27 @@ func (h *Handler) recordSuccess(model, apiKeyID string, inputTokens, outputToken
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
 	stats.Record(model, apiKeyID, true, inputTokens, outputTokens, credits)
+	// One-line success trace at INFO so operators can verify the counters
+	// chain end-to-end (model -> tokens -> credits -> SQLite). Set
+	// LOG_LEVEL=warn in production if this is too noisy; the data is also
+	// available via /admin/api/status and the Analytics tab.
+	logger.Infof("[Stats] model=%s key=%s in=%d out=%d credits=%.4f total_req=%d total_tok=%d total_cred=%.2f",
+		model,
+		apiKeyIDForLog(apiKeyID),
+		inputTokens, outputTokens, credits,
+		atomic.LoadInt64(&h.totalRequests),
+		atomic.LoadInt64(&h.totalTokens),
+		h.getCredits(),
+	)
+}
+
+// apiKeyIDForLog returns "-" when no key is associated, so the log line is
+// always parseable as space-separated key=value pairs.
+func apiKeyIDForLog(id string) string {
+	if id == "" {
+		return "-"
+	}
+	return id
 }
 
 func (h *Handler) recordFailure(model, apiKeyID string) {
