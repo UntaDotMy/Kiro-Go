@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   kiro-go-patch:
     # When testing locally with `docker compose up --build`, this builds from

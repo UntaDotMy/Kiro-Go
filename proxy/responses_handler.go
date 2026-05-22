@@ -6,6 +6,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,8 +48,13 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
 	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
 
-	account := h.pool.GetNextForModel(mappedModel)
-	if account == nil {
+	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
+	if !ok {
+		if retryAfter > 0 {
+			setRetryAfter(w, retryAfter)
+			h.sendResponsesError(w, 429, "rate_limit_exceeded", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+			return
+		}
 		h.sendResponsesError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -86,6 +92,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	var inputTokens, outputTokens int
 	var credits float64
 	var realInputTokens int
+	var upstreamStopReason string
 
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
@@ -97,17 +104,16 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
-		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
+		OnError:    func(err error) { h.recordPoolError(account.ID, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.recordFailure(model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		h.sendResponsesError(w, 500, "server_error", err.Error())
 		return
 	}
@@ -133,7 +139,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
-	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, 0, reasoningCfg)
+	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, 0, reasoningCfg, upstreamStopReason)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
@@ -176,7 +182,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 		"object":              "response",
 		"created_at":          now,
 		"status":              "in_progress",
-		"model":               model,
+		"model":               canonicalAnthropicModelID(model),
 		"output":              []interface{}{},
 		"parallel_tool_calls": true,
 		"reasoning":           reasoningCfg,
@@ -218,6 +224,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 		inputTokens, outputTokens int
 		credits                   float64
 		realInputTokens           int
+		upstreamStopReason        string
 	)
 
 	nextSeq := func() int { seq++; return seq }
@@ -465,17 +472,16 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 			})
 		},
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
-		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
+		OnError:    func(err error) { h.recordPoolError(account.ID, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.recordFailure(model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		// Emit failure events Codex understands.
 		h.sendResponsesEvent(w, flusher, "response.failed", map[string]interface{}{
 			"type":            "response.failed",
@@ -556,20 +562,27 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 		}
 	}
 
+	completedStatus := "completed"
+	completedResponse := map[string]interface{}{
+		"id":                  respID,
+		"object":              "response",
+		"created_at":          now,
+		"status":              completedStatus,
+		"model":               canonicalAnthropicModelID(model),
+		"output":              finalOutputs,
+		"usage":               usage,
+		"parallel_tool_calls": true,
+		"reasoning":           reasoningCfg,
+	}
+	if upstreamStopReason == "max_tokens" {
+		completedResponse["status"] = "incomplete"
+		completedResponse["incomplete_details"] = map[string]string{"reason": "max_output_tokens"}
+	}
+
 	h.sendResponsesEvent(w, flusher, "response.completed", map[string]interface{}{
 		"type":            "response.completed",
 		"sequence_number": nextSeq(),
-		"response": map[string]interface{}{
-			"id":                  respID,
-			"object":              "response",
-			"created_at":          now,
-			"status":              "completed",
-			"model":               model,
-			"output":              finalOutputs,
-			"usage":               usage,
-			"parallel_tool_calls": true,
-			"reasoning":           reasoningCfg,
-		},
+		"response":        completedResponse,
 	})
 }
 

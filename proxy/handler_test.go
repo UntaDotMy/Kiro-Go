@@ -381,3 +381,43 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
 	}
 }
+
+// TestApplyAdaptiveThinkingDefaultInjectsAdaptive verifies that requests
+// against Claude 4-family models with no thinking config gain
+// thinking.type="adaptive" so Claude Code displays the thinking indicator.
+func TestApplyAdaptiveThinkingDefaultInjectsAdaptive(t *testing.T) {
+	req := &ClaudeRequest{Model: "claude-opus-4.7"}
+	applyAdaptiveThinkingDefault(req)
+	if req.Thinking == nil || req.Thinking.Type != "adaptive" {
+		t.Fatalf("expected adaptive thinking to be injected, got %#v", req.Thinking)
+	}
+	if req.Thinking.BudgetTokens != 0 {
+		t.Fatalf("expected no budget tokens for adaptive default, got %d", req.Thinking.BudgetTokens)
+	}
+}
+
+// TestApplyAdaptiveThinkingDefaultRespectsExisting verifies that an
+// explicit thinking config from the client is left intact (so users who
+// disabled thinking keep that choice). The function only fills in defaults.
+func TestApplyAdaptiveThinkingDefaultRespectsExisting(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-opus-4.7",
+		Thinking: &ClaudeThinkingConfig{Type: "disabled"},
+	}
+	applyAdaptiveThinkingDefault(req)
+	if req.Thinking.Type != "disabled" {
+		t.Fatalf("expected explicit disabled to be preserved, got %q", req.Thinking.Type)
+	}
+}
+
+// TestApplyAdaptiveThinkingDefaultSkipsNonClaude verifies that non-Claude
+// models (e.g. legacy GPT routes during passthrough) don't get an adaptive
+// thinking config injected.
+func TestApplyAdaptiveThinkingDefaultSkipsNonClaude(t *testing.T) {
+	req := &ClaudeRequest{Model: "gpt-4o"}
+	applyAdaptiveThinkingDefault(req)
+	if req.Thinking != nil {
+		t.Fatalf("expected no thinking config for non-Claude model, got %#v", req.Thinking)
+	}
+}
+

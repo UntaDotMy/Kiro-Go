@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -129,11 +130,17 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
 	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
 
-	account := h.pool.GetNextForModel(mappedModel)
-	if account == nil {
+	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
+	if !ok {
+		errMsg := "No available accounts"
+		errType := "server_error"
+		if retryAfter > 0 {
+			errMsg = "All accounts are rate limited; retry after " + strconv.Itoa(retryAfterSeconds(retryAfter)) + "s"
+			errType = "rate_limit_exceeded"
+		}
 		_ = conn.WriteJSON(map[string]interface{}{
 			"event": "error",
-			"data":  map[string]interface{}{"type": "server_error", "message": "No available accounts"},
+			"data":  map[string]interface{}{"type": errType, "message": errMsg},
 		})
 		return
 	}
@@ -168,17 +175,18 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	send("response.created", map[string]interface{}{
 		"type": "response.created",
 		"response": map[string]interface{}{
-			"id": respID, "object": "response", "status": "in_progress", "model": req.Model,
+			"id": respID, "object": "response", "status": "in_progress", "model": canonicalAnthropicModelID(req.Model),
 		},
 	})
 
 	var (
-		seq          int
-		messageBuf   strings.Builder
-		reasoningBuf strings.Builder
-		inputTokens  int
-		outputTokens int
-		credits      float64
+		seq                int
+		messageBuf         strings.Builder
+		reasoningBuf       strings.Builder
+		inputTokens        int
+		outputTokens       int
+		credits            float64
+		upstreamStopReason string
 	)
 	nextSeq := func() int { seq++; return seq }
 
@@ -206,15 +214,14 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 				"call_id": tu.ToolUseID, "name": tu.Name, "arguments": string(argsStr),
 			})
 		},
-		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
-		OnCredits:  func(c float64) { credits = c },
-		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
+		OnComplete:   func(in, out int) { inputTokens, outputTokens = in, out },
+		OnCredits:    func(c float64) { credits = c },
+		OnError:      func(err error) { h.recordPoolError(account.ID, err) },
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
-		h.recordFailure(req.Model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID)
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
 			"sequence_number": nextSeq(),
@@ -235,12 +242,19 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model) }
 
+	completedStatus := "completed"
+	completedPayload := map[string]interface{}{
+		"id": respID, "status": completedStatus, "model": canonicalAnthropicModelID(req.Model),
+		"usage": map[string]interface{}{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": inputTokens + outputTokens},
+	}
+	if upstreamStopReason == "max_tokens" {
+		completedPayload["status"] = "incomplete"
+		completedPayload["incomplete_details"] = map[string]string{"reason": "max_output_tokens"}
+	}
+
 	send("response.completed", map[string]interface{}{
 		"type":            "response.completed",
 		"sequence_number": nextSeq(),
-		"response": map[string]interface{}{
-			"id": respID, "status": "completed", "model": req.Model,
-			"usage": map[string]interface{}{"input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": inputTokens + outputTokens},
-		},
+		"response":        completedPayload,
 	})
 }

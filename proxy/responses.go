@@ -63,17 +63,24 @@ type ResponsesTool struct {
 
 // ResponsesResponse is the non-streaming /v1/responses response body.
 type ResponsesResponse struct {
-	ID         string            `json:"id"`
-	Object     string            `json:"object"`
-	CreatedAt  int64             `json:"created_at"`
-	Status     string            `json:"status"`
-	Model      string            `json:"model"`
-	Output     []ResponsesOutput `json:"output"`
-	Usage      ResponsesUsage    `json:"usage"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Reasoning  *ResponsesReason  `json:"reasoning,omitempty"`
-	ParallelTC bool              `json:"parallel_tool_calls"`
-	Tools      []ResponsesTool   `json:"tools,omitempty"`
+	ID                string                       `json:"id"`
+	Object            string                       `json:"object"`
+	CreatedAt         int64                        `json:"created_at"`
+	Status            string                       `json:"status"`
+	Model             string                       `json:"model"`
+	Output            []ResponsesOutput            `json:"output"`
+	Usage             ResponsesUsage               `json:"usage"`
+	Metadata          map[string]string            `json:"metadata,omitempty"`
+	Reasoning         *ResponsesReason             `json:"reasoning,omitempty"`
+	ParallelTC        bool                         `json:"parallel_tool_calls"`
+	Tools             []ResponsesTool              `json:"tools,omitempty"`
+	IncompleteDetails *ResponsesIncompleteDetails  `json:"incomplete_details,omitempty"`
+}
+
+// ResponsesIncompleteDetails carries the reason a response did not run to
+// completion. Reason is one of: "max_output_tokens", "content_filter".
+type ResponsesIncompleteDetails struct {
+	Reason string `json:"reason"`
 }
 
 // ResponsesOutput is one item in the response.output array. Type is one of:
@@ -333,7 +340,7 @@ func convertResponsesContentForClaude(content interface{}) interface{} {
 
 // BuildResponsesNonStream assembles a non-streaming Responses payload from the
 // upstream Kiro completion data.
-func BuildResponsesNonStream(model, content, reasoning string, toolUses []KiroToolUse, inputTokens, outputTokens int, includeReasoning bool, cachedInputTokens int, reasoningCfg *ResponsesReason) *ResponsesResponse {
+func BuildResponsesNonStream(model, content, reasoning string, toolUses []KiroToolUse, inputTokens, outputTokens int, includeReasoning bool, cachedInputTokens int, reasoningCfg *ResponsesReason, upstreamStopReason string) *ResponsesResponse {
 	now := time.Now().Unix()
 
 	output := make([]ResponsesOutput, 0, 1+len(toolUses))
@@ -373,15 +380,23 @@ func BuildResponsesNonStream(model, content, reasoning string, toolUses []KiroTo
 		})
 	}
 
+	status := "completed"
+	var incomplete *ResponsesIncompleteDetails
+	if upstreamStopReason == "max_tokens" {
+		status = "incomplete"
+		incomplete = &ResponsesIncompleteDetails{Reason: "max_output_tokens"}
+	}
+
 	resp := &ResponsesResponse{
-		ID:         "resp_" + uuid.New().String(),
-		Object:     "response",
-		CreatedAt:  now,
-		Status:     "completed",
-		Model:      model,
-		Output:     output,
-		ParallelTC: true,
-		Reasoning:  reasoningCfg,
+		ID:                "resp_" + uuid.New().String(),
+		Object:            "response",
+		CreatedAt:         now,
+		Status:            status,
+		Model:             canonicalAnthropicModelID(model),
+		Output:            output,
+		ParallelTC:        true,
+		Reasoning:         reasoningCfg,
+		IncompleteDetails: incomplete,
 		Usage: ResponsesUsage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,

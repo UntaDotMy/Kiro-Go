@@ -12,6 +12,7 @@ import (
 	"kiro-go/pool"
 	"kiro-go/stats"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -156,6 +157,37 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 	}
 
 	return ""
+}
+
+// applyAdaptiveThinkingDefault mutates req so adaptive thinking is enabled
+// when the client did not specify any thinking config. Kiro upstream uses
+// adaptive thinking by default for Claude 4-family models, so flipping this
+// on lets Claude Code's /model panel surface the "thinking" indicator and
+// routes reasoning content through the response builder.
+//
+// When the client explicitly sent thinking.type="enabled" with a
+// budget_tokens value, log a debug line noting that the budget is dropped
+// (Kiro upstream doesn't accept budget_tokens or reasoning_effort —
+// kirodotdev/Kiro #8576, #8577) but otherwise leave the config untouched so
+// validation still applies.
+func applyAdaptiveThinkingDefault(req *ClaudeRequest) {
+	if req == nil {
+		return
+	}
+
+	if req.Thinking == nil {
+		if !modelSupportsAdaptiveThinking(req.Model) {
+			return
+		}
+		req.Thinking = &ClaudeThinkingConfig{Type: "adaptive"}
+		logger.Debugf("[Thinking] Defaulting to adaptive thinking for %s", req.Model)
+		return
+	}
+
+	kind := strings.ToLower(strings.TrimSpace(req.Thinking.Type))
+	if kind == "enabled" && req.Thinking.BudgetTokens > 0 {
+		logger.Debugf("[Thinking] Client requested thinking.type=enabled with budget_tokens=%d for %s; Kiro upstream does not accept budget_tokens — adaptive thinking will be applied (budget dropped). See kirodotdev/Kiro#8576, #8577.", req.Thinking.BudgetTokens, req.Model)
+	}
 }
 
 type claudeThinkingResponseOptions struct {
@@ -1113,6 +1145,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
+	applyAdaptiveThinkingDefault(&req)
 	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
@@ -1155,6 +1188,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+	// Default to adaptive thinking for Claude-family models when the client
+	// did not specify any thinking config. Kiro upstream uses adaptive thinking
+	// by default; setting thinking.type="adaptive" on the inbound request makes
+	// Claude Code's /model panel surface the "thinking" indicator and routes
+	// reasoning content through the response builder.
+	applyAdaptiveThinkingDefault(&req)
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
@@ -1169,8 +1208,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 获取账号（按模型过滤，优先选支持该模型的账号）
 	actualModel, _ := ParseModelAndThinking(req.Model, config.GetThinkingConfig().Suffix)
-	account := h.pool.GetNextForModel(actualModel)
-	if account == nil {
+	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
+	if !ok {
+		if retryAfter > 0 {
+			setRetryAfter(w, retryAfter)
+			h.sendClaudeError(w, 429, "rate_limit_error", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+			return
+		}
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
@@ -1235,6 +1279,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	var nextContentIndex int
 	var rawContentBuilder strings.Builder
 	var rawThinkingBuilder strings.Builder
+	var upstreamStopReason string
 	activeBlockIndex := -1
 	activeBlockType := ""
 	startInputTokens := estimatedInputTokens
@@ -1496,7 +1541,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			"type":          "message",
 			"role":          "assistant",
 			"content":       []interface{}{},
-			"model":         model,
+			"model":         canonicalAnthropicModelID(model),
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
@@ -1560,7 +1605,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
-			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
+			h.recordPoolError(account.ID, err)
 		},
 		OnCredits: func(c float64) {
 			credits = c
@@ -1568,13 +1613,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure(model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1613,10 +1657,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
-	stopReason := "end_turn"
-	if len(toolUses) > 0 {
-		stopReason = "tool_use"
-	}
+	stopReason := resolveAnthropicStopReason(upstreamStopReason, len(toolUses) > 0)
 
 	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 		"type": "message_delta",
@@ -1740,6 +1781,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	var inputTokens, outputTokens int
 	var credits float64
 	var realInputTokens int
+	var upstreamStopReason string
 
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
@@ -1757,7 +1799,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
-			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+			h.recordPoolError(account.ID, err)
 		},
 		OnCredits: func(c float64) {
 			credits = c
@@ -1765,13 +1807,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure(model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		h.sendClaudeError(w, 500, "api_error", err.Error())
 		return
 	}
@@ -1819,7 +1860,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		}
 	}
 
-	resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+	resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
 	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -1874,8 +1915,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	actualModel, _ := ParseModelAndThinking(req.Model, config.GetThinkingConfig().Suffix)
-	account := h.pool.GetNextForModel(actualModel)
-	if account == nil {
+	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
+	if !ok {
+		if retryAfter > 0 {
+			setRetryAfter(w, retryAfter)
+			h.sendOpenAIError(w, 429, "rate_limit_exceeded", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+			return
+		}
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -1922,6 +1968,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
+	// Echo the canonical Anthropic dash form so SDKs / Claude Code resolve the
+	// model id correctly on every chunk; the inbound dotted form (e.g.
+	// "claude-opus-4.7") is kept in `model` for upstream routing.
+	respModel := canonicalAnthropicModelID(model)
 	var toolCalls []ToolCall
 	var toolCallIndex int
 	var inputTokens, outputTokens int
@@ -1929,6 +1979,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	var realInputTokens int
 	var rawContentBuilder strings.Builder
 	var rawReasoningBuilder strings.Builder
+	var upstreamStopReason string
 
 	// Thinking 标签解析状态
 	var textBuffer string
@@ -1969,7 +2020,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
 					"created": time.Now().Unix(),
-					"model":   model,
+					"model":   respModel,
 					"choices": []map[string]interface{}{{
 						"index":         0,
 						"delta":         map[string]string{"content": text},
@@ -1993,7 +2044,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
 					"created": time.Now().Unix(),
-					"model":   model,
+					"model":   respModel,
 					"choices": []map[string]interface{}{{
 						"index":         0,
 						"delta":         map[string]string{"content": text},
@@ -2008,7 +2059,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
 					"created": time.Now().Unix(),
-					"model":   model,
+					"model":   respModel,
 					"choices": []map[string]interface{}{{
 						"index":         0,
 						"delta":         map[string]string{"reasoning_content": content},
@@ -2025,7 +2076,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 				"id":      chatID,
 				"object":  "chat.completion.chunk",
 				"created": time.Now().Unix(),
-				"model":   model,
+				"model":   respModel,
 				"choices": []map[string]interface{}{{
 					"index":         0,
 					"delta":         map[string]string{"content": content},
@@ -2187,7 +2238,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 				"id":      chatID,
 				"object":  "chat.completion.chunk",
 				"created": time.Now().Unix(),
-				"model":   model,
+				"model":   canonicalAnthropicModelID(model),
 				"choices": []map[string]interface{}{{
 					"index": 0,
 					"delta": map[string]interface{}{
@@ -2214,7 +2265,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
-			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
+			h.recordPoolError(account.ID, err)
 		},
 		OnCredits: func(c float64) {
 			credits = c
@@ -2222,13 +2273,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure(model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		return
 	}
 
@@ -2265,16 +2315,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
 	// 发送结束
-	finishReason := "stop"
-	if len(toolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
+	finishReason := resolveOpenAIFinishReason(upstreamStopReason, len(toolCalls) > 0)
 
 	chunk := map[string]interface{}{
 		"id":      chatID,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
-		"model":   model,
+		"model":   canonicalAnthropicModelID(model),
 		"choices": []map[string]interface{}{{
 			"index":         0,
 			"delta":         map[string]interface{}{},
@@ -2300,6 +2347,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	var inputTokens, outputTokens int
 	var credits float64
 	var realInputTokens int
+	var upstreamStopReason string
 
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
@@ -2311,18 +2359,17 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
+		OnError:    func(err error) { h.recordPoolError(account.ID, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
+		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.recordFailure(model, apiKeyID)
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		h.checkOverageError(err, account.ID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		h.sendOpenAIError(w, 500, "server_error", err.Error())
 		return
 	}
@@ -2349,7 +2396,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -3392,6 +3439,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnError:        func(err error) {},
 		OnCredits:      func(c float64) {},
 		OnContextUsage: func(pct float64) {},
+		OnStopReason:   func(r string) {},
 	}
 
 	err := CallKiroAPI(account, kiroPayload, callback)

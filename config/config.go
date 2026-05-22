@@ -198,7 +198,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.8-A20"
+const Version = "1.0.9-A1"
 
 var (
 	cfg     *Config
@@ -701,7 +701,7 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 func GetPreferredEndpoint() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg.PreferredEndpoint == "" {
+	if cfg == nil || cfg.PreferredEndpoint == "" {
 		return "auto"
 	}
 	return cfg.PreferredEndpoint
@@ -719,7 +719,7 @@ func UpdatePreferredEndpoint(endpoint string) error {
 func GetEndpointFallback() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg.EndpointFallback == nil {
+	if cfg == nil || cfg.EndpointFallback == nil {
 		return true
 	}
 	return *cfg.EndpointFallback
@@ -737,6 +737,9 @@ func UpdateEndpointFallback(enabled bool) error {
 func GetProxyURL() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
 	return cfg.ProxyURL
 }
 

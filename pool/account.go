@@ -1,27 +1,81 @@
 // Package pool 账号池管理
-// 实现轮询负载均衡、错误冷却、Token 刷新
+//
+// Implements smooth weighted round-robin (SWRR) account selection plus a
+// per-account cooldown state machine that distinguishes soft throttles from
+// hard quota exhaustion.
+//
+// Selection algorithm: smooth weighted round-robin (the nginx/Envoy variant).
+// For each pick we add the effective weight to every account's runningWeight,
+// pick the account with the highest runningWeight, then subtract the total
+// effective weight from the winner. With weights {a:5, b:1, c:1} this
+// produces the interleaved sequence a,a,b,a,c,a,a instead of bursting
+// a,a,a,a,a then b then c — which matters because each account is one AWS
+// identity and AWS rate-limits per identity.
+//
+// Cooldown tiers (RecordError):
+//   - Retry-After header present → use it (clamped 5s..5min).
+//   - 1st 429:                     decorrelated jitter starting at 5s
+//   - Nth consecutive 429:         random(5s, prev × 3), capped at 5min
+//   - 3 consecutive non-quota errs: 60s
+//   - Hard UsageCurrent ≥ UsageLimit: handled separately by isOverUsageLimit.
+//
+// Decorrelated jitter (instead of plain full jitter) is preferred when many
+// accounts can throttle in the same AWS bucket: it desynchronises retry
+// windows because each account's next sleep is bounded by its OWN previous
+// sleep, not a shared shift counter. See AWS Architecture Blog
+// "Exponential Backoff and Jitter" for the comparison.
+//
+// The consecutive counter decays after errorCounterDecay of no errors so old
+// failures don't keep amplifying backoff after a recovery.
 package pool
 
 import (
 	"kiro-go/config"
+	"math/rand"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-const overageFrequencyScale = 10
-const tokenRefreshSkewSeconds int64 = 120
+const (
+	tokenRefreshSkewSeconds int64 = 120
+
+	// Soft cooldown tiers.
+	//
+	// retryAfterMax bounds upstream-supplied Retry-After so a malformed or
+	// oversized header can't park an account longer than ~5 min. AWS's own
+	// SDK clamps server-supplied retry-after to [computed_backoff,
+	// computed_backoff + 5s] for the same reason.
+	softCooldownBase  = 5 * time.Second
+	softCooldownMax   = 5 * time.Minute
+	retryAfterMin     = 5 * time.Second
+	retryAfterMax     = 5 * time.Minute
+	nonQuotaCooldown  = 60 * time.Second
+	errorCounterDecay = 5 * time.Minute
+)
+
+// accountSlot is one entry in the SWRR scheduler. The slot is keyed
+// positionally to AccountPool.accounts, so we don't store the account ID here.
+type accountSlot struct {
+	effectiveWeight int
+	currentWeight   int
+}
+
+// cooldownEntry tracks per-account error state.
+type cooldownEntry struct {
+	until           time.Time     // soft cooldown expiry; zero = not cooling
+	lastSleep       time.Duration // last cooldown duration we computed; seeds decorrelated jitter
+	lastErrorAt     time.Time     // for decay
+	consecutiveErrs int           // consecutive non-quota errors
+}
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	mu         sync.Mutex
+	accounts   []config.Account           // deduplicated, one entry per real account
+	slots      []*accountSlot             // SWRR scheduler slots, parallel to accounts
+	cooldowns  map[string]*cooldownEntry  // accountID → cooldown state
+	modelLists map[string]map[string]bool // accountID → set of supported model IDs
 }
 
 var (
@@ -33,101 +87,99 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:  make(map[string]*cooldownEntry),
+			modelLists: make(map[string]map[string]bool),
 		}
 		pool.Reload()
 	})
 	return pool
 }
 
-// Reload 从配置重新加载账号
-// 构建加权列表：weight<=1 出现 1 次，weight>=2 出现 weight 次
+// NewForTesting returns an empty pool for use in unit tests. Unlike GetPool,
+// it does not call Reload (which would panic if config has not been initialized).
+// Tests can populate state directly through the public mutator methods
+// (RecordError, RecordSuccess, UpdateStats, ...) — these only touch the
+// cooldown / stats maps, not the SWRR slots.
+func NewForTesting() *AccountPool {
+	return &AccountPool{
+		cooldowns:  make(map[string]*cooldownEntry),
+		modelLists: make(map[string]map[string]bool),
+	}
+}
+
+// Reload rebuilds the account list and SWRR slots from configuration.
+// Cooldown state and model lists are preserved for accounts that still exist.
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	enabled := config.GetEnabledAccounts()
-	var weighted []config.Account
+	accounts := make([]config.Account, 0, len(enabled))
+	slots := make([]*accountSlot, 0, len(enabled))
+
 	for _, a := range enabled {
-		w := effectiveWeight(a.Weight) * overageFrequencyScale
-		if isOverUsageLimit(a) {
-			if !a.AllowOverage {
-				continue
-			}
-			w = effectiveOverageWeight(a.OverageWeight)
+		w := computeEffectiveWeight(a)
+		if w <= 0 {
+			// Skip accounts that can't currently serve traffic (e.g. over-limit
+			// without overage allowance). They re-enter rotation on the next
+			// Reload after their state changes.
+			continue
 		}
-		for j := 0; j < w; j++ {
-			weighted = append(weighted, a)
+		accounts = append(accounts, a)
+		slots = append(slots, &accountSlot{
+			effectiveWeight: w,
+			currentWeight:   0,
+		})
+	}
+
+	p.accounts = accounts
+	p.slots = slots
+
+	// Drop cooldowns and model lists for accounts that no longer exist.
+	keep := make(map[string]bool, len(accounts))
+	for _, a := range accounts {
+		keep[a.ID] = true
+	}
+	for id := range p.cooldowns {
+		if !keep[id] {
+			delete(p.cooldowns, id)
 		}
 	}
-	p.accounts = weighted
-	p.totalAccounts = len(enabled)
+	for id := range p.modelLists {
+		if !keep[id] {
+			delete(p.modelLists, id)
+		}
+	}
 }
 
-// GetNext 获取下一个可用账号（加权轮询）
-func (p *AccountPool) GetNext() *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
+// computeEffectiveWeight derives the SWRR weight from account config. Returns
+// 0 to mean "do not include in rotation right now". The pool will skip it on
+// every pick until the next Reload.
+//
+// Weights are scaled up by 10× so overage accounts (which have weight 1..10)
+// can be expressed as fractions of a normal slot without losing precision.
+func computeEffectiveWeight(a config.Account) int {
+	if isOverUsageLimit(a) {
+		if !a.AllowOverage && !config.GetAllowOverUsage() {
+			return 0
+		}
+		// Overage weight 1..10, kept on the same scale so a healthy account
+		// (weight 1 → 10) gets ≥10× the picks of an overage account (weight 1).
+		w := a.OverageWeight
+		if w < 1 {
+			w = 1
+		}
+		if w > 10 {
+			w = 10
+		}
+		return w
 	}
 
-	allowOverUsage := config.GetAllowOverUsage()
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if seen[acc.ID] {
-			continue
-		}
-
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过额度已用尽的账号（账号级 AllowOverage 或全局 AllowOverUsage 可放行）
-		if isOverUsageLimit(*acc) && !acc.AllowOverage && !allowOverUsage {
-			seen[acc.ID] = true
-			continue
-		}
-
-		return acc
+	w := a.Weight
+	if w < 1 {
+		w = 1
 	}
-
-	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		// 额度用尽的账号不作为 fallback（除非账号级或全局允许超额）
-		if isOverUsageLimit(*acc) && !acc.AllowOverage && !allowOverUsage {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
-		}
-	}
-	return best
+	return w * 10
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -142,10 +194,9 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 }
 
 // GetModelList 返回该账号缓存的模型 ID 列表（供 admin API 使用）。
-// 若尚无缓存则返回空切片。
 func (p *AccountPool) GetModelList(accountID string) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	set, ok := p.modelLists[accountID]
 	if !ok || len(set) == 0 {
 		return []string{}
@@ -157,114 +208,229 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 	return ids
 }
 
-// accountHasModel 检查账号是否支持指定模型。
-// 若该账号尚无模型列表（冷启动），视为支持所有模型。
-func (p *AccountPool) accountHasModel(accountID, model string) bool {
+// accountHasModel checks the cached model list. If unknown (cold start) we
+// optimistically return true so the account is still considered.
+//
+// modelKey must be the already-normalized (lowercased + trimmed) model ID.
+// Caller must hold p.mu.
+func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
-		return true // 冷启动：列表未就绪，乐观放行
+		return true
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+	return list[modelKey]
 }
 
-// GetNextForModel 获取下一个支持指定模型的可用账号。
-// model 应为去掉 thinking 后缀的实际模型名。
-// 若无账号有该模型列表数据，行为与 GetNext 相同（乐观路由）。
-func (p *AccountPool) GetNextForModel(model string) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+// GetNextForModel returns the next account that supports the requested model.
+//
+//   - acc == nil, ok == false                 → no account configured at all
+//     (caller should return 503 / "No available accounts").
+//   - acc == nil, ok == false, retryAfter > 0 → pool is non-empty but every
+//     candidate is in cooldown; retryAfter is the time until the soonest
+//     account becomes eligible. Caller should return 429 with Retry-After.
+//   - acc != nil, ok == true                  → caller should proceed; the
+//     account is eligible and not cooling.
+//
+// model may be empty to skip the model-list filter.
+func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	if len(p.accounts) == 0 {
-		return nil
+	if len(p.slots) == 0 {
+		return nil, 0, false
 	}
 
-	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
+	p.decayCountersLocked(now)
 
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
+	// Normalize once before the per-slot walk so accountHasModel doesn't pay
+	// strings.ToLower + TrimSpace per candidate.
+	modelKey := strings.ToLower(strings.TrimSpace(model))
 
-		if seen[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-		if isOverUsageLimit(*acc) && !acc.AllowOverage && !allowOverUsage {
-			seen[acc.ID] = true
-			continue
-		}
-		return acc
-	}
-
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
+	// SWRR walk over eligible slots only. We collect indices of slots that
+	// are currently eligible (model match, no cooldown, token not about to
+	// expire) and run SWRR on that subset. Ineligible slots don't accumulate
+	// currentWeight, so they don't bias future picks toward themselves.
+	var eligible []int
+	var soonest time.Time
+	for i := range p.slots {
 		acc := &p.accounts[i]
-		if !p.accountHasModel(acc.ID, model) {
+		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {
 			continue
 		}
-		if isOverUsageLimit(*acc) && !acc.AllowOverage && !allowOverUsage {
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			continue
 		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
+		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.until) {
+			if soonest.IsZero() || cd.until.Before(soonest) {
+				soonest = cd.until
 			}
-		} else {
-			return acc
+			continue
+		}
+		eligible = append(eligible, i)
+	}
+
+	if len(eligible) == 0 {
+		// Pool is non-empty but every account is cooling. Tell the caller how
+		// long until the soonest account is eligible so they can surface a
+		// real Retry-After to the client instead of burning quota on a known
+		// throttled account.
+		if !soonest.IsZero() {
+			return nil, time.Until(soonest), false
+		}
+		return nil, 0, false
+	}
+
+	// SWRR pick among the eligible subset.
+	totalEligibleWeight := 0
+	for _, i := range eligible {
+		totalEligibleWeight += p.slots[i].effectiveWeight
+	}
+
+	winner := eligible[0]
+	for _, i := range eligible {
+		p.slots[i].currentWeight += p.slots[i].effectiveWeight
+		if p.slots[i].currentWeight > p.slots[winner].currentWeight {
+			winner = i
 		}
 	}
-	return best
+	p.slots[winner].currentWeight -= totalEligibleWeight
+
+	// Return a copy so the caller can't mutate pool state through the pointer.
+	accCopy := p.accounts[winner]
+	return &accCopy, 0, true
+}
+
+// decayCountersLocked drops cooldown state for accounts whose last error is
+// older than errorCounterDecay AND whose cooldown timer has already expired.
+// Without this, an account that flaps with intermittent 429s separated by
+// hours would keep climbing the decorrelated-jitter ladder via lastSleep,
+// even though earlier failures should have aged out. Caller must hold p.mu.
+func (p *AccountPool) decayCountersLocked(now time.Time) {
+	for id, cd := range p.cooldowns {
+		if cd.lastErrorAt.IsZero() {
+			continue
+		}
+		if now.Sub(cd.lastErrorAt) <= errorCounterDecay {
+			continue
+		}
+		// Don't drop while still cooling — that would make the account
+		// look eligible mid-cooldown.
+		if !cd.until.IsZero() && now.Before(cd.until) {
+			continue
+		}
+		delete(p.cooldowns, id)
+	}
 }
 
 // GetByID 根据 ID 获取账号
 func (p *AccountPool) GetByID(id string) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			acc := p.accounts[i]
+			return &acc
 		}
 	}
 	return nil
 }
 
-// RecordSuccess 记录请求成功，清除冷却
+// RecordSuccess clears soft cooldown and resets the consecutive error counter.
+// Hard quota state (UsageCurrent ≥ UsageLimit) is unaffected and continues to
+// be enforced by computeEffectiveWeight on the next Reload.
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.cooldowns, id)
-	p.errorCounts[id] = 0
 }
 
-// RecordError 记录请求错误，设置冷却
-func (p *AccountPool) RecordError(id string, isQuotaError bool) {
+// RecordError records an error for the account and applies a tiered cooldown.
+//
+//   - retryAfter > 0 (from upstream Retry-After header): use it, clamped to
+//     [retryAfterMin, retryAfterMax].
+//   - isQuotaError && retryAfter == 0: decorrelated jitter — the next sleep
+//     is drawn from random(retryAfterMin, prev × 3), capped at softCooldownMax.
+//     The first 429 uses random(retryAfterMin, softCooldownBase × 3) so it
+//     can't be near-zero. Decorrelated jitter desynchronises retries across
+//     accounts that share an AWS identity better than full jitter does.
+//   - !isQuotaError: only cool down after 3 consecutive non-quota errors.
+//
+// Pass retryAfter = 0 if no header was present.
+func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.errorCounts[id]++
+	cd := p.cooldowns[id]
+	if cd == nil {
+		cd = &cooldownEntry{}
+		p.cooldowns[id] = cd
+	}
+	now := time.Now()
+	cd.lastErrorAt = now
 
-	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
-	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = time.Now().Add(time.Minute)
+	switch {
+	case isQuotaError && retryAfter > 0:
+		clamped := retryAfter
+		if clamped < retryAfterMin {
+			clamped = retryAfterMin
+		}
+		if clamped > retryAfterMax {
+			clamped = retryAfterMax
+		}
+		cd.until = now.Add(clamped)
+		cd.lastSleep = clamped
+		cd.consecutiveErrs = 0
+
+	case isQuotaError:
+		// Decorrelated jitter: sleep = random(base, min(cap, prev × 3)).
+		prev := cd.lastSleep
+		if prev <= 0 {
+			prev = softCooldownBase
+		}
+		ceiling := prev * 3
+		if ceiling > softCooldownMax {
+			ceiling = softCooldownMax
+		}
+		var jittered time.Duration
+		if ceiling <= retryAfterMin {
+			jittered = retryAfterMin
+		} else {
+			width := int64(ceiling - retryAfterMin)
+			jittered = retryAfterMin + time.Duration(rand.Int63n(width))
+		}
+		cd.until = now.Add(jittered)
+		cd.lastSleep = jittered
+		cd.consecutiveErrs = 0
+
+	default:
+		cd.consecutiveErrs++
+		if cd.consecutiveErrs >= 3 {
+			cd.until = now.Add(nonQuotaCooldown)
+			cd.lastSleep = nonQuotaCooldown
+		}
+	}
+
+	// Bump the persisted ErrorCount so the admin UI reflects reality.
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ErrorCount++
+			break
+		}
+	}
+}
+
+// ClearSoftCooldownIfHealthy is called from RefreshAccountInfo after a
+// successful refresh confirms the account is still healthy (well under its
+// usage limit). It clears the soft cooldown so the account can re-enter
+// rotation immediately rather than waiting for the cooldown to expire.
+func (p *AccountPool) ClearSoftCooldownIfHealthy(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cd, ok := p.cooldowns[id]; ok {
+		cd.until = time.Time{}
+		cd.consecutiveErrs = 0
+		cd.lastSleep = 0
 	}
 }
 
@@ -279,38 +445,30 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 				p.accounts[i].RefreshToken = refreshToken
 			}
 			p.accounts[i].ExpiresAt = expiresAt
+			return
 		}
 	}
 }
 
 // Count 返回账号总数
 func (p *AccountPool) Count() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.totalAccounts > 0 {
-		return p.totalAccounts
-	}
-
-	seen := make(map[string]bool)
-	for _, acc := range p.accounts {
-		seen[acc.ID] = true
-	}
-	return len(seen)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.accounts)
 }
 
-// AvailableCount 返回可用账号数
+// AvailableCount 返回当前可用（未冷却且 token 未过期）的账号数
 func (p *AccountPool) AvailableCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	now := time.Now()
 	count := 0
-	seen := make(map[string]bool)
-	for _, acc := range p.accounts {
-		if seen[acc.ID] {
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.until) {
 			continue
 		}
-		seen[acc.ID] = true
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			continue
 		}
 		count++
@@ -322,64 +480,46 @@ func (p *AccountPool) AvailableCount() int {
 func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var updated bool
-	var requestCount, errorCount, totalTokens int
-	var totalCredits float64
-	var lastUsed int64
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			if !updated {
-				p.accounts[i].RequestCount++
-				p.accounts[i].TotalTokens += tokens
-				p.accounts[i].TotalCredits += credits
-				p.accounts[i].LastUsed = time.Now().Unix()
+			p.accounts[i].RequestCount++
+			p.accounts[i].TotalTokens += tokens
+			p.accounts[i].TotalCredits += credits
+			p.accounts[i].LastUsed = time.Now().Unix()
 
-				requestCount = p.accounts[i].RequestCount
-				errorCount = p.accounts[i].ErrorCount
-				totalTokens = p.accounts[i].TotalTokens
-				totalCredits = p.accounts[i].TotalCredits
-				lastUsed = p.accounts[i].LastUsed
-				updated = true
-				continue
-			}
-			p.accounts[i].RequestCount = requestCount
-			p.accounts[i].ErrorCount = errorCount
-			p.accounts[i].TotalTokens = totalTokens
-			p.accounts[i].TotalCredits = totalCredits
-			p.accounts[i].LastUsed = lastUsed
+			requestCount := p.accounts[i].RequestCount
+			errorCount := p.accounts[i].ErrorCount
+			totalTokens := p.accounts[i].TotalTokens
+			totalCredits := p.accounts[i].TotalCredits
+			lastUsed := p.accounts[i].LastUsed
+			go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+			return
 		}
-	}
-	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 	}
 }
 
-// GetAllAccounts 获取所有账号副本
+// GetAllAccounts returns a deduplicated copy of every account in the pool.
 func (p *AccountPool) GetAllAccounts() []config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	result := make([]config.Account, len(p.accounts))
 	copy(result, p.accounts)
 	return result
 }
 
+// CooldownRemaining reports the time remaining on the soft cooldown for the
+// given account, or 0 if not cooling. Useful for tests and admin diagnostics.
+func (p *AccountPool) CooldownRemaining(id string) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cd, ok := p.cooldowns[id]; ok {
+		if d := time.Until(cd.until); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 func isOverUsageLimit(acc config.Account) bool {
 	return acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit
-}
-
-func effectiveWeight(weight int) int {
-	if weight < 1 {
-		return 1
-	}
-	return weight
-}
-
-func effectiveOverageWeight(weight int) int {
-	if weight < 1 {
-		return 1
-	}
-	if weight > overageFrequencyScale {
-		return overageFrequencyScale
-	}
-	return weight
 }

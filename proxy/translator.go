@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"regexp"
 	"strings"
 	"time"
@@ -106,9 +107,47 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 	return kind == "enabled" || kind == "adaptive"
 }
 
+// modelSupportsAdaptiveThinking reports whether the given model id is part of
+// the Claude family that supports adaptive / extended thinking. The Kiro
+// upstream uses adaptive thinking by default for these families; setting
+// thinking.type="adaptive" on the inbound request makes Claude Code's
+// /model panel display the "thinking" indicator without us forwarding any
+// budget knob (Kiro upstream doesn't accept budget_tokens or
+// reasoning_effort — see kirodotdev/Kiro #8576, #8577).
+func modelSupportsAdaptiveThinking(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	if !strings.Contains(m, "claude") {
+		return false
+	}
+	// Sonnet 4+, Opus 4+, Haiku 4.5 all support adaptive thinking.
+	return strings.Contains(m, "sonnet-4") ||
+		strings.Contains(m, "opus-4") ||
+		strings.Contains(m, "haiku-4")
+}
+
 func MapModel(model string) string {
 	mapped, _ := ParseModelAndThinking(model, "-thinking")
 	return mapped
+}
+
+// canonicalAnthropicModelID normalizes a Claude / Anthropic model id to the
+// canonical dash-separated form Claude Code's model picker recognizes. The
+// proxy uses dotted version forms internally (e.g. "claude-opus-4.7") for
+// Kiro upstream routing, but Claude Code's "/model" output and the
+// "Opus 4 has been updated to the latest" banner only resolve when the
+// response echoes the dashed id ("claude-opus-4-7").
+//
+// Inputs already in dashed form (or unrelated ids like gpt-* during
+// passthrough tests) are returned with all dots converted to dashes; the
+// transform is idempotent for ids that contain no dots.
+func canonicalAnthropicModelID(model string) string {
+	if model == "" {
+		return model
+	}
+	return strings.ReplaceAll(model, ".", "-")
 }
 
 // ==================== Claude API 类型 ====================
@@ -157,6 +196,13 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
+	// Type is set by Anthropic for hosted "server tools" (web_search,
+	// code_execution, computer, text_editor, bash). For user-defined tools
+	// it's empty. We capture it so convertClaudeTools can drop server tools
+	// before they reach Kiro / CodeWhisperer (which has no concept of
+	// server-side tool execution and 400s on the resulting empty-description
+	// spec). Custom tools never set Type, so omitempty keeps round-trips clean.
+	Type        string      `json:"type,omitempty"`
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
@@ -245,6 +291,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	history = trimLeadingAssistantHistory(history)
 
+	// 转换工具
+	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
+
+	// Enforce upstream invariants on the tool history. CodeWhisperer / Kiro
+	// validate toolUse↔toolResult pairing across the whole conversation, and
+	// reject history that carries tool blocks without a declared tool catalog.
+	// See normalizeHistoryToolPairing for the full rule set; violating any of
+	// them surfaces as HTTP 400 "Improperly formed request" with no specific
+	// reason field.
+	history, currentToolResults = normalizeHistoryToolPairing(history, currentToolResults, len(kiroTools) > 0)
+
 	// 构建最终内容
 	finalContent := ""
 	if systemPrompt != "" {
@@ -270,9 +327,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	} else {
 		finalContent += minimalFallbackUserContent
 	}
-
-	// 转换工具
-	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -300,8 +354,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
+		capped, _ := capInferenceMaxTokensForModel(req.MaxTokens, modelID)
 		payload.InferenceConfig = &InferenceConfig{
-			MaxTokens:   req.MaxTokens,
+			MaxTokens:   capped,
 			Temperature: req.Temperature,
 			TopP:        req.TopP,
 		}
@@ -686,6 +741,19 @@ func extractSystemPrompt(system interface{}) string {
 	return ""
 }
 
+// logUnsupportedBlock emits a single debug breadcrumb when an Anthropic block
+// type is silently dropped during request translation. Centralized so the user
+// and assistant content extractors stay byte-for-byte consistent in their
+// logging and we have one place to adjust the message or add metrics later.
+// role is "user" or "assistant"; blockType is the raw Anthropic block string
+// (server_tool_use, web_search_tool_result, code_execution_*, mcp_*, etc.).
+func logUnsupportedBlock(role, blockType string) {
+	if blockType == "" {
+		return
+	}
+	logger.Debugf("[Translator] Dropping unsupported Claude %s block type=%s", role, blockType)
+}
+
 func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroToolResult) {
 	var text string
 	var images []KiroImage
@@ -715,11 +783,30 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
 				resultContent := extractToolResultContent(block["content"])
+				status := "success"
+				// Anthropic encodes tool errors via is_error: true on the
+				// tool_result block. Mapping it to "error" lets the upstream
+				// model see the failure rather than a misleading "success",
+				// and avoids state desync that has been observed to trigger
+				// 400 "Improperly formed request" downstream.
+				if isErr, ok := block["is_error"].(bool); ok && isErr {
+					status = "error"
+				}
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
+					Status:    status,
 				})
+			default:
+				// Anthropic introduces new block types alongside server tools
+				// (server_tool_use, web_search_tool_result, code_execution_*,
+				// mcp_*, etc.). Kiro upstream rejects unknown block types, so
+				// we silently drop anything we don't recognise rather than
+				// forwarding it. The corresponding tool catalog entry was
+				// already filtered out by isAnthropicServerTool, so the
+				// model won't try to reuse them. The debug log gives operators
+				// a breadcrumb if a brand-new block type appears upstream.
+				logUnsupportedBlock("user", blockType)
 			}
 		}
 	}
@@ -765,20 +852,92 @@ func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
 	return nil
 }
 
+// emptyToolResultPlaceholder is substituted whenever a tool_result resolves
+// to an empty string. CodeWhisperer / AmazonQ / Kiro reject toolResults whose
+// content[0].text is empty with HTTP 400 "Improperly formed request." The
+// placeholder is a neutral marker that preserves the structural pairing with
+// the originating toolUseId without leaking a visible synthetic envelope.
+const emptyToolResultPlaceholder = "(no output)"
+
+// extractToolResultContent normalizes any Anthropic / OpenAI shape of a
+// tool_result content payload into a single non-empty string. The upstream
+// Kiro API rejects empty toolResults[].content[].text values, so this
+// function never returns "". When the input is a structured block (image,
+// object, nested array) that yields no text, the JSON serialization is
+// returned as a fallback so the upstream model still has something to read.
 func extractToolResultContent(content interface{}) string {
+	result := extractToolResultText(content)
+	if result == "" {
+		return emptyToolResultPlaceholder
+	}
+	return result
+}
+
+// extractToolResultText is the recursive worker behind extractToolResultContent.
+// It returns "" only when the input is genuinely empty; the caller is
+// responsible for substituting a placeholder so the API never sees an empty
+// toolResult text.
+func extractToolResultText(content interface{}) string {
+	if content == nil {
+		return ""
+	}
 	if s, ok := content.(string); ok {
 		return s
 	}
 	if blocks, ok := content.([]interface{}); ok {
 		var parts []string
 		for _, b := range blocks {
-			if block, ok := b.(map[string]interface{}); ok {
-				if text, ok := block["text"].(string); ok {
+			block, ok := b.(map[string]interface{})
+			if !ok {
+				if s, ok := b.(string); ok && s != "" {
+					parts = append(parts, s)
+				}
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			switch blockType {
+			case "text", "input_text", "output_text":
+				if text, ok := block["text"].(string); ok && text != "" {
 					parts = append(parts, text)
+				}
+			case "image", "image_url", "input_image":
+				// We can't embed image bytes inside a Kiro toolResult text
+				// field, but we must still produce non-empty content so the
+				// upstream API accepts the message. Emit a stable placeholder.
+				parts = append(parts, "[image]")
+			default:
+				if text, ok := block["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+					continue
+				}
+				if nested, ok := block["content"]; ok {
+					if t := extractToolResultText(nested); t != "" {
+						parts = append(parts, t)
+						continue
+					}
+				}
+				if raw, err := json.Marshal(block); err == nil {
+					parts = append(parts, string(raw))
 				}
 			}
 		}
 		return strings.Join(parts, "")
+	}
+	if m, ok := content.(map[string]interface{}); ok {
+		if text, ok := m["text"].(string); ok && text != "" {
+			return text
+		}
+		if nested, ok := m["content"]; ok {
+			if t := extractToolResultText(nested); t != "" {
+				return t
+			}
+		}
+		if raw, err := json.Marshal(m); err == nil {
+			return string(raw)
+		}
+	}
+	if raw, err := json.Marshal(content); err == nil {
+		return string(raw)
 	}
 	return ""
 }
@@ -816,11 +975,38 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 					Name:      name,
 					Input:     input,
 				})
+			default:
+				// Mirror the user-content extractor: silently drop unknown
+				// assistant blocks (server_tool_use, web_search_tool_result,
+				// code_execution_*, mcp_*, etc.) so they never reach Kiro
+				// upstream. Their catalog entry was already filtered out by
+				// isAnthropicServerTool, so the model won't try to reuse them.
+				logUnsupportedBlock("assistant", blockType)
 			}
 		}
 	}
 
 	return text, toolUses
+}
+
+// isAnthropicServerTool reports whether the given Claude tool spec is one
+// Anthropic executes server-side (so we can't forward it to Kiro upstream).
+//
+// Detection is by presence of the `type` field, not by prefix match. The
+// Anthropic Messages API contract is that custom user-defined tools omit
+// `type` entirely — only hosted server tools (web_search, code_execution,
+// computer_use, text_editor, bash, plus future variants like
+// image_generation, mcp, etc.) carry a versioned type stamp such as
+// "web_search_20250305". Filtering on `Type != ""` future-proofs us against
+// new server-tool variants Anthropic may introduce, since CodeWhisperer /
+// Kiro / AmazonQ have no concept of any of them.
+//
+// References:
+//   - Anthropic web_search: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool
+//   - Anthropic tool-use catalog (custom tools have no type field):
+//     https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview
+func isAnthropicServerTool(t ClaudeTool) bool {
+	return t.Type != ""
 }
 
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
@@ -831,9 +1017,9 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
-		desc := tool.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
+		if isAnthropicServerTool(tool) {
+			logger.Debugf("[Tools] Dropping Anthropic server tool type=%s name=%s — not supported by Kiro upstream", tool.Type, tool.Name)
+			continue
 		}
 		sanitized := shortenToolName(sanitizeToolName(tool.Name))
 		if sanitized != tool.Name {
@@ -841,11 +1027,29 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		}
 		w := KiroToolWrapper{}
 		w.ToolSpecification.Name = sanitized
-		w.ToolSpecification.Description = desc
+		w.ToolSpecification.Description = normalizeToolDescription(tool.Description, tool.Name)
 		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
 		result = append(result, w)
 	}
 	return result, nameMap
+}
+
+// normalizeToolDescription enforces the Kiro upstream tool-spec contract:
+// description has minLength=1 and a maximum of maxToolDescLen characters.
+// An empty description triggers HTTP 400 "Improperly formed request"; an
+// over-length one is truncated with an ellipsis. The fallback chain
+// (description → name → "tool") guarantees a non-empty result.
+func normalizeToolDescription(desc, name string) string {
+	if desc == "" {
+		desc = name
+		if desc == "" {
+			desc = "tool"
+		}
+	}
+	if len(desc) > maxToolDescLen {
+		desc = desc[:maxToolDescLen] + "..."
+	}
+	return desc
 }
 
 // ensureObjectSchema ensures the JSON schema has "type": "object" at the top level
@@ -955,7 +1159,7 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model, upstreamStopReason string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
@@ -981,23 +1185,55 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 		})
 	}
 
-	stopReason := "end_turn"
-	if len(toolUses) > 0 {
-		stopReason = "tool_use"
-	}
+	stopReason := resolveAnthropicStopReason(upstreamStopReason, len(toolUses) > 0)
 
 	return &ClaudeResponse{
 		ID:         "msg_" + uuid.New().String(),
 		Type:       "message",
 		Role:       "assistant",
 		Content:    blocks,
-		Model:      model,
+		Model:      canonicalAnthropicModelID(model),
 		StopReason: stopReason,
 		Usage: ClaudeUsage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
 		},
 	}
+}
+
+// resolveAnthropicStopReason picks the canonical Anthropic Messages API
+// stop_reason for the response. When the upstream surfaced an explicit
+// signal (e.g. "max_tokens" from a ContentLengthExceededException), that
+// wins. Otherwise we fall back to the heuristic Claude Code expects:
+// "tool_use" when the assistant ended with a tool call, "end_turn" otherwise.
+func resolveAnthropicStopReason(upstream string, hasToolUse bool) string {
+	if upstream != "" {
+		return upstream
+	}
+	if hasToolUse {
+		return "tool_use"
+	}
+	return "end_turn"
+}
+
+// resolveOpenAIFinishReason mirrors resolveAnthropicStopReason but maps to
+// OpenAI's finish_reason vocabulary ("stop" / "length" / "tool_calls").
+func resolveOpenAIFinishReason(upstream string, hasToolCalls bool) string {
+	switch upstream {
+	case "max_tokens":
+		return "length"
+	case "stop_sequence", "end_turn":
+		if hasToolCalls {
+			return "tool_calls"
+		}
+		return "stop"
+	case "tool_use":
+		return "tool_calls"
+	}
+	if hasToolCalls {
+		return "tool_calls"
+	}
+	return "stop"
 }
 
 // ==================== OpenAI API 类型 ====================
@@ -1147,6 +1383,13 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 		case "tool":
 			content := extractOpenAIMessageText(msg.Content)
+			if strings.TrimSpace(content) == "" {
+				// Kiro / CodeWhisperer reject toolResults whose text is empty.
+				// Substitute a placeholder so the structural pairing with
+				// toolUseId survives even if the upstream tool emitted no
+				// textual output (e.g. structured/binary-only result).
+				content = emptyToolResultPlaceholder
+			}
 			currentToolResults = append(currentToolResults, KiroToolResult{
 				ToolUseID: msg.ToolCallID,
 				Content:   []KiroResultContent{{Text: content}},
@@ -1195,6 +1438,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 转换工具
 	kiroTools := convertOpenAITools(req.Tools)
 
+	// Enforce upstream invariants on the tool history. Mirrors the protection
+	// applied to the Claude path; without it, OpenAI-shaped clients that
+	// compact or prune mid-conversation send orphan toolUses/toolResults that
+	// trigger HTTP 400 "Improperly formed request."
+	history, currentToolResults = normalizeHistoryToolPairing(history, currentToolResults, len(kiroTools) > 0)
+
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
@@ -1218,8 +1467,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
+		capped, _ := capInferenceMaxTokensForModel(req.MaxTokens, modelID)
 		payload.InferenceConfig = &InferenceConfig{
-			MaxTokens:   req.MaxTokens,
+			MaxTokens:   capped,
 			Temperature: req.Temperature,
 			TopP:        req.TopP,
 		}
@@ -1326,6 +1576,193 @@ func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMess
 		return nil
 	}
 	return history[idx:]
+}
+
+// kiroUpstreamMaxTokens is the documented upper bound the Kiro / CodeWhisperer
+// generateAssistantResponse endpoint accepts for inferenceConfig.maxTokens.
+// Sending values above this triggers HTTP 400 "Improperly formed request."
+// Confirmed empirically by multiple Kiro-proxy projects (CLIProxyAPI#3383).
+const kiroUpstreamMaxTokens = 32000
+
+// capForModel returns the maximum maxTokens the upstream Kiro service will
+// accept for a given model. Today the cap is universal (32000) — confirmed
+// against CLIProxyAPI's kiroMaxOutputTokens constant and reproduced through
+// 400-rejection testing — but this function exists so future per-model
+// overrides (e.g. a higher cap for Opus 4.7 if Kiro lifts the limit) can
+// land here without touching every call site.
+//
+// The model argument is the canonical Kiro model id ("claude-opus-4.7",
+// "claude-sonnet-4.6", etc.), already normalized by ParseModelAndThinking
+// before this is called.
+func capForModel(model string) int {
+	return kiroUpstreamMaxTokens
+}
+
+// capInferenceMaxTokensForModel clamps maxTokens against the per-model cap.
+func capInferenceMaxTokensForModel(maxTokens int, model string) (int, bool) {
+	cap := capForModel(model)
+	if maxTokens > cap {
+		return cap, true
+	}
+	return maxTokens, false
+}
+
+// normalizeHistoryToolPairing enforces the invariants Kiro / CodeWhisperer
+// validate across the full history (not just the tail):
+//
+//  1. Every assistant toolUse must have a matching toolResult in some later
+//     user-turn's UserInputMessageContext.ToolResults. Orphan toolUses cause
+//     400 "Improperly formed request" — they're stripped here.
+//  2. Every toolResult must reference a toolUseId emitted by an earlier
+//     assistant turn. Orphan toolResults are stripped.
+//  3. If the request declares no tools at all, history is not allowed to
+//     carry tool blocks (the upstream validates tool history against the
+//     declared tool catalog). When toolsDeclared is false, all toolUses
+//     and toolResults are stripped from history.
+//
+// The normalized history is returned along with the set of toolUseIds that
+// remained valid in history, so the caller can also normalize the current
+// turn's pending toolResults against the same set.
+func normalizeHistoryToolPairing(history []KiroHistoryMessage, currentToolResults []KiroToolResult, toolsDeclared bool) ([]KiroHistoryMessage, []KiroToolResult) {
+	if len(history) == 0 && len(currentToolResults) == 0 {
+		return history, currentToolResults
+	}
+
+	// When no tools are declared, scrub all tool blocks from history and
+	// drop any pending tool results on the current turn.
+	if !toolsDeclared {
+		scrubbed := make([]KiroHistoryMessage, 0, len(history))
+		for _, item := range history {
+			if item.AssistantResponseMessage != nil {
+				clone := *item.AssistantResponseMessage
+				clone.ToolUses = nil
+				if clone.Content == "" {
+					// Drop assistant turns that consisted only of tool calls;
+					// keeping an empty assistant message in history can also
+					// trip validation. If the assistant had any text, keep
+					// the text-only form.
+					continue
+				}
+				scrubbed = append(scrubbed, KiroHistoryMessage{AssistantResponseMessage: &clone})
+				continue
+			}
+			if item.UserInputMessage != nil {
+				clone := *item.UserInputMessage
+				if clone.UserInputMessageContext != nil {
+					ctx := *clone.UserInputMessageContext
+					ctx.ToolResults = nil
+					if len(ctx.Tools) == 0 && len(ctx.ToolResults) == 0 {
+						clone.UserInputMessageContext = nil
+					} else {
+						clone.UserInputMessageContext = &ctx
+					}
+				}
+				if clone.Content == "" && len(clone.Images) == 0 && clone.UserInputMessageContext == nil {
+					// Pure tool-result turn with no other payload — drop it.
+					continue
+				}
+				scrubbed = append(scrubbed, KiroHistoryMessage{UserInputMessage: &clone})
+				continue
+			}
+		}
+		return scrubbed, nil
+	}
+
+	// First pass: collect all toolUseIds emitted by assistant turns and all
+	// toolUseIds referenced by user toolResults.
+	emittedIDs := make(map[string]bool)
+	for _, item := range history {
+		if item.AssistantResponseMessage == nil {
+			continue
+		}
+		for _, tu := range item.AssistantResponseMessage.ToolUses {
+			if tu.ToolUseID != "" {
+				emittedIDs[tu.ToolUseID] = true
+			}
+		}
+	}
+
+	consumedIDs := make(map[string]bool)
+	for _, item := range history {
+		if item.UserInputMessage == nil || item.UserInputMessage.UserInputMessageContext == nil {
+			continue
+		}
+		for _, tr := range item.UserInputMessage.UserInputMessageContext.ToolResults {
+			if tr.ToolUseID != "" && emittedIDs[tr.ToolUseID] {
+				consumedIDs[tr.ToolUseID] = true
+			}
+		}
+	}
+	// Current-turn results also count as consuming.
+	for _, tr := range currentToolResults {
+		if tr.ToolUseID != "" && emittedIDs[tr.ToolUseID] {
+			consumedIDs[tr.ToolUseID] = true
+		}
+	}
+
+	// Second pass: rebuild history dropping orphans.
+	out := make([]KiroHistoryMessage, 0, len(history))
+	for _, item := range history {
+		if item.AssistantResponseMessage != nil {
+			src := item.AssistantResponseMessage
+			kept := make([]KiroToolUse, 0, len(src.ToolUses))
+			for _, tu := range src.ToolUses {
+				if tu.ToolUseID != "" && consumedIDs[tu.ToolUseID] {
+					kept = append(kept, tu)
+				}
+			}
+			if len(kept) == 0 && src.Content == "" {
+				// Empty assistant turn after pruning — skip.
+				continue
+			}
+			out = append(out, KiroHistoryMessage{
+				AssistantResponseMessage: &KiroAssistantResponseMessage{
+					Content:  src.Content,
+					ToolUses: kept,
+				},
+			})
+			continue
+		}
+		if item.UserInputMessage != nil {
+			src := item.UserInputMessage
+			clone := *src
+			if src.UserInputMessageContext != nil {
+				ctx := *src.UserInputMessageContext
+				if len(ctx.ToolResults) > 0 {
+					kept := make([]KiroToolResult, 0, len(ctx.ToolResults))
+					for _, tr := range ctx.ToolResults {
+						if tr.ToolUseID != "" && emittedIDs[tr.ToolUseID] {
+							kept = append(kept, tr)
+						}
+					}
+					ctx.ToolResults = kept
+				}
+				if len(ctx.Tools) == 0 && len(ctx.ToolResults) == 0 {
+					clone.UserInputMessageContext = nil
+				} else {
+					clone.UserInputMessageContext = &ctx
+				}
+			}
+			if clone.Content == "" && len(clone.Images) == 0 && clone.UserInputMessageContext == nil {
+				continue
+			}
+			out = append(out, KiroHistoryMessage{UserInputMessage: &clone})
+			continue
+		}
+	}
+
+	// Filter the current turn's tool results against emittedIDs as well.
+	var keptCurrent []KiroToolResult
+	if len(currentToolResults) > 0 {
+		keptCurrent = make([]KiroToolResult, 0, len(currentToolResults))
+		for _, tr := range currentToolResults {
+			if tr.ToolUseID != "" && emittedIDs[tr.ToolUseID] {
+				keptCurrent = append(keptCurrent, tr)
+			}
+		}
+	}
+
+	return out, keptCurrent
 }
 
 func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
@@ -1545,13 +1982,9 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 		if tool.Type != "function" {
 			continue
 		}
-		desc := tool.Function.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
-		}
 		wrapper := KiroToolWrapper{}
 		wrapper.ToolSpecification.Name = shortenToolName(tool.Function.Name)
-		wrapper.ToolSpecification.Description = desc
+		wrapper.ToolSpecification.Description = normalizeToolDescription(tool.Function.Description, tool.Function.Name)
 		wrapper.ToolSpecification.InputSchema = InputSchema{JSON: tool.Function.Parameters}
 		result = append(result, wrapper)
 	}
@@ -1560,12 +1993,10 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 
 // ==================== Kiro -> OpenAI 转换 ====================
 
-func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *OpenAIResponse {
+func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, upstreamStopReason string) *OpenAIResponse {
 	msg := OpenAIMessage{
 		Role: "assistant",
 	}
-
-	finishReason := "stop"
 
 	if len(toolUses) > 0 {
 		msg.Content = nil
@@ -1579,16 +2010,17 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 			msg.ToolCalls[i].Function.Name = tu.Name
 			msg.ToolCalls[i].Function.Arguments = string(args)
 		}
-		finishReason = "tool_calls"
 	} else {
 		msg.Content = content
 	}
+
+	finishReason := resolveOpenAIFinishReason(upstreamStopReason, len(toolUses) > 0)
 
 	return &OpenAIResponse{
 		ID:      "chatcmpl-" + uuid.New().String(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   model,
+		Model:   canonicalAnthropicModelID(model),
 		Choices: []OpenAIChoice{{
 			Index:        0,
 			Message:      msg,
@@ -1630,9 +2062,7 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
-	finishReason := "stop"
-
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat, upstreamStopReason string) map[string]interface{} {
 	message := map[string]interface{}{
 		"role": "assistant",
 	}
@@ -1652,7 +2082,6 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			}
 		}
 		message["tool_calls"] = toolCalls
-		finishReason = "tool_calls"
 	} else {
 		// 根据配置格式化 thinking 输出
 		if reasoningContent != "" {
@@ -1670,11 +2099,13 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 		}
 	}
 
+	finishReason := resolveOpenAIFinishReason(upstreamStopReason, len(toolUses) > 0)
+
 	return map[string]interface{}{
 		"id":      "chatcmpl-" + uuid.New().String(),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   model,
+		"model":   canonicalAnthropicModelID(model),
 		"choices": []map[string]interface{}{{
 			"index":         0,
 			"message":       message,

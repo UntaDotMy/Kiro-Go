@@ -7,6 +7,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -36,7 +37,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -67,7 +68,7 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -97,7 +98,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -161,7 +162,7 @@ func listAvailableProfiles(account *config.Account) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -334,6 +335,13 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 				}
 			}
 		}
+	}
+
+	// If the refresh confirms the account is healthy (well below its quota),
+	// clear any soft 429 cooldown so the pool brings it back into rotation
+	// immediately rather than waiting for the cooldown timer to expire.
+	if info.UsageLimit == 0 || info.UsageCurrent < info.UsageLimit*0.95 {
+		pool.GetPool().ClearSoftCooldownIfHealthy(account.ID)
 	}
 
 	return info, nil

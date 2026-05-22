@@ -238,6 +238,13 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnStopReason surfaces a canonical stop reason ("end_turn", "max_tokens",
+	// "stop_sequence", "tool_use", "pause_turn", "refusal") detected from the
+	// upstream event stream — either from explicit messageStopEvent /
+	// finishReason fields or from exception events such as
+	// ContentLengthExceededException. Optional; callers that don't supply this
+	// fall back to a heuristic in the response builder (tool_use vs end_turn).
+	OnStopReason func(reason string)
 }
 
 // ==================== API Call ====================
@@ -276,15 +283,6 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
-	if _, err := json.Marshal(payload); err != nil {
-		return err
-	}
-
-	// Debug: dump full payload for troubleshooting upstream rejections
-	if payloadJSON, err := json.Marshal(payload); err == nil {
-		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
-	}
-
 	// Wrap OnToolUse to restore original tool names for the client.
 	if callback != nil && callback.OnToolUse != nil && len(payload.ToolNameMap) > 0 {
 		originalOnToolUse := callback.OnToolUse
@@ -314,12 +312,41 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	// Build endpoint list ordered by configuration.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
-	var lastErr error
-	for _, ep := range endpoints {
-		// Update the origin field for the selected endpoint.
-		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+	// All currently configured endpoints share Origin="AI_EDITOR", so the
+	// marshaled bytes are identical per iteration. We re-marshal inside the
+	// loop only when an endpoint's Origin differs from what we last serialized.
+	originPtr := &payload.ConversationState.CurrentMessage.UserInputMessage.Origin
+	var reqBody []byte
 
-		reqBody, _ := json.Marshal(payload)
+	var lastErr error
+	// AWS rate-limits per (identity, action) — Kiro IDE / CodeWhisperer /
+	// AmazonQ are three different actions, so a 429 on one does NOT imply the
+	// others are throttled. We try every endpoint before reporting quota
+	// exhaustion to the pool.
+	type throttleHit struct {
+		name       string
+		retryAfter time.Duration
+	}
+	var throttled []throttleHit
+	for _, ep := range endpoints {
+		// Marshal lazily: first iteration always re-marshals (originPtr starts
+		// as whatever the caller supplied, typically ""), subsequent iterations
+		// only re-marshal if Origin actually changes.
+		if ep.Origin != *originPtr || reqBody == nil {
+			*originPtr = ep.Origin
+			body, err := json.Marshal(payload)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			reqBody = body
+			// Debug dump only after a fresh marshal, gated on level so
+			// production INFO/WARN runs avoid the string conversion.
+			if logger.GetLevel() <= logger.LevelDebug {
+				logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
+			}
+		}
+
 		req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(reqBody))
 		if err != nil {
 			lastErr = err
@@ -351,14 +378,27 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 
 		if resp.StatusCode == 429 {
+			retryAfter := parseRetryAfter(resp.Header)
+			// Drain the body before Close so the underlying connection can be
+			// reused from the keep-alive pool for the next endpoint attempt.
+			// Cap at 64KiB — AWS throttling envelopes are <1KB; the limit
+			// guards chain-failover latency against a misbehaving upstream.
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+			// Per-endpoint throttle is logged at INFO so the operator can see
+			// the chain progress without WARN-level noise. We only WARN once
+			// at the end if EVERY endpoint refused.
+			logger.Infof("[KiroAPI] Endpoint %s throttled (429, retry-after=%s) — trying next endpoint", ep.Name, retryAfter)
+			throttled = append(throttled, throttleHit{name: ep.Name, retryAfter: retryAfter})
+			lastErr = &QuotaError{Endpoints: []string{ep.Name}, RetryAfter: retryAfter}
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			errBody, _ := io.ReadAll(resp.Body)
+			// Cap the error envelope at 64KiB. AWS error JSON is well under
+			// this; the limit guards us against a misbehaving upstream that
+			// might return a multi-MB HTML error page.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 			// Authentication errors and payment errors are not retried across endpoints.
@@ -374,10 +414,75 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return err
 	}
 
+	// Every endpoint returned 429: surface a single QuotaError carrying the
+	// SHORTEST upstream Retry-After we saw, so the pool's cooldown reflects
+	// the most optimistic recovery hint.
+	if len(throttled) > 0 && len(throttled) == len(endpoints) {
+		names := make([]string, 0, len(throttled))
+		minRetry := time.Duration(0)
+		for _, t := range throttled {
+			names = append(names, t.name)
+			if t.retryAfter > 0 && (minRetry == 0 || t.retryAfter < minRetry) {
+				minRetry = t.retryAfter
+			}
+		}
+		logger.Warnf("[KiroAPI] Account throttled on all endpoints (%s, retry-after=%s)", strings.Join(names, "+"), minRetry)
+		return &QuotaError{Endpoints: names, RetryAfter: minRetry}
+	}
+
 	if lastErr != nil {
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+// QuotaError signals that the upstream returned 429 for this account. The
+// pool should move the account into cooldown and the handler should either
+// retry on a different account or surface 429 + Retry-After to the client.
+//
+// Callers discriminate via errors.As(err, &qe) so wrapping with fmt.Errorf
+// "%w" remains safe. len(Endpoints) > 1 means the entire endpoint chain was
+// exhausted; len == 1 means a single-endpoint failure (which today is unusual
+// since the chain always tries every endpoint, but keeps the API symmetric).
+type QuotaError struct {
+	Endpoints  []string
+	RetryAfter time.Duration // 0 if upstream did not send Retry-After
+}
+
+func (e *QuotaError) Error() string {
+	joined := strings.Join(e.Endpoints, "+")
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("quota exhausted on %s (retry after %s)", joined, e.RetryAfter)
+	}
+	return fmt.Sprintf("quota exhausted on %s", joined)
+}
+
+// parseRetryAfter reads the Retry-After header in either delta-seconds or
+// HTTP-date format (RFC 7231 §7.1.3). AWS Q Developer historically sends
+// delta-seconds via API Gateway-style fronting, but we accept either to be
+// safe. Returns 0 if absent or unparseable.
+func parseRetryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		// Fall back to AWS-style x-amz-retry-after which is in milliseconds.
+		v = strings.TrimSpace(h.Get("x-amz-retry-after"))
+		if v == "" {
+			return 0
+		}
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // ==================== Event Stream Parsing ====================
@@ -390,6 +495,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	stopReasonEmitted := false
+
+	emitStopReason := func(reason string) {
+		if reason == "" || stopReasonEmitted {
+			return
+		}
+		stopReasonEmitted = true
+		if callback != nil && callback.OnStopReason != nil {
+			callback.OnStopReason(reason)
+		}
+	}
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -421,10 +537,33 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		eventType, exceptionType, messageType := extractEventHeaders(msgBuf[0:headersLength])
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 		if len(payloadBytes) == 0 {
 			continue
+		}
+
+		// Exception frames carry a JSON body like {"message":"..."} but the
+		// crucial signal is the :exception-type header. Map known truncation
+		// exceptions to canonical Anthropic stop_reason values so downstream
+		// clients (Claude Code, OpenAI SDKs) see "max_tokens" / "length"
+		// instead of a clean "end_turn".
+		if strings.EqualFold(messageType, "exception") || exceptionType != "" {
+			lower := strings.ToLower(exceptionType)
+			switch {
+			case strings.Contains(lower, "contentlengthexceeded"),
+				strings.Contains(lower, "content_length_exceeds"),
+				strings.Contains(lower, "maxtokens"),
+				strings.Contains(lower, "max_tokens"):
+				logger.Debugf("[KiroAPI] Upstream truncation exception: %s — %s", exceptionType, string(payloadBytes))
+				emitStopReason("max_tokens")
+				// Don't fall through to normal event dispatch.
+				continue
+			default:
+				if exceptionType != "" {
+					logger.Warnf("[KiroAPI] Upstream exception event %q: %s", exceptionType, string(payloadBytes))
+				}
+			}
 		}
 
 		var event map[string]interface{}
@@ -433,6 +572,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+
+		// Best-effort: an explicit finishReason / stopReason field anywhere in
+		// the payload signals the upstream's intended termination state. Map
+		// it to canonical Anthropic stop_reason values.
+		if reason := extractFinishReason(event); reason != "" {
+			emitStopReason(reason)
+		}
 
 		// Dispatch by event type.
 		switch eventType {
@@ -462,6 +608,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 					callback.OnContextUsage(pct)
 				}
 			}
+		case "messageStopEvent", "messageStop":
+			// Bedrock-style messageStopEvent carries the canonical stop reason.
+			if reason, ok := event["stopReason"].(string); ok && reason != "" {
+				emitStopReason(canonicalizeStopReason(reason))
+			} else if reason, ok := event["finishReason"].(string); ok && reason != "" {
+				emitStopReason(canonicalizeStopReason(reason))
+			}
 		}
 	}
 
@@ -471,6 +624,63 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 	callback.OnComplete(inputTokens, outputTokens)
 	return nil
+}
+
+// extractFinishReason looks for a finishReason / stopReason / stop_reason field
+// anywhere in an event payload and returns the canonical Anthropic stop reason.
+// Returns empty string when no recognized signal is present.
+func extractFinishReason(event map[string]interface{}) string {
+	candidates := []string{}
+	collectStopReasons(event, &candidates)
+	for _, raw := range candidates {
+		if normalized := canonicalizeStopReason(raw); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func collectStopReasons(v interface{}, out *[]string) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, child := range t {
+			lk := strings.ToLower(k)
+			if lk == "finishreason" || lk == "finish_reason" ||
+				lk == "stopreason" || lk == "stop_reason" {
+				if s, ok := child.(string); ok && s != "" {
+					*out = append(*out, s)
+				}
+			}
+			collectStopReasons(child, out)
+		}
+	case []interface{}:
+		for _, child := range t {
+			collectStopReasons(child, out)
+		}
+	}
+}
+
+// canonicalizeStopReason maps an upstream finish/stop reason to the canonical
+// Anthropic Messages API stop_reason vocabulary. Returns "" when the input is
+// not recognized so the caller can fall back to its heuristic.
+func canonicalizeStopReason(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "end_turn", "endturn", "stop", "complete", "completed", "finish", "finished":
+		return "end_turn"
+	case "max_tokens", "maxtokens", "length", "token_limit", "tokenlimit",
+		"content_length_exceeds", "contentlengthexceeded", "model_length",
+		"max_output_tokens":
+		return "max_tokens"
+	case "stop_sequence", "stopsequence":
+		return "stop_sequence"
+	case "tool_use", "tooluse", "tool_calls", "toolcalls":
+		return "tool_use"
+	case "pause_turn", "pauseturn":
+		return "pause_turn"
+	case "refusal", "refused":
+		return "refusal"
+	}
+	return ""
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
@@ -687,6 +897,15 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.
 func extractEventType(headers []byte) string {
+	eventType, _, _ := extractEventHeaders(headers)
+	return eventType
+}
+
+// extractEventHeaders extracts the AWS Event Stream framing identity headers
+// (:event-type, :exception-type, :message-type). Either of the first two is
+// usually present; :message-type tells us whether this frame is a normal
+// "event" or a fatal "exception" we must surface to the client.
+func extractEventHeaders(headers []byte) (eventType, exceptionType, messageType string) {
 	offset := 0
 	for offset < len(headers) {
 		if offset >= len(headers) {
@@ -716,8 +935,13 @@ func extractEventType(headers []byte) string {
 			}
 			value := string(headers[offset : offset+valueLen])
 			offset += valueLen
-			if name == ":event-type" {
-				return value
+			switch name {
+			case ":event-type":
+				eventType = value
+			case ":exception-type":
+				exceptionType = value
+			case ":message-type":
+				messageType = value
 			}
 			continue
 		}
@@ -736,5 +960,5 @@ func extractEventType(headers []byte) string {
 			break
 		}
 	}
-	return ""
+	return eventType, exceptionType, messageType
 }
