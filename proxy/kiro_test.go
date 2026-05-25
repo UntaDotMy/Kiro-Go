@@ -33,11 +33,61 @@ func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
 	}
 }
 
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
-	prev := "hello world"
+func TestNormalizeChunkPreservesNonOverlappingDeltas(t *testing.T) {
+	// Regression: an earlier suffix-overlap heuristic in normalizeChunk would
+	// strip leading characters from a fresh chunk whenever they coincidentally
+	// matched the tail of the prior snapshot. That produced user-visible
+	// truncations like "sleep" -> "slep" or "lets begin" -> "letsbegin" any
+	// time a chunk boundary aligned with a repeated character or whitespace.
+	// Each case below exercises a previously-buggy boundary; with the fix the
+	// chunk must pass through verbatim.
+	cases := []struct {
+		name string
+		prev string
+		next string
+		want string
+	}{
+		{"single trailing letter matches leading letter", "the e", "easy", "easy"},
+		{"trailing space matches leading space", "lets ", " begin", " begin"},
+		{"trailing space and char match leading", "halt ", " sleep", " sleep"},
+		{"punctuation tail", "wow!", "!extra", "!extra"},
+		{"unicode tail and head", "café", "éclair", "éclair"},
+		{"long shared multi-rune tail does not eat delta", "abc xyz", "xyz123", "xyz123"},
+	}
 
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := tc.prev
+			got := normalizeChunk(tc.next, &prev)
+			if got != tc.want {
+				t.Fatalf("normalizeChunk(%q, prev=%q) = %q, want %q",
+					tc.next, tc.prev, got, tc.want)
+			}
+			if prev != tc.next {
+				t.Fatalf("snapshot after delta = %q, want %q", prev, tc.next)
+			}
+		})
+	}
+}
+
+func TestNormalizeChunkStillDedupesCumulativeReplay(t *testing.T) {
+	// Confirm the cumulative/replay branches the heuristic was bolted onto
+	// continue to work after the suffix-overlap removal.
+	prev := ""
+	if got := normalizeChunk("hello", &prev); got != "hello" {
+		t.Fatalf("first chunk = %q, want %q", got, "hello")
+	}
+	if got := normalizeChunk("hello world", &prev); got != " world" {
+		t.Fatalf("cumulative extension = %q, want %q", got, " world")
+	}
+	if got := normalizeChunk("hello world", &prev); got != "" {
+		t.Fatalf("exact replay should be dropped, got %q", got)
+	}
+	if got := normalizeChunk("hello", &prev); got != "" {
+		t.Fatalf("rewind should be dropped, got %q", got)
+	}
+	if prev != "hello world" {
+		t.Fatalf("snapshot must keep longest version, got %q", prev)
 	}
 }
 

@@ -1329,11 +1329,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		activeBlockType = blockType
 	}
 
-	// Thinking 标签解析状态
-	var textBuffer string
-	var inThinkingBlock bool
-	var dropTagThinking bool
-	var thinkingSource thinkingStreamSource
+	// Thinking 标签解析状态由 thinkingTextProcessor 内部管理；这里不再
+	// 单独保存 textBuffer / inThinkingBlock / dropTagThinking / thinkingSource。
 
 	// 发送文本的辅助函数
 	// thinkingState: 0=普通内容, 1=thinking开始, 2=thinking中间, 3=thinking结束
@@ -1420,118 +1417,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		}
 	}
 
-	// 处理文本，解析 <thinking> 标签
-	var thinkingStarted bool
-	var eventThinkingOpen bool
-
-	processClaudeText := func(text string, isThinking bool, forceFlush bool) {
-		if isThinking && !thinking {
-			return
-		}
-
-		// 如果是 reasoningContentEvent，直接输出
-		if isThinking {
-			if !allowReasoningSource(&thinkingSource) {
-				return
-			}
-			if !thinkingStarted {
-				sendText(text, 1)
-				thinkingStarted = true
-				eventThinkingOpen = true
-			} else {
-				sendText(text, 2)
-			}
-			return
-		}
-
-		if eventThinkingOpen {
-			sendText("", 3)
-			eventThinkingOpen = false
-			thinkingStarted = false
-		}
-
-		textBuffer += text
-
-		for {
-			if !inThinkingBlock {
-				thinkingStart := strings.Index(textBuffer, "<thinking>")
-				if thinkingStart != -1 {
-					if thinkingStart > 0 {
-						sendText(textBuffer[:thinkingStart], 0)
-					}
-					textBuffer = textBuffer[thinkingStart+10:]
-					inThinkingBlock = true
-					dropTagThinking = !allowTagSource(&thinkingSource)
-					thinkingStarted = false
-				} else if forceFlush || len([]rune(textBuffer)) > 50 {
-					// 使用 rune 切片来正确处理 Unicode 字符
-					runes := []rune(textBuffer)
-					safeLen := len(runes)
-					if !forceFlush {
-						safeLen = max(0, len(runes)-15)
-					}
-					if safeLen > 0 {
-						sendText(string(runes[:safeLen]), 0)
-						textBuffer = string(runes[safeLen:])
-					}
-					break
-				} else {
-					break
-				}
-			} else {
-				thinkingEnd := strings.Index(textBuffer, "</thinking>")
-				if thinkingEnd != -1 {
-					content := textBuffer[:thinkingEnd]
-					if !dropTagThinking {
-						if !thinkingStarted {
-							sendText(content, 1)
-							sendText("", 3)
-						} else {
-							sendText(content, 3)
-						}
-					}
-					textBuffer = textBuffer[thinkingEnd+11:]
-					inThinkingBlock = false
-					dropTagThinking = false
-					thinkingStarted = false
-				} else if forceFlush {
-					if textBuffer != "" {
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendText(textBuffer, 1)
-								sendText("", 3)
-							} else {
-								sendText(textBuffer, 3)
-							}
-						}
-						textBuffer = ""
-					}
-					inThinkingBlock = false
-					dropTagThinking = false
-					thinkingStarted = false
-					break
-				} else {
-					// 流式输出 thinking 块内的内容
-					runes := []rune(textBuffer)
-					if len(runes) > 20 {
-						safeLen := len(runes) - 15
-						if safeLen > 0 {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendText(string(runes[:safeLen]), 1)
-									thinkingStarted = true
-								} else {
-									sendText(string(runes[:safeLen]), 2)
-								}
-							}
-							textBuffer = string(runes[safeLen:])
-						}
-					}
-					break
-				}
-			}
-		}
-	}
+	// 处理文本，解析 <thinking> 标签 — 实现复用 thinkingTextProcessor。
+	// 旧版本在 Anthropic 与 OpenAI 路径各自维护一份相同的状态机闭包，
+	// 上游修复（例如截断 bug 的 15-rune 收尾）只改一处会导致漂移。
+	processor := newThinkingProcessor(thinking, sendText, allowReasoningSource, allowTagSource)
 
 	// 发送 message_start
 	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
@@ -1558,11 +1447,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			} else {
 				rawContentBuilder.WriteString(text)
 			}
-			processClaudeText(text, isThinking, false)
+			processor.Process(text, isThinking)
 		},
 		OnToolUse: func(tu KiroToolUse) {
 			// 先刷新缓冲区
-			processClaudeText("", false, true)
+			processor.Finalize()
 			rawContentBuilder.WriteString(tu.Name)
 			if b, err := json.Marshal(tu.Input); err == nil {
 				rawContentBuilder.Write(b)
@@ -1627,11 +1516,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	// 刷新剩余缓冲区
-	processClaudeText("", false, true)
-	if eventThinkingOpen {
-		sendText("", 3)
-		eventThinkingOpen = false
-	}
+	processor.Finalize()
 	closeActiveBlock()
 
 	if realInputTokens > 0 {
@@ -1981,11 +1866,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	var rawReasoningBuilder strings.Builder
 	var upstreamStopReason string
 
-	// Thinking 标签解析状态
-	var textBuffer string
-	var inThinkingBlock bool
-	var dropTagThinking bool
-	var thinkingSource thinkingStreamSource
+	// Thinking 标签解析状态由 thinkingTextProcessor 内部管理。
 
 	// 发送 chunk 的辅助函数
 	// thinkingState: 0=普通内容, 1=thinking开始, 2=thinking中间, 3=thinking结束
@@ -2091,124 +1972,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 
 	// 处理文本，解析 <thinking> 标签
 	// thinkingStarted 用于跟踪是否已发送开始标签
-	var thinkingStarted bool
-	var eventThinkingOpen bool
-
-	processText := func(text string, isThinking bool, forceFlush bool) {
-		if isThinking && !thinking {
-			return
-		}
-
-		// 如果是 reasoningContentEvent，直接输出
-		if isThinking {
-			if !allowReasoningSource(&thinkingSource) {
-				return
-			}
-			if !thinkingStarted {
-				sendChunk(text, 1) // 开始
-				thinkingStarted = true
-				eventThinkingOpen = true
-			} else {
-				sendChunk(text, 2) // 中间
-			}
-			return
-		}
-
-		if eventThinkingOpen {
-			sendChunk("", 3)
-			eventThinkingOpen = false
-			thinkingStarted = false
-		}
-
-		textBuffer += text
-
-		for {
-			if !inThinkingBlock {
-				// 查找 <thinking> 开始标签
-				thinkingStart := strings.Index(textBuffer, "<thinking>")
-				if thinkingStart != -1 {
-					// 输出 thinking 标签之前的内容
-					if thinkingStart > 0 {
-						sendChunk(textBuffer[:thinkingStart], 0)
-					}
-					textBuffer = textBuffer[thinkingStart+10:] // 移除 <thinking>
-					inThinkingBlock = true
-					dropTagThinking = !allowTagSource(&thinkingSource)
-					thinkingStarted = false // 重置，准备发送新的开始标签
-				} else if forceFlush || len([]rune(textBuffer)) > 50 {
-					// 没有找到标签，安全输出（保留可能的部分标签）
-					runes := []rune(textBuffer)
-					safeLen := len(runes)
-					if !forceFlush {
-						safeLen = max(0, len(runes)-15)
-					}
-					if safeLen > 0 {
-						sendChunk(string(runes[:safeLen]), 0)
-						textBuffer = string(runes[safeLen:])
-					}
-					break
-				} else {
-					break
-				}
-			} else {
-				// 在 thinking 块内，查找 </thinking> 结束标签
-				thinkingEnd := strings.Index(textBuffer, "</thinking>")
-				if thinkingEnd != -1 {
-					// 输出 thinking 内容
-					content := textBuffer[:thinkingEnd]
-					if !dropTagThinking {
-						if !thinkingStarted {
-							// 一次性输出完整内容（开始+内容+结束）
-							sendChunk(content, 1) // 开始
-							sendChunk("", 3)      // 结束（空内容，只发结束标签）
-						} else {
-							// 已经开始了，发送剩余内容和结束
-							sendChunk(content, 3) // 结束
-						}
-					}
-					textBuffer = textBuffer[thinkingEnd+11:] // 移除 </thinking>
-					inThinkingBlock = false
-					dropTagThinking = false
-					thinkingStarted = false
-				} else if forceFlush {
-					// 强制刷新：输出剩余内容
-					if textBuffer != "" {
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendChunk(textBuffer, 1) // 开始
-								sendChunk("", 3)         // 结束
-							} else {
-								sendChunk(textBuffer, 3) // 结束
-							}
-						}
-						textBuffer = ""
-					}
-					inThinkingBlock = false
-					dropTagThinking = false
-					thinkingStarted = false
-					break
-				} else {
-					// 流式输出 thinking 块内的内容
-					runes := []rune(textBuffer)
-					if len(runes) > 20 {
-						safeLen := len(runes) - 15 // 保留可能的 </thinking> 部分
-						if safeLen > 0 {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendChunk(string(runes[:safeLen]), 1) // 开始
-									thinkingStarted = true
-								} else {
-									sendChunk(string(runes[:safeLen]), 2) // 中间
-								}
-							}
-							textBuffer = string(runes[safeLen:])
-						}
-					}
-					break
-				}
-			}
-		}
-	}
+	// 处理文本，解析 <thinking> 标签 — 与 Anthropic 路径共用 thinkingTextProcessor。
+	processor := newThinkingProcessor(thinking, sendChunk, allowReasoningSource, allowTagSource)
 
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
@@ -2220,11 +1985,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			} else {
 				rawContentBuilder.WriteString(text)
 			}
-			processText(text, isThinking, false)
+			processor.Process(text, isThinking)
 		},
 		OnToolUse: func(tu KiroToolUse) {
 			// 先刷新缓冲区
-			processText("", false, true)
+			processor.Finalize()
 
 			args, _ := json.Marshal(tu.Input)
 			rawContentBuilder.WriteString(tu.Name)
@@ -2283,11 +2048,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	// 刷新剩余缓冲区
-	processText("", false, true)
-	if eventThinkingOpen {
-		sendChunk("", 3)
-		eventThinkingOpen = false
-	}
+	processor.Finalize()
 
 	if realInputTokens > 0 {
 		inputTokens = realInputTokens
