@@ -70,6 +70,13 @@ type Account struct {
 	BanReason string `json:"banReason,omitempty"` // Reason for ban/suspension
 	BanTime   int64  `json:"banTime,omitempty"`   // Timestamp when ban was detected
 
+	// AutoDisabledAtFull marks an account that was disabled by the auto-disable
+	// path (UsageCurrent ≥ UsageLimit on paid OR trial). Used to distinguish
+	// "system disabled because quota was exhausted" from "operator manually
+	// disabled this" so the next refresh can auto-re-enable the former without
+	// trampling the latter. Cleared when the operator manually toggles Enabled.
+	AutoDisabledAtFull bool `json:"autoDisabledAtFull,omitempty"`
+
 	// Subscription information
 	SubscriptionType  string `json:"subscriptionType,omitempty"`  // Tier: FREE, PRO, PRO_PLUS, or POWER
 	SubscriptionTitle string `json:"subscriptionTitle,omitempty"` // Human-readable subscription name
@@ -518,9 +525,51 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 	return nil
 }
 
+// IsQuotaExhausted reports whether either the paid or the trial quota has
+// been fully consumed. A zero limit means "no limit declared by upstream"
+// and is treated as not-exhausted (we never auto-disable accounts whose
+// limit we can't see).
+func IsQuotaExhausted(a Account) bool {
+	if a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit {
+		return true
+	}
+	if a.TrialUsageLimit > 0 && a.TrialUsageCurrent >= a.TrialUsageLimit {
+		return true
+	}
+	return false
+}
+
+// applyAutoDisableTransition encodes the four-state machine for the
+// auto-disable feature. Mutates `a` in place. Returns true when the call
+// flipped Enabled — callers use that to know they need to Reload the pool.
+//
+// State table (E = Enabled, F = AutoDisabledAtFull, Q = quota exhausted):
+//
+//	(E=t, F=*, Q=t)  →  (E=f, F=t)   auto-disable
+//	(E=f, F=t, Q=f)  →  (E=t, F=f)   auto-recover
+//	(E=f, F=f, Q=*)  →  unchanged    operator manually disabled — respect it
+//	any other         →  unchanged
+func applyAutoDisableTransition(a *Account) bool {
+	full := IsQuotaExhausted(*a)
+	if a.Enabled && full {
+		a.Enabled = false
+		a.AutoDisabledAtFull = true
+		return true
+	}
+	if !a.Enabled && a.AutoDisabledAtFull && !full {
+		a.Enabled = true
+		a.AutoDisabledAtFull = false
+		return true
+	}
+	return false
+}
+
 // UpdateAccountInfo updates an account's subscription and usage information.
 // Called after refreshing account data from Kiro API.
-func UpdateAccountInfo(id string, info AccountInfo) error {
+//
+// Returns true when the call flipped Enabled (auto-disable or auto-recover);
+// callers use that to decide whether to Reload the pool.
+func UpdateAccountInfo(id string, info AccountInfo) (bool, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
@@ -544,10 +593,11 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			return Save()
+			flipped := applyAutoDisableTransition(&cfg.Accounts[i])
+			return flipped, Save()
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.

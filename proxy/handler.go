@@ -381,7 +381,14 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 			logger.Debugf("[LazyRefresh] Failed to refresh %s: %v", acc.Email, err)
 			return
 		}
-		_ = config.UpdateAccountInfo(acc.ID, *info)
+		flipped, _ := config.UpdateAccountInfo(acc.ID, *info)
+		if flipped {
+			// Auto-disable / auto-recover took effect — re-pick weights so the
+			// scheduler stops (or resumes) routing to this account immediately.
+			h.pool.Reload()
+			logger.Infof("[AutoDisable] Account %s enabled-state flipped on refresh (current=%.1f/%.1f trial=%.1f/%.1f)",
+				redactForLog(acc.Email), info.UsageCurrent, info.UsageLimit, info.TrialUsageCurrent, info.TrialUsageLimit)
+		}
 	})
 }
 
@@ -2480,6 +2487,12 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	oldEnabled := existing.Enabled
 	if v, ok := updates["enabled"].(bool); ok {
 		existing.Enabled = v
+		// Operator made an explicit choice — clear the auto-disable marker
+		// either way so the next refresh doesn't re-flip the state. (Manual
+		// disable: don't auto-recover later. Manual enable: don't get
+		// immediately re-disabled if quota is still full — the operator
+		// might have just enabled overage or has a reason.)
+		existing.AutoDisabledAtFull = false
 	}
 	if v, ok := updates["nickname"].(string); ok {
 		existing.Nickname = v
@@ -2551,6 +2564,10 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 					toRefreshModels = append(toRefreshModels, a)
 				}
 				a.Enabled = enabled
+				// Operator made an explicit choice — clear auto-disable marker
+				// so the next refresh doesn't re-flip the state. Mirrors the
+				// single-account update path.
+				a.AutoDisabledAtFull = false
 				if enabled && a.BanStatus != "" && a.BanStatus != "ACTIVE" {
 					a.BanStatus = "ACTIVE"
 					a.BanReason = ""
@@ -3309,10 +3326,14 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	}
 
 	// 保存到配置
-	if err := config.UpdateAccountInfo(id, *info); err != nil {
+	flipped, err := config.UpdateAccountInfo(id, *info)
+	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+	if flipped {
+		h.pool.Reload()
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
