@@ -1337,6 +1337,7 @@
                             </label>
                         </div>
                         <button class="btn btn-secondary btn-sm" onclick="showExportModal()" data-i18n="accounts.export"></button>
+                        <button class="btn btn-secondary btn-sm" onclick="showImportModal()" data-i18n="accounts.import"></button>
                         <button class="btn btn-secondary btn-sm" onclick="refreshAllModels()" data-i18n="models.refreshAll"></button>
                         <button class="btn btn-primary btn-sm" onclick="showModal('add')" data-i18n="accounts.add"></button>
                     </div>
@@ -1591,6 +1592,13 @@
             <div class="modal-header"><span class="modal-title" data-i18n="export.title"></span><button
                     class="modal-close" onclick="closeExportModal()">&times;</button></div>
             <div id="exportBody"></div>
+        </div>
+    </div>
+    <div id="importModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><span class="modal-title" data-i18n="import.title"></span><button
+                    class="modal-close" onclick="closeImportModal()">&times;</button></div>
+            <div id="importBody"></div>
         </div>
     </div>
     <div id="updateModal" class="modal">
@@ -1886,6 +1894,7 @@
                 'common.saveFailed': '保存失败',
                 'common.logout': '退出登录',
                 'accounts.export': '导出',
+                'accounts.import': '导入',
                 'models.refreshAll': '刷新模型缓存',
                 'models.confirmRefreshAll': '确定为所有已启用账号刷新模型缓存？',
                 'models.refreshAllDone': '模型缓存刷新完成，共缓存 {0} 个模型',
@@ -1898,6 +1907,28 @@
                 'export.copyJson': '复制 JSON',
                 'export.copied': '已复制到剪贴板',
                 'export.noSelection': '请至少选择一个账号',
+                'import.title': '导入账号',
+                'import.pickFile': '选择 JSON 文件',
+                'import.orPaste': '或粘贴 JSON',
+                'import.parsePlaceholder': '粘贴导出的 JSON 或 RefreshToken（每行一个）',
+                'import.parse': '解析',
+                'import.parseError': 'JSON 解析失败：{0}',
+                'import.parseEmpty': '未发现可导入的账号',
+                'import.found': '解析到 {0} 个账号',
+                'import.duplicate': '已存在（跳过）',
+                'import.willImport': '待导入',
+                'import.selectAll': '全选',
+                'import.deselectAll': '取消全选',
+                'import.selected': '已选 {0} 个 / 共 {1} 个',
+                'import.run': '开始导入',
+                'import.running': '导入中…',
+                'import.done': '导入完成：成功 {0}、跳过 {1}、失败 {2}',
+                'import.failedRow': '失败：{0}',
+                'import.invalidRow': '无效：{0}',
+                'import.skippedRow': '跳过：refreshToken 已存在',
+                'import.noSelection': '请至少选择一个待导入的账号',
+                'import.requestFailed': '请求失败：{0}',
+                'import.tokenLines': 'RefreshToken 列表（每行一个）',
                 'update.title': '版本更新',
                 'update.current': '当前版本',
                 'update.latest': '最新版本',
@@ -2244,6 +2275,7 @@
                 'common.saveFailed': 'Save failed',
                 'common.logout': 'Logout',
                 'accounts.export': 'Export',
+                'accounts.import': 'Import',
                 'models.refreshAll': 'Refresh Model Cache',
                 'models.confirmRefreshAll': 'Refresh model cache for all enabled accounts?',
                 'models.refreshAllDone': 'Model cache refreshed, {0} models cached',
@@ -2256,6 +2288,28 @@
                 'export.copyJson': 'Copy JSON',
                 'export.copied': 'Copied to clipboard',
                 'export.noSelection': 'Please select at least one account',
+                'import.title': 'Import Accounts',
+                'import.pickFile': 'Choose JSON File',
+                'import.orPaste': 'or paste JSON',
+                'import.parsePlaceholder': 'Paste exported JSON or one refreshToken per line',
+                'import.parse': 'Parse',
+                'import.parseError': 'JSON parse failed: {0}',
+                'import.parseEmpty': 'No importable accounts found',
+                'import.found': 'Found {0} account(s)',
+                'import.duplicate': 'Already exists (will skip)',
+                'import.willImport': 'Will import',
+                'import.selectAll': 'Select All',
+                'import.deselectAll': 'Deselect All',
+                'import.selected': '{0} selected / {1} total',
+                'import.run': 'Import Selected',
+                'import.running': 'Importing…',
+                'import.done': 'Done: {0} imported, {1} skipped, {2} failed',
+                'import.failedRow': 'Failed: {0}',
+                'import.invalidRow': 'Invalid: {0}',
+                'import.skippedRow': 'Skipped: refreshToken already exists',
+                'import.noSelection': 'Please select at least one account to import',
+                'import.requestFailed': 'Request failed: {0}',
+                'import.tokenLines': 'RefreshToken list (one per line)',
                 'update.title': 'Version Update',
                 'update.current': 'Current',
                 'update.latest': 'Latest',
@@ -4093,6 +4147,247 @@
             a.download = 'kiro-accounts-' + new Date().toISOString().slice(0, 10) + '.json';
             a.click();
             URL.revokeObjectURL(url);
+        }
+
+        // ==================== 导入功能 ====================
+        // 解析后的待导入条目，每项 {refreshToken, accessToken?, clientId?, clientSecret?, authMethod?, provider?, region?, email?, nickname?, userId?, machineId?, idx, selected, status?, reason?}
+        let importParsedRows = [];
+
+        function showImportModal() {
+            importParsedRows = [];
+            renderImportModal();
+            document.getElementById('importModal').classList.add('active');
+        }
+
+        function closeImportModal() {
+            document.getElementById('importModal').classList.remove('active');
+        }
+
+        function renderImportModal() {
+            const body = document.getElementById('importBody');
+            const hasRows = importParsedRows.length > 0;
+            const selectedCount = importParsedRows.filter(r => r.selected && !r.status).length;
+            const totalSelectable = importParsedRows.filter(r => !r.status).length;
+            const allSelected = totalSelectable > 0 && selectedCount === totalSelectable;
+
+            let listHtml = '';
+            if (hasRows) {
+                listHtml =
+                    '<div style="margin:12px 0;display:flex;justify-content:space-between;align-items:center">' +
+                    '<span style="font-size:13px;color:#64748b">' + t('import.found', importParsedRows.length) + ' · ' + t('import.selected', selectedCount, totalSelectable) + '</span>' +
+                    (totalSelectable > 0 ? '<button class="btn btn-sm btn-secondary" onclick="toggleImportSelectAll()">' + (allSelected ? t('import.deselectAll') : t('import.selectAll')) + '</button>' : '') +
+                    '</div>' +
+                    '<div style="max-height:280px;overflow-y:auto;margin-bottom:16px">' +
+                    importParsedRows.map((r, i) => renderImportRow(r, i)).join('') +
+                    '</div>';
+            }
+
+            body.innerHTML =
+                '<p style="font-size:13px;color:#64748b;margin-bottom:12px">' + t('credentials.batchHint') + '</p>' +
+                '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">' +
+                '<input type="file" id="importFileInput" accept=".json,application/json" onchange="importLoadFile(event)" style="font-size:12px">' +
+                '<span style="font-size:12px;color:#64748b">' + t('import.orPaste') + '</span>' +
+                '</div>' +
+                '<div class="form-group"><textarea id="importJsonText" placeholder="' + t('import.parsePlaceholder') + '" style="min-height:140px;font-family:monospace;font-size:11px"></textarea></div>' +
+                '<div style="margin-bottom:8px"><button class="btn btn-secondary btn-sm" onclick="importParse()">' + t('import.parse') + '</button></div>' +
+                listHtml +
+                '<div class="modal-footer">' +
+                '<button class="btn btn-secondary" onclick="closeImportModal()">' + t('common.cancel') + '</button>' +
+                (hasRows && totalSelectable > 0 ? '<button class="btn btn-primary" id="importRunBtn" onclick="importRun()">' + t('import.run') + '</button>' : '') +
+                '</div>';
+        }
+
+        function renderImportRow(r, i) {
+            // status mirrors the backend response: imported | skipped | failed | invalid
+            let badge = '';
+            let bg = '#f8fafc';
+            let disabled = '';
+            if (r.status === 'imported') {
+                badge = '<span style="font-size:11px;color:#16a34a;font-weight:600">✓</span>';
+                bg = '#f0fdf4';
+                disabled = 'disabled';
+            } else if (r.status === 'skipped') {
+                badge = '<span style="font-size:11px;color:#64748b">' + t('import.skippedRow') + '</span>';
+                bg = '#f1f5f9';
+                disabled = 'disabled';
+            } else if (r.status === 'failed') {
+                badge = '<span style="font-size:11px;color:#dc2626">' + t('import.failedRow', r.reason || '') + '</span>';
+                bg = '#fef2f2';
+                disabled = 'disabled';
+            } else if (r.status === 'invalid') {
+                badge = '<span style="font-size:11px;color:#b45309">' + t('import.invalidRow', r.reason || '') + '</span>';
+                bg = '#fffbeb';
+                disabled = 'disabled';
+            }
+            const checked = (r.selected && !r.status) ? 'checked' : '';
+            const tail = (r.refreshToken || '').slice(-8);
+            const display = r.email || (r.userId ? r.userId.slice(0, 12) + '…' : '…' + tail);
+            const provider = r.provider || formatAuthMethod(r.authMethod) || '-';
+            return '<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:4px;background:' + bg + '">' +
+                '<input type="checkbox" ' + checked + ' ' + disabled + ' onchange="toggleImportRow(' + i + ')" style="width:16px;height:16px">' +
+                '<div style="flex:1;min-width:0">' +
+                '<div style="font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(display) + '</div>' +
+                '<div style="font-size:11px;color:#64748b">' + escapeHtml(provider) + ' · …' + escapeHtml(tail) + '</div>' +
+                '</div>' +
+                (badge ? '<div style="margin-left:8px">' + badge + '</div>' : '') +
+                '</label>';
+        }
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        function importLoadFile(ev) {
+            const f = ev.target.files && ev.target.files[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = e => {
+                document.getElementById('importJsonText').value = String(e.target.result || '');
+                importParse();
+            };
+            reader.readAsText(f);
+        }
+
+        function importParse() {
+            const raw = (document.getElementById('importJsonText').value || '').trim();
+            if (!raw) { importParsedRows = []; renderImportModal(); return; }
+
+            // Three accepted shapes plus a fallback line-by-line refreshToken list.
+            let items = [];
+            try {
+                const j = JSON.parse(raw);
+                if (Array.isArray(j)) {
+                    items = j;
+                } else if (j && Array.isArray(j.accounts)) {
+                    items = j.accounts.map(a => {
+                        const c = a.credentials || {};
+                        return {
+                            refreshToken: c.refreshToken || a.refreshToken,
+                            accessToken: c.accessToken,
+                            clientId: c.clientId || a.clientId,
+                            clientSecret: c.clientSecret || a.clientSecret,
+                            region: c.region || a.region,
+                            authMethod: c.authMethod || a.authMethod,
+                            provider: c.provider || a.provider || a.idp,
+                            email: a.email,
+                            nickname: a.nickname,
+                            userId: a.userId,
+                            machineId: a.machineId
+                        };
+                    });
+                } else if (j && j.refreshToken) {
+                    items = [j];
+                }
+            } catch (e) {
+                // Fallback: maybe one refreshToken per line.
+                const lines = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                if (lines.length > 0 && lines.every(l => !l.startsWith('{') && !l.startsWith('['))) {
+                    items = lines.map(l => ({ refreshToken: l }));
+                } else {
+                    alert(t('import.parseError', e.message || e));
+                    return;
+                }
+            }
+
+            const cleaned = items.filter(it => it && typeof it.refreshToken === 'string' && it.refreshToken.trim() !== '');
+            if (cleaned.length === 0) {
+                alert(t('import.parseEmpty'));
+                importParsedRows = [];
+                renderImportModal();
+                return;
+            }
+
+            importParsedRows = cleaned.map((it, i) => Object.assign({}, it, { idx: i, selected: true, status: '', reason: '' }));
+            renderImportModal();
+        }
+
+        function toggleImportRow(i) {
+            const r = importParsedRows[i];
+            if (!r || r.status) return;
+            r.selected = !r.selected;
+            renderImportModal();
+        }
+
+        function toggleImportSelectAll() {
+            const selectable = importParsedRows.filter(r => !r.status);
+            const allOn = selectable.every(r => r.selected);
+            selectable.forEach(r => { r.selected = !allOn; });
+            renderImportModal();
+        }
+
+        async function importRun() {
+            const toSend = importParsedRows.filter(r => r.selected && !r.status);
+            if (toSend.length === 0) { alert(t('import.noSelection')); return; }
+
+            const btn = document.getElementById('importRunBtn');
+            if (btn) { btn.disabled = true; btn.textContent = t('import.running'); }
+
+            const payload = {
+                accounts: toSend.map(r => ({
+                    credentials: {
+                        refreshToken: r.refreshToken,
+                        // Deliberately omit accessToken — the backend always
+                        // re-derives a fresh one via auth.RefreshToken.
+                        clientId: r.clientId || '',
+                        clientSecret: r.clientSecret || '',
+                        region: r.region || '',
+                        authMethod: r.authMethod || '',
+                        provider: r.provider || ''
+                    },
+                    email: r.email || '',
+                    nickname: r.nickname || '',
+                    userId: r.userId || '',
+                    machineId: r.machineId || '',
+                    idp: r.provider || ''
+                }))
+            };
+
+            let data;
+            try {
+                const res = await fetch('/admin/api/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify(payload)
+                });
+                data = await res.json();
+                if (!res.ok) {
+                    alert(t('import.requestFailed', data && data.error ? data.error : res.status));
+                    if (btn) { btn.disabled = false; btn.textContent = t('import.run'); }
+                    return;
+                }
+            } catch (e) {
+                alert(t('import.requestFailed', e.message || e));
+                if (btn) { btn.disabled = false; btn.textContent = t('import.run'); }
+                return;
+            }
+
+            // Map per-row results back onto the parsed rows. The server returns
+            // results in the same order we sent them, so we walk the selected
+            // subset by index.
+            const results = (data && data.results) || [];
+            const newAccountIds = [];
+            toSend.forEach((row, i) => {
+                const res = results[i] || {};
+                row.status = res.status || 'failed';
+                row.reason = res.reason || '';
+                if (res.status === 'imported' && res.accountId) {
+                    newAccountIds.push(res.accountId);
+                }
+                if (res.email && !row.email) row.email = res.email;
+            });
+
+            renderImportModal();
+
+            const imported = data.imported || 0;
+            const skipped = data.skipped || 0;
+            const failed = data.failed || 0;
+            alert(t('import.done', imported, skipped, failed));
+
+            if (imported > 0) {
+                loadAccounts();
+                loadStats();
+                newAccountIds.forEach(id => autoRefreshNewAccount(id));
+            }
         }
 
         // ==================== 添加账号后自动刷新 ====================
