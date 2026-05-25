@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -132,14 +133,11 @@ func (h *Handler) apiImportAccounts(w http.ResponseWriter, r *http.Request) {
 	importedAny := false
 
 	for _, c := range creds {
-		entry, created := h.importOneAccount(c, existing, auth.RefreshToken, auth.GetUserInfo)
+		entry := h.importOneAccount(c, existing, auth.RefreshToken, auth.GetUserInfo)
 		switch entry.Status {
 		case "imported":
 			resp.Imported++
 			importedAny = true
-			if created != "" {
-				existing[c.RefreshToken] = created
-			}
 		case "skipped":
 			resp.Skipped++
 		default:
@@ -166,6 +164,10 @@ func decodeImportBody(body io.Reader) ([]importCredential, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
+	// Strip a leading UTF-8 BOM (\xEF\xBB\xBF). Files saved by some Windows
+	// editors / PowerShell `>>` carry one and json.Unmarshal would otherwise
+	// reject them.
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("empty request body")
 	}
@@ -232,8 +234,11 @@ type refreshTokenFunc func(account *config.Account) (string, string, int64, stri
 type userInfoFunc func(accessToken string) (string, string, error)
 
 // importOneAccount handles dedupe + token refresh + persistence for a single
-// row. Returns the user-visible result entry and the freshly-minted account
-// ID (empty when no row was created).
+// row. Returns the user-visible result entry. On a successful import it also
+// registers BOTH the original refreshToken and any rotated refreshToken in
+// the `existing` index so a later row in the same batch carrying either
+// value will be deduped — AWS rotates the RT on refresh, so a file that
+// repeats the same pre-rotation token across rows must skip the second one.
 //
 // refresh and getUserInfo are injected so tests can run without making real
 // network calls. In production both come from the auth package.
@@ -242,18 +247,19 @@ func (h *Handler) importOneAccount(
 	existing map[string]string,
 	refresh refreshTokenFunc,
 	getUserInfo userInfoFunc,
-) (importResultEntry, string) {
+) importResultEntry {
 	rt := strings.TrimSpace(c.RefreshToken)
 	if rt == "" {
-		return importResultEntry{Status: "invalid", Reason: "missing refreshToken"}, ""
+		return importResultEntry{Status: "invalid", Reason: "missing refreshToken"}
 	}
+	originalRT := rt
 
 	if existingID, ok := existing[rt]; ok {
 		return importResultEntry{
 			Status:    "skipped",
 			AccountID: existingID,
 			Reason:    "refreshToken already imported",
-		}, ""
+		}
 	}
 
 	authMethod := normalizeAuthMethod(c.AuthMethod, c.ClientID, c.ClientSecret)
@@ -275,7 +281,7 @@ func (h *Handler) importOneAccount(
 		return importResultEntry{
 			Status: "failed",
 			Reason: "token refresh failed: " + err.Error(),
-		}, ""
+		}
 	}
 	if newRT != "" {
 		rt = newRT
@@ -317,7 +323,14 @@ func (h *Handler) importOneAccount(
 		return importResultEntry{
 			Status: "failed",
 			Reason: "save failed: " + err.Error(),
-		}, ""
+		}
+	}
+
+	// Register both the original and the rotated token so subsequent rows in
+	// this batch are deduped regardless of which form they carry.
+	existing[originalRT] = account.ID
+	if rt != originalRT {
+		existing[rt] = account.ID
 	}
 
 	logger.Infof("import: added account id=%s email=%s authMethod=%s region=%s",
@@ -327,7 +340,7 @@ func (h *Handler) importOneAccount(
 		Status:    "imported",
 		AccountID: account.ID,
 		Email:     email,
-	}, account.ID
+	}
 }
 
 // buildRefreshTokenIndex maps refreshToken → accountID for fast O(1) dedupe.

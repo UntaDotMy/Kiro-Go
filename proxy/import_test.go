@@ -120,12 +120,53 @@ func TestDecodeImportBodyRejectsEmpty(t *testing.T) {
 	}
 }
 
+// TestDecodeImportBodyStripsUTF8BOM ensures a BOM-prefixed export file (the
+// kind PowerShell `>` and a few editors produce) parses cleanly. Without the
+// strip, json.Unmarshal rejects the leading \xEF\xBB\xBF.
+func TestDecodeImportBodyStripsUTF8BOM(t *testing.T) {
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	body := append(bom, []byte(`[{"refreshToken":"rt-1"}]`)...)
+	got, err := decodeImportBody(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("BOM-prefixed body must parse, got %v", err)
+	}
+	if len(got) != 1 || got[0].RefreshToken != "rt-1" {
+		t.Fatalf("expected one row with rt-1, got %+v", got)
+	}
+
+	// Same for the object-form export envelope.
+	envelope := append(bom, []byte(`{"accounts":[{"credentials":{"refreshToken":"rt-2"}}]}`)...)
+	got, err = decodeImportBody(bytes.NewReader(envelope))
+	if err != nil {
+		t.Fatalf("BOM-prefixed envelope must parse, got %v", err)
+	}
+	if len(got) != 1 || got[0].RefreshToken != "rt-2" {
+		t.Fatalf("expected one envelope row with rt-2, got %+v", got)
+	}
+}
+
+// TestDecodeImportBodyRejectsMalformedJSON pins the error path for partial /
+// invalid JSON so a regression doesn't accidentally crash the handler.
+func TestDecodeImportBodyRejectsMalformedJSON(t *testing.T) {
+	cases := []string{
+		`{garbage`,
+		`[{"refreshToken":"a"`,
+		`not json at all`,
+		`{"accounts":[{`,
+	}
+	for _, in := range cases {
+		if _, err := decodeImportBody(strings.NewReader(in)); err == nil {
+			t.Errorf("malformed input %q must error", in)
+		}
+	}
+}
+
 func TestImportOneAccountSkipsExistingRefreshToken(t *testing.T) {
 	h := newImportTestHandler(t)
 	existing := map[string]string{"rt-dup": "acct-existing"}
 
 	refresh, calls := stubRefresh("new-access", 9_999_999_999, "")
-	entry, created := h.importOneAccount(
+	entry := h.importOneAccount(
 		importCredential{RefreshToken: "rt-dup"},
 		existing,
 		refresh,
@@ -136,9 +177,6 @@ func TestImportOneAccountSkipsExistingRefreshToken(t *testing.T) {
 	}
 	if entry.AccountID != "acct-existing" {
 		t.Fatalf("expected existing accountID surfaced, got %q", entry.AccountID)
-	}
-	if created != "" {
-		t.Fatalf("skip path must not return a new ID, got %q", created)
 	}
 	if len(*calls) != 0 {
 		t.Fatal("skip path must not call RefreshToken")
@@ -151,23 +189,20 @@ func TestImportOneAccountSkipsExistingRefreshToken(t *testing.T) {
 func TestImportOneAccountInvalidEmptyRefreshToken(t *testing.T) {
 	h := newImportTestHandler(t)
 	refresh, _ := stubRefresh("", 0, "")
-	entry, created := h.importOneAccount(
+	entry := h.importOneAccount(
 		importCredential{RefreshToken: "   "},
 		nil, refresh, stubUserInfo(""),
 	)
 	if entry.Status != "invalid" {
 		t.Fatalf("expected invalid, got %q (%s)", entry.Status, entry.Reason)
 	}
-	if created != "" {
-		t.Fatal("invalid row must not produce an account ID")
-	}
 }
 
 func TestImportOneAccountFailedRefreshIsReportedNotPanicked(t *testing.T) {
 	h := newImportTestHandler(t)
-	entry, created := h.importOneAccount(
+	entry := h.importOneAccount(
 		importCredential{RefreshToken: "rt-bad", ClientID: "c", ClientSecret: "s"},
-		nil,
+		map[string]string{},
 		stubFailingRefresh("token revoked"),
 		stubUserInfo(""),
 	)
@@ -177,7 +212,7 @@ func TestImportOneAccountFailedRefreshIsReportedNotPanicked(t *testing.T) {
 	if !strings.Contains(entry.Reason, "token revoked") {
 		t.Fatalf("expected refresh error in reason, got %q", entry.Reason)
 	}
-	if created != "" || len(config.GetAccounts()) != 0 {
+	if len(config.GetAccounts()) != 0 {
 		t.Fatal("failed refresh must not persist anything")
 	}
 }
@@ -185,7 +220,7 @@ func TestImportOneAccountFailedRefreshIsReportedNotPanicked(t *testing.T) {
 func TestImportOneAccountPersistsNewAccountWithRefreshedToken(t *testing.T) {
 	h := newImportTestHandler(t)
 	refresh, calls := stubRefresh("fresh-access", 1_700_000_000, "arn:profile")
-	entry, created := h.importOneAccount(
+	entry := h.importOneAccount(
 		importCredential{
 			RefreshToken: "rt-new",
 			ClientID:     "cid",
@@ -202,8 +237,8 @@ func TestImportOneAccountPersistsNewAccountWithRefreshedToken(t *testing.T) {
 	if entry.Status != "imported" {
 		t.Fatalf("expected imported, got %q (%s)", entry.Status, entry.Reason)
 	}
-	if created == "" || created != entry.AccountID {
-		t.Fatalf("expected new accountID, got entry=%q created=%q", entry.AccountID, created)
+	if entry.AccountID == "" {
+		t.Fatalf("imported entry must carry an accountID, got empty")
 	}
 	if entry.Email != "user@example.com" {
 		t.Fatalf("supplied email must take precedence; got %q", entry.Email)
@@ -240,14 +275,128 @@ func TestImportOneAccountPersistsNewAccountWithRefreshedToken(t *testing.T) {
 func TestImportOneAccountUsesUserInfoWhenEmailMissing(t *testing.T) {
 	h := newImportTestHandler(t)
 	refresh, _ := stubRefresh("a", 1_700_000_000, "")
-	entry, _ := h.importOneAccount(
+	entry := h.importOneAccount(
 		importCredential{RefreshToken: "rt-x"},
-		nil,
+		map[string]string{},
 		refresh,
 		stubUserInfo("from-userinfo@example.com"),
 	)
 	if entry.Email != "from-userinfo@example.com" {
 		t.Fatalf("expected GetUserInfo email when supplied was empty, got %q", entry.Email)
+	}
+}
+
+// stubRotatingRefresh returns a refreshTokenFunc that swaps the input RT for
+// `newRT` on every call — used to exercise the rotation branch where AWS
+// hands back a different refreshToken than the one we sent.
+func stubRotatingRefresh(access, newRT string, expires int64) refreshTokenFunc {
+	return func(*config.Account) (string, string, int64, string, error) {
+		return access, newRT, expires, "", nil
+	}
+}
+
+// TestImportOneAccountRegistersBothOriginalAndRotatedToken pins the dedupe
+// invariant: when refresh rotates the RT, both the original (file-supplied)
+// and the rotated (server-issued) value must enter the in-batch index, so a
+// later row carrying either form is skipped.
+func TestImportOneAccountRegistersBothOriginalAndRotatedToken(t *testing.T) {
+	h := newImportTestHandler(t)
+	existing := map[string]string{}
+
+	entry := h.importOneAccount(
+		importCredential{RefreshToken: "rt-original"},
+		existing,
+		stubRotatingRefresh("access", "rt-rotated", 1_700_000_000),
+		stubUserInfo("u@example.com"),
+	)
+	if entry.Status != "imported" {
+		t.Fatalf("expected imported, got %q (%s)", entry.Status, entry.Reason)
+	}
+	if got := existing["rt-original"]; got != entry.AccountID {
+		t.Fatalf("original RT must be registered → %q, got %q", entry.AccountID, got)
+	}
+	if got := existing["rt-rotated"]; got != entry.AccountID {
+		t.Fatalf("rotated RT must be registered → %q, got %q", entry.AccountID, got)
+	}
+
+	// Persisted account must hold the rotated RT, not the file-supplied one.
+	saved := config.GetAccounts()
+	if len(saved) != 1 {
+		t.Fatalf("expected 1 saved account, got %d", len(saved))
+	}
+	if saved[0].RefreshToken != "rt-rotated" {
+		t.Fatalf("persisted RT must be the rotated value, got %q", saved[0].RefreshToken)
+	}
+}
+
+// TestImportOneAccountDedupesWithinBatch pins the other half of the invariant:
+// two rows in the same batch sharing a brand-new (not pre-seeded) refreshToken
+// must result in one import + one skip, never two imports.
+func TestImportOneAccountDedupesWithinBatch(t *testing.T) {
+	h := newImportTestHandler(t)
+	existing := map[string]string{}
+	refresh, _ := stubRefresh("access", 1_700_000_000, "")
+
+	first := h.importOneAccount(
+		importCredential{RefreshToken: "rt-shared"},
+		existing,
+		refresh,
+		stubUserInfo("a@example.com"),
+	)
+	if first.Status != "imported" {
+		t.Fatalf("first row: expected imported, got %q", first.Status)
+	}
+
+	second := h.importOneAccount(
+		importCredential{RefreshToken: "rt-shared"},
+		existing,
+		refresh,
+		stubUserInfo("b@example.com"),
+	)
+	if second.Status != "skipped" {
+		t.Fatalf("second row: expected skipped (dedupe within batch), got %q (%s)",
+			second.Status, second.Reason)
+	}
+	if second.AccountID != first.AccountID {
+		t.Fatalf("skip must surface the freshly-imported accountID, got %q vs %q",
+			second.AccountID, first.AccountID)
+	}
+	if got := config.GetAccounts(); len(got) != 1 {
+		t.Fatalf("must end with exactly one persisted account, got %d", len(got))
+	}
+}
+
+// TestImportOneAccountDedupesAgainstRotatedTokenInBatch covers the cross-row
+// case introduced by token rotation: row 1 refreshes from rt-A and is issued
+// rt-B by AWS. A later row carrying rt-B (e.g. someone exported the account
+// post-rotation) must be deduped, not double-imported.
+func TestImportOneAccountDedupesAgainstRotatedTokenInBatch(t *testing.T) {
+	h := newImportTestHandler(t)
+	existing := map[string]string{}
+
+	first := h.importOneAccount(
+		importCredential{RefreshToken: "rt-A"},
+		existing,
+		stubRotatingRefresh("access", "rt-B", 1_700_000_000),
+		stubUserInfo("a@example.com"),
+	)
+	if first.Status != "imported" {
+		t.Fatalf("first row: expected imported, got %q", first.Status)
+	}
+
+	// Row 2 carries the post-rotation token — must skip.
+	second := h.importOneAccount(
+		importCredential{RefreshToken: "rt-B"},
+		existing,
+		stubRotatingRefresh("access2", "rt-C", 1_700_000_000),
+		stubUserInfo("b@example.com"),
+	)
+	if second.Status != "skipped" {
+		t.Fatalf("second row: expected skipped against rotated token, got %q (%s)",
+			second.Status, second.Reason)
+	}
+	if got := config.GetAccounts(); len(got) != 1 {
+		t.Fatalf("must end with exactly one persisted account, got %d", len(got))
 	}
 }
 
@@ -282,7 +431,7 @@ func TestApiImportAccountsSkipDuplicatesAndReturnPerRowResults(t *testing.T) {
 
 	resp := importResponse{Results: make([]importResultEntry, 0, len(rows))}
 	for _, c := range rows {
-		entry, _ := h.importOneAccount(c, existing, failingRefresh, stubUserInfo(""))
+		entry := h.importOneAccount(c, existing, failingRefresh, stubUserInfo(""))
 		switch entry.Status {
 		case "imported":
 			resp.Imported++

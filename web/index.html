@@ -4211,11 +4211,11 @@
                 bg = '#f1f5f9';
                 disabled = 'disabled';
             } else if (r.status === 'failed') {
-                badge = '<span style="font-size:11px;color:#dc2626">' + t('import.failedRow', r.reason || '') + '</span>';
+                badge = '<span style="font-size:11px;color:#dc2626">' + t('import.failedRow', escapeHtml(r.reason || '')) + '</span>';
                 bg = '#fef2f2';
                 disabled = 'disabled';
             } else if (r.status === 'invalid') {
-                badge = '<span style="font-size:11px;color:#b45309">' + t('import.invalidRow', r.reason || '') + '</span>';
+                badge = '<span style="font-size:11px;color:#b45309">' + t('import.invalidRow', escapeHtml(r.reason || '')) + '</span>';
                 bg = '#fffbeb';
                 disabled = 'disabled';
             }
