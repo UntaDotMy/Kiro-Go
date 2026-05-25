@@ -32,6 +32,19 @@ func TestIsQuotaExhausted(t *testing.T) {
 		{"trial only — no paid limit", Account{TrialUsageCurrent: 50, TrialUsageLimit: 50, UsageLimit: 0}, true},
 		{"paid healthy, trial full", Account{UsageCurrent: 1, UsageLimit: 1000, TrialUsageCurrent: 50, TrialUsageLimit: 50}, true},
 		{"limit zero with usage", Account{UsageCurrent: 100, UsageLimit: 0}, false},
+
+		// Sanity-check that the predicate has no hardcoded threshold — the
+		// upstream Kiro API reports any limit per account (Free 50, Pro 1000,
+		// Pro+ 2000+, custom enterprise tiers, fractional credit limits, …).
+		// All of these must trigger purely off `UsageCurrent >= UsageLimit`,
+		// never off a magic constant.
+		{"tiny limit at full", Account{Enabled: true, UsageCurrent: 5, UsageLimit: 5}, true},
+		{"500 at full", Account{Enabled: true, UsageCurrent: 500, UsageLimit: 500}, true},
+		{"2000 at full", Account{Enabled: true, UsageCurrent: 2000, UsageLimit: 2000}, true},
+		{"5000 at full", Account{Enabled: true, UsageCurrent: 5000, UsageLimit: 5000}, true},
+		{"large limit at full", Account{Enabled: true, UsageCurrent: 100000, UsageLimit: 100000}, true},
+		{"fractional limit at full", Account{Enabled: true, UsageCurrent: 12.5, UsageLimit: 12.5}, true},
+		{"large limit one credit short", Account{UsageCurrent: 1999, UsageLimit: 2000}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
