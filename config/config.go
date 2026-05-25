@@ -539,24 +539,42 @@ func IsQuotaExhausted(a Account) bool {
 	return false
 }
 
-// applyAutoDisableTransition encodes the four-state machine for the
-// auto-disable feature. Mutates `a` in place. Returns true when the call
-// flipped Enabled — callers use that to know they need to Reload the pool.
+// applyAutoDisableTransition encodes the state machine for the auto-disable
+// feature. Mutates `a` in place. Returns true when the call flipped Enabled —
+// callers use that to know they need to Reload the pool.
 //
-// State table (E = Enabled, F = AutoDisabledAtFull, Q = quota exhausted):
+// `globalOverage` is the value of cfg.AllowOverUsage at the call site. We
+// receive it as an arg rather than reading it ourselves because every
+// production caller already holds cfgLock for write, and GetAllowOverUsage
+// would deadlock on the RLock from inside that critical section.
 //
-//	(E=t, F=*, Q=t)  →  (E=f, F=t)   auto-disable
-//	(E=f, F=t, Q=f)  →  (E=t, F=f)   auto-recover
-//	(E=f, F=f, Q=*)  →  unchanged    operator manually disabled — respect it
-//	any other         →  unchanged
-func applyAutoDisableTransition(a *Account) bool {
+// Auto-disable is suppressed when overage is allowed for the account (either
+// per-account `AllowOverage` or the global `AllowOverUsage` flag). Without
+// this guard the auto-disable would defeat AllowOverage: the account would
+// disappear from the pool entirely instead of staying in rotation at its
+// reduced overage weight (1..10), as the operator intended.
+//
+// State table (E = Enabled, F = AutoDisabledAtFull, Q = quota exhausted,
+// O = overage allowed for this account):
+//
+//	(E=t, Q=t, O=f)         →  (E=f, F=t)   auto-disable
+//	(E=t, Q=t, O=t)         →  unchanged    overage takes over (pool weight 1..10)
+//	(E=f, F=t, Q=f)         →  (E=t, F=f)   auto-recover (quota dropped)
+//	(E=f, F=t, O=t)         →  (E=t, F=f)   auto-recover (overage now allowed)
+//	(E=f, F=f, *)           →  unchanged    operator manually disabled — respect it
+//	any other               →  unchanged
+func applyAutoDisableTransition(a *Account, globalOverage bool) bool {
 	full := IsQuotaExhausted(*a)
-	if a.Enabled && full {
+	overageAllowed := a.AllowOverage || globalOverage
+
+	if a.Enabled && full && !overageAllowed {
 		a.Enabled = false
 		a.AutoDisabledAtFull = true
 		return true
 	}
-	if !a.Enabled && a.AutoDisabledAtFull && !full {
+	// Recovery: an account we previously auto-disabled becomes routable again
+	// when EITHER quota dropped below the limit OR overage was turned on.
+	if !a.Enabled && a.AutoDisabledAtFull && (!full || overageAllowed) {
 		a.Enabled = true
 		a.AutoDisabledAtFull = false
 		return true
@@ -593,7 +611,7 @@ func UpdateAccountInfo(id string, info AccountInfo) (bool, error) {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			flipped := applyAutoDisableTransition(&cfg.Accounts[i])
+			flipped := applyAutoDisableTransition(&cfg.Accounts[i], cfg.AllowOverUsage)
 			return flipped, Save()
 		}
 	}
