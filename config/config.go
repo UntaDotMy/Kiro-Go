@@ -70,6 +70,13 @@ type Account struct {
 	BanReason string `json:"banReason,omitempty"` // Reason for ban/suspension
 	BanTime   int64  `json:"banTime,omitempty"`   // Timestamp when ban was detected
 
+	// AutoDisabledAtFull marks an account that was disabled by the auto-disable
+	// path (UsageCurrent ≥ UsageLimit on paid OR trial). Used to distinguish
+	// "system disabled because quota was exhausted" from "operator manually
+	// disabled this" so the next refresh can auto-re-enable the former without
+	// trampling the latter. Cleared when the operator manually toggles Enabled.
+	AutoDisabledAtFull bool `json:"autoDisabledAtFull,omitempty"`
+
 	// Subscription information
 	SubscriptionType  string `json:"subscriptionType,omitempty"`  // Tier: FREE, PRO, PRO_PLUS, or POWER
 	SubscriptionTitle string `json:"subscriptionTitle,omitempty"` // Human-readable subscription name
@@ -198,7 +205,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.9-A1"
+const Version = "1.0.9-A2"
 
 var (
 	cfg     *Config
@@ -518,9 +525,69 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 	return nil
 }
 
+// IsQuotaExhausted reports whether either the paid or the trial quota has
+// been fully consumed. A zero limit means "no limit declared by upstream"
+// and is treated as not-exhausted (we never auto-disable accounts whose
+// limit we can't see).
+func IsQuotaExhausted(a Account) bool {
+	if a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit {
+		return true
+	}
+	if a.TrialUsageLimit > 0 && a.TrialUsageCurrent >= a.TrialUsageLimit {
+		return true
+	}
+	return false
+}
+
+// applyAutoDisableTransition encodes the state machine for the auto-disable
+// feature. Mutates `a` in place. Returns true when the call flipped Enabled —
+// callers use that to know they need to Reload the pool.
+//
+// `globalOverage` is the value of cfg.AllowOverUsage at the call site. We
+// receive it as an arg rather than reading it ourselves because every
+// production caller already holds cfgLock for write, and GetAllowOverUsage
+// would deadlock on the RLock from inside that critical section.
+//
+// Auto-disable is suppressed when overage is allowed for the account (either
+// per-account `AllowOverage` or the global `AllowOverUsage` flag). Without
+// this guard the auto-disable would defeat AllowOverage: the account would
+// disappear from the pool entirely instead of staying in rotation at its
+// reduced overage weight (1..10), as the operator intended.
+//
+// State table (E = Enabled, F = AutoDisabledAtFull, Q = quota exhausted,
+// O = overage allowed for this account):
+//
+//	(E=t, Q=t, O=f)         →  (E=f, F=t)   auto-disable
+//	(E=t, Q=t, O=t)         →  unchanged    overage takes over (pool weight 1..10)
+//	(E=f, F=t, Q=f)         →  (E=t, F=f)   auto-recover (quota dropped)
+//	(E=f, F=t, O=t)         →  (E=t, F=f)   auto-recover (overage now allowed)
+//	(E=f, F=f, *)           →  unchanged    operator manually disabled — respect it
+//	any other               →  unchanged
+func applyAutoDisableTransition(a *Account, globalOverage bool) bool {
+	full := IsQuotaExhausted(*a)
+	overageAllowed := a.AllowOverage || globalOverage
+
+	if a.Enabled && full && !overageAllowed {
+		a.Enabled = false
+		a.AutoDisabledAtFull = true
+		return true
+	}
+	// Recovery: an account we previously auto-disabled becomes routable again
+	// when EITHER quota dropped below the limit OR overage was turned on.
+	if !a.Enabled && a.AutoDisabledAtFull && (!full || overageAllowed) {
+		a.Enabled = true
+		a.AutoDisabledAtFull = false
+		return true
+	}
+	return false
+}
+
 // UpdateAccountInfo updates an account's subscription and usage information.
 // Called after refreshing account data from Kiro API.
-func UpdateAccountInfo(id string, info AccountInfo) error {
+//
+// Returns true when the call flipped Enabled (auto-disable or auto-recover);
+// callers use that to decide whether to Reload the pool.
+func UpdateAccountInfo(id string, info AccountInfo) (bool, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
@@ -544,10 +611,11 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			return Save()
+			flipped := applyAutoDisableTransition(&cfg.Accounts[i], cfg.AllowOverUsage)
+			return flipped, Save()
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.

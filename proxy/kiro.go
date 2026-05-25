@@ -766,6 +766,14 @@ func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
 	}
 }
 
+// normalizeChunk reconciles a freshly received upstream text chunk with the
+// snapshot of what we have already emitted. Kiro's event stream sometimes
+// replays cumulative content (e.g. successive chunks "abc" then "abcde"), and
+// older snapshots can arrive out of order on retries. We strip those exact
+// overlaps but never guess at partial-suffix duplication: a coincidental match
+// between prev's tail and chunk's head can just as easily be legitimate text
+// across a chunk boundary, and dropping it produced visible truncations like
+// "sleep" -> "slep" or "lets begin" -> "letsbegin".
 func normalizeChunk(chunk string, previous *string) string {
 	if chunk == "" {
 		return ""
@@ -777,37 +785,29 @@ func normalizeChunk(chunk string, previous *string) string {
 		return chunk
 	}
 
+	// Exact replay of the most recent snapshot — drop.
 	if chunk == prev {
 		return ""
 	}
 
+	// Cumulative replay: the new chunk extends prev. Emit only the new tail.
 	if strings.HasPrefix(chunk, prev) {
 		delta := chunk[len(prev):]
 		*previous = chunk
 		return delta
 	}
 
+	// Rewind: an older, shorter snapshot arrived after a longer one. Ignore it
+	// and keep the longer snapshot so future cumulative comparisons stay sound.
 	if strings.HasPrefix(prev, chunk) {
 		return ""
 	}
 
-	maxOverlap := 0
-	maxLen := len(prev)
-	if len(chunk) < maxLen {
-		maxLen = len(chunk)
-	}
-	for i := maxLen; i > 0; i-- {
-		if strings.HasSuffix(prev, chunk[:i]) {
-			maxOverlap = i
-			break
-		}
-	}
-
+	// Otherwise treat the chunk as a pure delta. Earlier revisions tried to
+	// detect partial overlaps via HasSuffix(prev, chunk[:i]) and trim them,
+	// but that heuristic mis-deletes legitimate characters whenever prev's
+	// trailing rune happens to match chunk's leading rune.
 	*previous = chunk
-	if maxOverlap > 0 {
-		return chunk[maxOverlap:]
-	}
-
 	return chunk
 }
 
