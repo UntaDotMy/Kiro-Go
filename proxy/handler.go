@@ -682,12 +682,23 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = fallbackAnthropicModels(thinkingSuffix)
 	}
 
-	// 添加别名模型
-	models = append(models,
-		buildModelInfo("auto", "kiro-proxy", true),
-		buildModelInfo("gpt-4o", "kiro-proxy", true),
-		buildModelInfo("gpt-4", "kiro-proxy", true),
-	)
+	// Append client aliases (auto / gpt-*) so SDKs that pin to those names
+	// still resolve a model. Skip ids that the cached list already produced
+	// (Kiro returns "auto" as a real model — re-appending it duplicated the
+	// picker entry).
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			seen[id] = true
+		}
+	}
+	for _, alias := range []string{"auto", "gpt-4o", "gpt-4"} {
+		if seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -702,49 +713,78 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		return nil
 	}
 
+	// We intentionally do NOT emit "<id>-thinking" variants here. The thinking
+	// suffix is a response-side parsing flag only — the outbound Kiro payload
+	// is unchanged whether the suffix is present or not (Kiro upstream rejects
+	// reasoning_effort / budget_tokens; see kirodotdev/Kiro #8576, #8577 and
+	// the `_ = thinking` no-ops in translator.go). Listing the suffixed
+	// variants in /v1/models doubled the picker entries for every model
+	// without changing behavior, so they're dropped.
+	//
+	// Per Kiro model we emit two ids:
+	//   1. the canonical dashed Anthropic form (e.g. "claude-opus-4-7") — what
+	//      Claude Code's picker recognizes;
+	//   2. the raw dotted Kiro id (e.g. "claude-opus-4.7") — alias for clients
+	//      that ask by the upstream id.
+	// Duplicates (same id) collapse, so a Kiro id that's already in dashed
+	// form yields a single entry.
 	models := make([]map[string]interface{}, 0, len(cached)*2)
+	seen := make(map[string]bool, len(cached)*2)
+	emit := func(id string, supportsImage bool) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		models = append(models, buildModelInfo(id, "anthropic", supportsImage))
+	}
 	for _, m := range cached {
 		supportsImage := modelSupportsImage(m.InputTypes)
-		// Emit the canonical Anthropic dashed / dated id (e.g. claude-opus-4-7-20251101)
-		// so Claude Code recognizes the model in its picker. Also include the raw
-		// Kiro id as an alias for clients that ask by the upstream id.
-		anthropicID := kiroModelToAnthropicID(m.ModelId)
-		models = append(models, buildModelInfo(anthropicID, "anthropic", supportsImage))
-		models = append(models, buildModelInfo(anthropicID+thinkingSuffix, "anthropic", supportsImage))
-		if anthropicID != m.ModelId {
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
+		emit(kiroModelToAnthropicID(m.ModelId), supportsImage)
+		emit(m.ModelId, supportsImage)
 	}
+	_ = thinkingSuffix // signature retained for callers; suffix variants are no longer emitted
 	return models
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	// Canonical Anthropic dashed / dated ids — what Claude Code 2.x expects.
-	ids := []string{
-		"claude-opus-4-7-20251101",
-		"claude-opus-4-7",
-		"claude-sonnet-4-6-20251101",
-		"claude-sonnet-4-6",
-		"claude-haiku-4-5-20251001",
-		"claude-haiku-4-5",
-		"claude-sonnet-4-5-20251101",
-		"claude-sonnet-4-5",
-		"claude-opus-4-5-20251101",
-		"claude-opus-4-5",
-		"claude-sonnet-4-20250514",
+	// Used only when the per-account model cache is empty (initial boot,
+	// before any account fetches its model list). Mirror the dedup rules
+	// applied to the live path: dashed Anthropic id + dotted Kiro id, no
+	// dated suffix, no -thinking variant.
+	pairs := []struct {
+		dashed string
+		dotted string
+	}{
+		{"claude-opus-4-7", "claude-opus-4.7"},
+		{"claude-sonnet-4-6", "claude-sonnet-4.6"},
+		{"claude-haiku-4-5", "claude-haiku-4.5"},
+		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+		{"claude-opus-4-5", "claude-opus-4.5"},
+		{"claude-sonnet-4", ""},
 	}
-	out := make([]map[string]interface{}, 0, len(ids)*2)
-	for _, id := range ids {
+	out := make([]map[string]interface{}, 0, len(pairs)*2)
+	seen := make(map[string]bool, len(pairs)*2)
+	emit := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
 		out = append(out, buildModelInfo(id, "anthropic", true))
-		out = append(out, buildModelInfo(id+thinkingSuffix, "anthropic", true))
 	}
+	for _, p := range pairs {
+		emit(p.dashed)
+		emit(p.dotted)
+	}
+	_ = thinkingSuffix // signature retained; suffix variants are no longer emitted
 	return out
 }
 
 // kiroModelToAnthropicID converts Kiro's internal dotted model id (e.g.
-// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed /
-// dated form Claude Code recognizes in its model picker.
+// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed
+// form Claude Code recognizes in its model picker. Dated suffixes (e.g.
+// "-20251101") are intentionally omitted: Claude Code resolves the family
+// from the dashed form alone, and emitting both creates duplicate picker
+// entries that map to the same upstream model.
 func kiroModelToAnthropicID(kiroID string) string {
 	switch strings.ToLower(strings.TrimSpace(kiroID)) {
 	case "claude-opus-4.7":
@@ -752,15 +792,15 @@ func kiroModelToAnthropicID(kiroID string) string {
 	case "claude-opus-4.6":
 		return "claude-opus-4-6"
 	case "claude-opus-4.5":
-		return "claude-opus-4-5-20251101"
+		return "claude-opus-4-5"
 	case "claude-sonnet-4.6":
 		return "claude-sonnet-4-6"
 	case "claude-sonnet-4.5":
-		return "claude-sonnet-4-5-20251101"
+		return "claude-sonnet-4-5"
 	case "claude-sonnet-4":
-		return "claude-sonnet-4-20250514"
+		return "claude-sonnet-4"
 	case "claude-haiku-4.5":
-		return "claude-haiku-4-5-20251001"
+		return "claude-haiku-4-5"
 	}
 	// Already in dashed form, or unknown — return as-is.
 	return kiroID
@@ -858,8 +898,9 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 }
 
 // modelDisplayName builds a human-friendly label from the canonical id so
-// Claude Code's picker shows e.g. "Claude Opus 4.7 (Thinking)" instead of
-// the raw "claude-opus-4-7-20251101-thinking".
+// Claude Code's picker shows e.g. "Claude Opus 4.7" instead of the raw
+// "claude-opus-4-7". Date stamps are stripped for legacy clients still
+// asking with the dated form.
 func modelDisplayName(id string, withThinking bool) string {
 	base := id
 	suffix := ""
@@ -1236,8 +1277,8 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	_ = actualModel // mapping happens inside ClaudeToKiro; keep req.Model as the
-	// original id (e.g. "claude-opus-4-7-20251101") so the response echoes the
-	// exact id the client (e.g. Claude Code) sent.
+	// original id (e.g. "claude-opus-4-7" or a dated alias the client still
+	// has cached) so the response echoes the exact id the client sent.
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)

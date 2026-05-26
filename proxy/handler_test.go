@@ -355,30 +355,71 @@ func TestMergeUniqueModelsPreservesUnionAcrossAccounts(t *testing.T) {
 	}
 }
 
-func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
+func TestBuildAnthropicModelsResponseDedupedNoThinkingVariants(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
 		InputTypes: []string{"text", "image"},
 	}}, "-thinking")
 
-	// Expect: Anthropic dashed/dated id + thinking variant + Kiro dotted alias + thinking variant.
-	if len(models) != 4 {
-		t.Fatalf("expected anthropic primary + alias (and thinking variants for each), got %d", len(models))
+	// We emit only the dashed Anthropic id and the dotted Kiro alias. No
+	// dated suffix, no -thinking variant — the suffix is response-side only,
+	// and Kiro upstream rejects reasoning_effort / budget_tokens, so listing
+	// the suffixed forms doubled the picker entries without changing
+	// behavior. See buildAnthropicModelsResponse for the full rationale.
+	if len(models) != 2 {
+		t.Fatalf("expected dashed + dotted alias only, got %d", len(models))
 	}
-	if models[0]["id"] != "claude-sonnet-4-5-20251101" {
-		t.Fatalf("expected primary id to be canonical Anthropic dashed/dated form, got %#v", models[0]["id"])
+	if models[0]["id"] != "claude-sonnet-4-5" {
+		t.Fatalf("expected primary id to be dashed (no date), got %#v", models[0]["id"])
 	}
-	if models[1]["id"] != "claude-sonnet-4-5-20251101-thinking" {
-		t.Fatalf("unexpected primary thinking id: %#v", models[1]["id"])
-	}
-	if models[2]["id"] != "claude-sonnet-4.5" {
-		t.Fatalf("expected dotted Kiro id alias, got %#v", models[2]["id"])
-	}
-	if models[3]["id"] != "claude-sonnet-4.5-thinking" {
-		t.Fatalf("unexpected dotted thinking id: %#v", models[3]["id"])
+	if models[1]["id"] != "claude-sonnet-4.5" {
+		t.Fatalf("expected dotted Kiro id alias, got %#v", models[1]["id"])
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+// TestBuildAnthropicModelsResponseCollapsesAlreadyDashedID confirms that a
+// Kiro id already in dashed form ("claude-opus-4-7") yields a single entry
+// rather than duplicating itself as both canonical and alias.
+func TestBuildAnthropicModelsResponseCollapsesAlreadyDashedID(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{{
+		ModelId:    "claude-opus-4-7",
+		InputTypes: []string{"text"},
+	}}, "-thinking")
+	if len(models) != 1 {
+		t.Fatalf("expected single entry for already-dashed id, got %d", len(models))
+	}
+	if models[0]["id"] != "claude-opus-4-7" {
+		t.Fatalf("expected claude-opus-4-7, got %#v", models[0]["id"])
+	}
+}
+
+// TestBuildAnthropicModelsResponseHandlesAutoAndKnownAliases confirms that
+// when Kiro itself returns one of the alias names (e.g. "auto") in its
+// model list, buildAnthropicModelsResponse passes it through as a single
+// entry. The alias-dedup pass in handleListModels then sees it in the
+// `seen` set and skips re-appending — preventing the double "auto" entry
+// the user reported.
+func TestBuildAnthropicModelsResponseHandlesAutoAndKnownAliases(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{
+		{ModelId: "auto", InputTypes: []string{"text", "image"}},
+		{ModelId: "claude-opus-4.7", InputTypes: []string{"text", "image"}},
+	}, "-thinking")
+
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		ids = append(ids, m["id"].(string))
+	}
+	want := []string{"auto", "claude-opus-4-7", "claude-opus-4.7"}
+	if len(ids) != len(want) {
+		t.Fatalf("expected %d entries, got %d (%v)", len(want), len(ids), ids)
+	}
+	for i, w := range want {
+		if ids[i] != w {
+			t.Fatalf("entry %d: want %q, got %q (full: %v)", i, w, ids[i], ids)
+		}
 	}
 }
 
