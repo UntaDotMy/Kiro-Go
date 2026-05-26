@@ -7,6 +7,7 @@ import (
 	"kiro-go/logger"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -394,12 +395,14 @@ func applySystemPromptFilters(prompt string) string {
 		return ""
 	}
 
+	cfg := config.GetPromptFilterConfig()
+
 	// 1. Detect Claude Code CLI system prompt → drop entirely.
-	if config.GetFilterClaudeCode() && isClaudeCodeSystemPrompt(prompt) {
+	if cfg.FilterClaudeCode && isClaudeCodeSystemPrompt(prompt) {
 		return ""
 	}
 
-	return applySharedFilters(prompt)
+	return applySharedFiltersWithConfig(prompt, cfg)
 }
 
 // applyUserMessageFilters runs only the noise-stripping subset of the filter
@@ -419,20 +422,30 @@ func applyUserMessageFilters(prompt string) string {
 	if prompt == "" {
 		return ""
 	}
-	return applySharedFilters(prompt)
+	return applySharedFiltersWithConfig(prompt, config.GetPromptFilterConfig())
 }
 
 // applySharedFilters runs the noise-strip and user-rule steps shared between
-// system-prompt and user-message filtering.
+// system-prompt and user-message filtering. Kept for callers that don't have a
+// preloaded snapshot; new code should pass the snapshot down via
+// applySharedFiltersWithConfig to avoid the per-call config RLock.
 func applySharedFilters(prompt string) string {
-	if config.GetFilterStripBoundaries() {
+	return applySharedFiltersWithConfig(prompt, config.GetPromptFilterConfig())
+}
+
+// applySharedFiltersWithConfig is the underlying implementation. It runs
+// against a caller-supplied PromptFilterConfig snapshot so a single inbound
+// request takes one cfgLock.RLock instead of one per filter step per
+// message block (the request hot path filters one system prompt + N user
+// messages, so the savings scale with conversation length).
+func applySharedFiltersWithConfig(prompt string, cfg config.PromptFilterConfig) string {
+	if cfg.FilterStripBoundaries {
 		prompt = stripBoundaryMarkers(prompt)
 	}
-	if config.GetFilterEnvNoise() {
+	if cfg.FilterEnvNoise {
 		prompt = stripEnvNoiseLines(prompt)
 	}
-	rules := config.GetPromptFilterRules()
-	for _, rule := range rules {
+	for _, rule := range cfg.Rules {
 		if !rule.Enabled || prompt == "" {
 			continue
 		}
@@ -448,12 +461,43 @@ func applyPromptFilters(prompt string) string {
 	return applySystemPromptFilters(prompt)
 }
 
+// filterRuleRegexCache memoizes compiled regular expressions used by user-
+// defined prompt filter rules. Filter rules are typically a small static set
+// (a handful of patterns the operator pinned in the admin UI), but
+// applyFilterRule is called once per message per request — without caching
+// each rule recompiled its pattern on every hot-path invocation. Keyed by
+// the raw pattern string so two rules sharing a pattern share one Regexp.
+//
+// The map only grows; entries are never evicted because the key space is
+// bounded by the operator's rule count, which is read from config and
+// orders of magnitude smaller than the request rate. A bad pattern is
+// memoized as a nil sentinel so we don't repeatedly attempt to compile it.
+var filterRuleRegexCache sync.Map // map[string]*regexp.Regexp; nil value = compile failed
+
+func compiledFilterRegex(pattern string) *regexp.Regexp {
+	if v, ok := filterRuleRegexCache.Load(pattern); ok {
+		// Stored values are always *regexp.Regexp — including the typed-nil
+		// sentinel that means "this pattern previously failed to compile".
+		// The type assertion below returns that nil pointer cleanly; callers
+		// already null-check the returned *Regexp.
+		return v.(*regexp.Regexp)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		filterRuleRegexCache.Store(pattern, (*regexp.Regexp)(nil))
+		return nil
+	}
+	// LoadOrStore so concurrent first-compiles converge on a single instance.
+	actual, _ := filterRuleRegexCache.LoadOrStore(pattern, re)
+	return actual.(*regexp.Regexp)
+}
+
 // applyFilterRule applies a single user-defined filter rule.
 func applyFilterRule(prompt string, rule config.PromptFilterRule) string {
 	switch rule.Type {
 	case "regex":
-		re, err := regexp.Compile(rule.Match)
-		if err != nil {
+		re := compiledFilterRegex(rule.Match)
+		if re == nil {
 			return prompt // invalid regex: skip silently
 		}
 		return re.ReplaceAllString(prompt, rule.Replace)
@@ -1911,9 +1955,18 @@ func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
 	return nil
 }
 
+// imagePlaceholderRe matches "[Image 1]" / "[Image 23]" placeholders that
+// upstream clients sometimes leave in user text after stripping a real image
+// payload. Compiled once at package load.
+var imagePlaceholderRe = regexp.MustCompile(`\[Image\s+\d+\]`)
+
+// dataURLImageRe matches RFC 2397 data URLs carrying image content. Compiled
+// once at package load (was being recompiled inside parseDataURL on every
+// image block, which dominated the request hot path for vision requests).
+var dataURLImageRe = regexp.MustCompile(`^data:image/([a-zA-Z0-9+.-]+)(;[a-zA-Z0-9=._:+-]+)*;base64,(.+)$`)
+
 func sanitizeImagePlaceholders(text string) string {
-	re := regexp.MustCompile(`\[Image\s+\d+\]`)
-	cleaned := re.ReplaceAllString(text, "")
+	cleaned := imagePlaceholderRe.ReplaceAllString(text, "")
 	cleaned = strings.Join(strings.Fields(cleaned), " ")
 	return strings.TrimSpace(cleaned)
 }
@@ -1931,8 +1984,7 @@ func parseDataURL(url string) *KiroImage {
 	if strings.Contains(cleaned, "[Image") {
 		return nil
 	}
-	re := regexp.MustCompile(`^data:image/([a-zA-Z0-9+.-]+)(;[a-zA-Z0-9=._:+-]+)*;base64,(.+)$`)
-	matches := re.FindStringSubmatch(cleaned)
+	matches := dataURLImageRe.FindStringSubmatch(cleaned)
 	if len(matches) == 4 {
 		return parseBase64Image(matches[3], matches[1])
 	}

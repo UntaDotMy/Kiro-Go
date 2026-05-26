@@ -71,7 +71,14 @@ type cooldownEntry struct {
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu         sync.Mutex
+	// mu protects accounts, slots, cooldowns, modelLists. Read-only methods
+	// (Count, AvailableCount, GetByID, GetAllAccounts, CooldownRemaining,
+	// GetModelList) take RLock so admin/UI polling and per-request lookups
+	// can fan in without serializing against each other. Methods that mutate
+	// counters or SWRR state (GetNextForModel, RecordError/Success,
+	// UpdateStats, UpdateToken, ClearSoftCooldownIfHealthy, SetModelList,
+	// Reload) take the exclusive Lock.
+	mu         sync.RWMutex
 	accounts   []config.Account           // deduplicated, one entry per real account
 	slots      []*accountSlot             // SWRR scheduler slots, parallel to accounts
 	cooldowns  map[string]*cooldownEntry  // accountID → cooldown state
@@ -195,8 +202,8 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 
 // GetModelList 返回该账号缓存的模型 ID 列表（供 admin API 使用）。
 func (p *AccountPool) GetModelList(accountID string) []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	set, ok := p.modelLists[accountID]
 	if !ok || len(set) == 0 {
 		return []string{}
@@ -325,8 +332,8 @@ func (p *AccountPool) decayCountersLocked(now time.Time) {
 
 // GetByID 根据 ID 获取账号
 func (p *AccountPool) GetByID(id string) *config.Account {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
 			acc := p.accounts[i]
@@ -452,15 +459,15 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 
 // Count 返回账号总数
 func (p *AccountPool) Count() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return len(p.accounts)
 }
 
 // AvailableCount 返回当前可用（未冷却且 token 未过期）的账号数
 func (p *AccountPool) AvailableCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	now := time.Now()
 	count := 0
 	for i := range p.accounts {
@@ -500,8 +507,8 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 
 // GetAllAccounts returns a deduplicated copy of every account in the pool.
 func (p *AccountPool) GetAllAccounts() []config.Account {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	result := make([]config.Account, len(p.accounts))
 	copy(result, p.accounts)
 	return result
@@ -510,8 +517,8 @@ func (p *AccountPool) GetAllAccounts() []config.Account {
 // CooldownRemaining reports the time remaining on the soft cooldown for the
 // given account, or 0 if not cooling. Useful for tests and admin diagnostics.
 func (p *AccountPool) CooldownRemaining(id string) time.Duration {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if cd, ok := p.cooldowns[id]; ok {
 		if d := time.Until(cd.until); d > 0 {
 			return d

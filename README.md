@@ -64,7 +64,7 @@ Open `http://localhost:8989/admin` (or whichever host port you mapped), log in, 
 curl http://localhost:8989/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-sonnet-4-5-20251101","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"claude-sonnet-4-5","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
 
 # OpenAI Chat Completions
 curl http://localhost:8989/v1/chat/completions \

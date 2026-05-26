@@ -23,6 +23,17 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// refreshFanoutConcurrency caps the number of in-flight upstream calls when
+// fan-outing background refreshes (token + RefreshAccountInfo, model list)
+// across accounts. Sequential refresh extended the stale-token window to
+// O(N * upstreamLatency); fully unbounded fan-out would burst N parallel
+// auth/usage calls at boot. 8 in-flight is a comfortable middle ground:
+// for typical pools (10–30 accounts) it cuts wall time to <= ~ceil(N/8) *
+// per-call latency, while staying well below any reasonable upstream rate
+// limit on the auth and usage endpoints (those are per-account, not per-
+// proxy, so concurrency between accounts doesn't compound).
+const refreshFanoutConcurrency = 8
+
 // maxRequestBodyBytes caps every JSON request body the proxy will read into
 // memory. 32 MiB is more than any reasonable Claude / OpenAI / Responses
 // payload (largest practical conversations top out around 5–10 MiB even with
@@ -48,6 +59,12 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	// modelsRefreshing collapses concurrent refreshModelsCache fan-outs into
+	// a single in-flight call. Set with atomic CAS at the entry point and
+	// cleared in defer so a panic/error path doesn't strand the gate. Without
+	// this gate, a burst of /v1/models requests during cold start each kicked
+	// off their own N-account fan-out.
+	modelsRefreshing atomic.Bool
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
 	// Per-account debounce for lazy quota refresh after a request completes.
@@ -393,44 +410,69 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 }
 
 // refreshAllAccounts 刷新所有账户信息
+//
+// Per-account work (token refresh + RefreshAccountInfo) is independent, so
+// we fan out across accounts with a bounded worker pool. Sequential refresh
+// took O(N * upstreamLatency) wall time which extended the
+// stale-quota / stale-token window for the whole pool. Concurrency is
+// capped at refreshFanoutConcurrency to avoid hammering the upstream auth /
+// usage endpoints during boot or on the periodic background tick.
 func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
+	if len(accounts) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, refreshFanoutConcurrency)
+	var wg sync.WaitGroup
 	for i := range accounts {
 		account := &accounts[i]
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(account *config.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("[BackgroundRefresh] worker panic for %s: %v", account.Email, r)
+				}
+			}()
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+			// 检查 token 是否需要刷新
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+				if err != nil {
+					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+					return
+				}
+				account.AccessToken = newAccessToken
+				if newRefreshToken != "" {
+					account.RefreshToken = newRefreshToken
+				}
+				account.ExpiresAt = newExpiresAt
+				config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+				h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+				if profileArn != "" {
+					account.ProfileArn = profileArn
+					config.UpdateAccountProfileArn(account.ID, profileArn)
+				}
+			}
+
+			// 刷新账户信息
+			info, err := RefreshAccountInfo(account)
 			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				continue
+				logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
+				return
 			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
-			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
-			}
-		}
 
-		// 刷新账户信息
-		info, err := RefreshAccountInfo(account)
-		if err != nil {
-			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
-			continue
-		}
-
-		config.UpdateAccountInfo(account.ID, *info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+			config.UpdateAccountInfo(account.ID, *info)
+			logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		}(account)
 	}
+	wg.Wait()
 	h.pool.Reload()
 }
 
@@ -664,30 +706,45 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	thinkingSuffix := config.GetThinkingConfig().Suffix
+
 	// 尝试用缓存的真实模型列表
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
-	if len(cached) == 0 {
-		h.refreshModelsCache()
-		h.modelsCacheMu.RLock()
-		cached = h.cachedModels
-		h.modelsCacheMu.RUnlock()
-	}
 
-	thinkingSuffix := config.GetThinkingConfig().Suffix
+	// On cold start (cache empty) we used to block this request on the full
+	// per-account fan-out, which made the first /v1/models call take seconds.
+	// Now we kick off the refresh in the background (collapsed via the
+	// modelsRefreshing gate so concurrent first-hits share one fan-out) and
+	// serve fallbackAnthropicModels immediately. Subsequent requests will
+	// see the populated cache once the refresh completes.
+	if len(cached) == 0 {
+		h.triggerModelsRefreshAsync()
+	}
 
 	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
 	if len(models) == 0 {
 		models = fallbackAnthropicModels(thinkingSuffix)
 	}
 
-	// 添加别名模型
-	models = append(models,
-		buildModelInfo("auto", "kiro-proxy", true),
-		buildModelInfo("gpt-4o", "kiro-proxy", true),
-		buildModelInfo("gpt-4", "kiro-proxy", true),
-	)
+	// Append client aliases (auto / gpt-*) so SDKs that pin to those names
+	// still resolve a model. Skip ids that the cached list already produced
+	// (Kiro returns "auto" as a real model — re-appending it duplicated the
+	// picker entry).
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			seen[id] = true
+		}
+	}
+	for _, alias := range []string{"auto", "gpt-4o", "gpt-4"} {
+		if seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -702,49 +759,78 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		return nil
 	}
 
+	// We intentionally do NOT emit "<id>-thinking" variants here. The thinking
+	// suffix is a response-side parsing flag only — the outbound Kiro payload
+	// is unchanged whether the suffix is present or not (Kiro upstream rejects
+	// reasoning_effort / budget_tokens; see kirodotdev/Kiro #8576, #8577 and
+	// the `_ = thinking` no-ops in translator.go). Listing the suffixed
+	// variants in /v1/models doubled the picker entries for every model
+	// without changing behavior, so they're dropped.
+	//
+	// Per Kiro model we emit two ids:
+	//   1. the canonical dashed Anthropic form (e.g. "claude-opus-4-7") — what
+	//      Claude Code's picker recognizes;
+	//   2. the raw dotted Kiro id (e.g. "claude-opus-4.7") — alias for clients
+	//      that ask by the upstream id.
+	// Duplicates (same id) collapse, so a Kiro id that's already in dashed
+	// form yields a single entry.
 	models := make([]map[string]interface{}, 0, len(cached)*2)
+	seen := make(map[string]bool, len(cached)*2)
+	emit := func(id string, supportsImage bool) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		models = append(models, buildModelInfo(id, "anthropic", supportsImage))
+	}
 	for _, m := range cached {
 		supportsImage := modelSupportsImage(m.InputTypes)
-		// Emit the canonical Anthropic dashed / dated id (e.g. claude-opus-4-7-20251101)
-		// so Claude Code recognizes the model in its picker. Also include the raw
-		// Kiro id as an alias for clients that ask by the upstream id.
-		anthropicID := kiroModelToAnthropicID(m.ModelId)
-		models = append(models, buildModelInfo(anthropicID, "anthropic", supportsImage))
-		models = append(models, buildModelInfo(anthropicID+thinkingSuffix, "anthropic", supportsImage))
-		if anthropicID != m.ModelId {
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
+		emit(kiroModelToAnthropicID(m.ModelId), supportsImage)
+		emit(m.ModelId, supportsImage)
 	}
+	_ = thinkingSuffix // signature retained for callers; suffix variants are no longer emitted
 	return models
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	// Canonical Anthropic dashed / dated ids — what Claude Code 2.x expects.
-	ids := []string{
-		"claude-opus-4-7-20251101",
-		"claude-opus-4-7",
-		"claude-sonnet-4-6-20251101",
-		"claude-sonnet-4-6",
-		"claude-haiku-4-5-20251001",
-		"claude-haiku-4-5",
-		"claude-sonnet-4-5-20251101",
-		"claude-sonnet-4-5",
-		"claude-opus-4-5-20251101",
-		"claude-opus-4-5",
-		"claude-sonnet-4-20250514",
+	// Used only when the per-account model cache is empty (initial boot,
+	// before any account fetches its model list). Mirror the dedup rules
+	// applied to the live path: dashed Anthropic id + dotted Kiro id, no
+	// dated suffix, no -thinking variant.
+	pairs := []struct {
+		dashed string
+		dotted string
+	}{
+		{"claude-opus-4-7", "claude-opus-4.7"},
+		{"claude-sonnet-4-6", "claude-sonnet-4.6"},
+		{"claude-haiku-4-5", "claude-haiku-4.5"},
+		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+		{"claude-opus-4-5", "claude-opus-4.5"},
+		{"claude-sonnet-4", ""},
 	}
-	out := make([]map[string]interface{}, 0, len(ids)*2)
-	for _, id := range ids {
+	out := make([]map[string]interface{}, 0, len(pairs)*2)
+	seen := make(map[string]bool, len(pairs)*2)
+	emit := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
 		out = append(out, buildModelInfo(id, "anthropic", true))
-		out = append(out, buildModelInfo(id+thinkingSuffix, "anthropic", true))
 	}
+	for _, p := range pairs {
+		emit(p.dashed)
+		emit(p.dotted)
+	}
+	_ = thinkingSuffix // signature retained; suffix variants are no longer emitted
 	return out
 }
 
 // kiroModelToAnthropicID converts Kiro's internal dotted model id (e.g.
-// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed /
-// dated form Claude Code recognizes in its model picker.
+// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed
+// form Claude Code recognizes in its model picker. Dated suffixes (e.g.
+// "-20251101") are intentionally omitted: Claude Code resolves the family
+// from the dashed form alone, and emitting both creates duplicate picker
+// entries that map to the same upstream model.
 func kiroModelToAnthropicID(kiroID string) string {
 	switch strings.ToLower(strings.TrimSpace(kiroID)) {
 	case "claude-opus-4.7":
@@ -752,15 +838,15 @@ func kiroModelToAnthropicID(kiroID string) string {
 	case "claude-opus-4.6":
 		return "claude-opus-4-6"
 	case "claude-opus-4.5":
-		return "claude-opus-4-5-20251101"
+		return "claude-opus-4-5"
 	case "claude-sonnet-4.6":
 		return "claude-sonnet-4-6"
 	case "claude-sonnet-4.5":
-		return "claude-sonnet-4-5-20251101"
+		return "claude-sonnet-4-5"
 	case "claude-sonnet-4":
-		return "claude-sonnet-4-20250514"
+		return "claude-sonnet-4"
 	case "claude-haiku-4.5":
-		return "claude-haiku-4-5-20251001"
+		return "claude-haiku-4-5"
 	}
 	// Already in dashed form, or unknown — return as-is.
 	return kiroID
@@ -858,8 +944,9 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 }
 
 // modelDisplayName builds a human-friendly label from the canonical id so
-// Claude Code's picker shows e.g. "Claude Opus 4.7 (Thinking)" instead of
-// the raw "claude-opus-4-7-20251101-thinking".
+// Claude Code's picker shows e.g. "Claude Opus 4.7" instead of the raw
+// "claude-opus-4-7". Date stamps are stripped for legacy clients still
+// asking with the dated form.
 func modelDisplayName(id string, withThinking bool) string {
 	base := id
 	suffix := ""
@@ -953,32 +1040,73 @@ func modelCreatedUnix(id string) int64 {
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
+//
+// Per-account upstream calls run concurrently with a small worker pool.
+// Each goroutine writes its own per-account result into a slice indexed by
+// account position; the merge into the global aggregate happens once on
+// the main goroutine after all workers finish, so we don't need a mutex
+// around mergeUniqueModels (which is not concurrency-safe).
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
 	if len(accounts) == 0 {
 		return
 	}
 
-	aggregated := make([]ModelInfo, 0)
+	type accountResult struct {
+		models   []ModelInfo
+		modelIDs []string
+		account  *config.Account
+		err      error
+	}
+	results := make([]accountResult, len(accounts))
+	sem := make(chan struct{}, refreshFanoutConcurrency)
+	var wg sync.WaitGroup
+
 	for i := range accounts {
+		i := i
 		account := &accounts[i]
-		if err := h.ensureValidToken(account); err != nil {
-			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("[ModelsCache] refresh worker panic for %s: %v", account.Email, r)
+					results[i] = accountResult{account: account, err: fmt.Errorf("worker panic: %v", r)}
+				}
+			}()
+			if err := h.ensureValidToken(account); err != nil {
+				results[i] = accountResult{account: account, err: fmt.Errorf("token refresh failed: %w", err)}
+				return
+			}
+			models, err := ListAvailableModels(account)
+			if err != nil {
+				results[i] = accountResult{account: account, err: err}
+				return
+			}
+			modelIDs := make([]string, 0, len(models))
+			for _, m := range models {
+				modelIDs = append(modelIDs, m.ModelId)
+			}
+			results[i] = accountResult{models: models, modelIDs: modelIDs, account: account}
+		}()
+	}
+	wg.Wait()
+
+	aggregated := make([]ModelInfo, 0)
+	for i := range results {
+		r := &results[i]
+		if r.account == nil {
 			continue
 		}
-
-		models, err := ListAvailableModels(account)
-		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
+		if r.err != nil {
+			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", r.account.Email, r.err)
 			continue
 		}
 		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		aggregated = mergeUniqueModels(aggregated, models)
+		h.pool.SetModelList(r.account.ID, r.modelIDs)
+		aggregated = mergeUniqueModels(aggregated, r.models)
 	}
 
 	if len(aggregated) > 0 {
@@ -988,6 +1116,30 @@ func (h *Handler) refreshModelsCache() {
 		h.modelsCacheMu.Unlock()
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
 	}
+}
+
+// triggerModelsRefreshAsync runs refreshModelsCache in the background, collapsing
+// concurrent callers via the modelsRefreshing CAS gate. Used on cold-cache /v1/models
+// hits so the request can serve fallbackAnthropicModels immediately while the per-
+// account fan-out finishes asynchronously. If a refresh is already in flight the
+// new caller returns immediately — the inflight goroutine will populate the cache.
+func (h *Handler) triggerModelsRefreshAsync() {
+	if !h.modelsRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer h.modelsRefreshing.Store(false)
+		// Recover from any panic in the per-account fan-out so a single
+		// upstream surprise can't tear down the whole proxy. The CAS gate
+		// is still cleared by the deferred Store above (deferred funcs run
+		// during unwind in LIFO order, so this recover sees the panic).
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[ModelsCache] async refresh panic: %v", r)
+			}
+		}()
+		h.refreshModelsCache()
+	}()
 }
 
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
@@ -1213,8 +1365,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Snapshot thinking config once at the top of the request so the
+	// downstream mapping + response options + adaptive defaults all share a
+	// single cfgLock.RLock. Earlier revisions called config.GetThinkingConfig
+	// twice in this handler and three times in the OpenAI variant.
+	thinkingCfg := config.GetThinkingConfig()
+
 	// 获取账号（按模型过滤，优先选支持该模型的账号）
-	actualModel, _ := ParseModelAndThinking(req.Model, config.GetThinkingConfig().Suffix)
+	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
 	if !ok {
 		if retryAfter > 0 {
@@ -1233,11 +1391,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	_ = actualModel // mapping happens inside ClaudeToKiro; keep req.Model as the
-	// original id (e.g. "claude-opus-4-7-20251101") so the response echoes the
-	// exact id the client (e.g. Claude Code) sent.
+	// original id (e.g. "claude-opus-4-7" or a dated alias the client still
+	// has cached) so the response echoes the exact id the client sent.
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -1566,9 +1723,35 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
 	jsonData, _ := json.Marshal(data)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
+	// Build the SSE frame in a single allocation and emit it with one Write
+	// call. fmt.Fprintf parses the format string and issues multiple writes
+	// per frame; on a streaming hot path that adds up. Pre-sizing the slice
+	// avoids the implicit grow inside append.
+	frame := make([]byte, 0, len(event)+len(jsonData)+16)
+	frame = append(frame, "event: "...)
+	frame = append(frame, event...)
+	frame = append(frame, "\ndata: "...)
+	frame = append(frame, jsonData...)
+	frame = append(frame, "\n\n"...)
+	w.Write(frame)
 	flusher.Flush()
 }
+
+// writeOpenAIDataFrame emits an OpenAI-style "data: <json>\n\n" SSE chunk in
+// a single Write, avoiding the format-string parse on the streaming hot path.
+// Caller is expected to Flush — sometimes multiple frames are written before
+// a flush (e.g. final chunk + [DONE]).
+func writeOpenAIDataFrame(w http.ResponseWriter, jsonData []byte) {
+	frame := make([]byte, 0, len(jsonData)+10)
+	frame = append(frame, "data: "...)
+	frame = append(frame, jsonData...)
+	frame = append(frame, "\n\n"...)
+	w.Write(frame)
+}
+
+// openAIDoneFrame is the byte-for-byte termination chunk for an OpenAI stream.
+// Pre-built to skip the format string and string conversion on every request.
+var openAIDoneFrame = []byte("data: [DONE]\n\n")
 
 // backgroundStatsSaver 后台定时保存统计数据
 func (h *Handler) backgroundStatsSaver() {
@@ -1806,7 +1989,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actualModel, _ := ParseModelAndThinking(req.Model, config.GetThinkingConfig().Suffix)
+	// Snapshot thinking config once (see handleClaudeMessages for rationale).
+	thinkingCfg := config.GetThinkingConfig()
+
+	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
 	if !ok {
 		if retryAfter > 0 {
@@ -1824,7 +2010,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	_ = actualModel // OpenAIToKiro maps the model internally for the Kiro upstream call;
 	// keep req.Model as the original id so the response echoes what the client sent.
@@ -1973,7 +2158,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			}
 		}
 		data, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		writeOpenAIDataFrame(w, data)
 		flusher.Flush()
 	}
 
@@ -2029,7 +2214,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			}
 			toolCallIndex++
 			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			writeOpenAIDataFrame(w, data)
 			flusher.Flush()
 		},
 		OnComplete: func(inTok, outTok int) {
@@ -2102,8 +2287,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 	data, _ := json.Marshal(chunk)
-	fmt.Fprintf(w, "data: %s\n\n", string(data))
-	fmt.Fprintf(w, "data: [DONE]\n\n")
+	writeOpenAIDataFrame(w, data)
+	w.Write(openAIDoneFrame)
 	flusher.Flush()
 }
 
