@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"kiro-go/config"
 	"net/http"
@@ -593,7 +592,15 @@ func (h *Handler) sendResponsesEvent(w http.ResponseWriter, flusher http.Flusher
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body)
+	// Single Write of a pre-built frame — same fast path as sendSSE; avoids
+	// fmt.Fprintf format-parse cost on the streaming hot path.
+	frame := make([]byte, 0, len(event)+len(body)+16)
+	frame = append(frame, "event: "...)
+	frame = append(frame, event...)
+	frame = append(frame, "\ndata: "...)
+	frame = append(frame, body...)
+	frame = append(frame, "\n\n"...)
+	w.Write(frame)
 	flusher.Flush()
 }
 

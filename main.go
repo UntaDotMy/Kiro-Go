@@ -52,6 +52,12 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Coalesce per-request stats writes into one fsync per ~5s instead of
+	// one fsync per request. The shutdown path below calls FlushStats to
+	// drain any pending mutation before exit, so no counter updates are
+	// lost on graceful termination.
+	config.StartStatsSaver()
+
 	logger.Init(config.GetLogLevel())
 
 	// Persistent statistics. Stored alongside config.json so the existing
@@ -137,6 +143,9 @@ func main() {
 			logger.Errorf("Graceful shutdown error: %v", err)
 		}
 		handler.Stop()
+		// Drain any per-request stats updates that haven't reached disk
+		// yet (the saver normally flushes every statsFlushInterval).
+		config.FlushStats()
 		_ = stats.Close()
 		logger.Infof("Bye.")
 	}

@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -215,7 +216,29 @@ var (
 	// a new config.json. main.go logs it loudly so the operator can copy the
 	// generated default API key on first run.
 	firstRunStarterKey string
+
+	// statsDirty is set whenever an in-memory request-level mutation happens
+	// (currently UpdateAccountStats — bumped on every successful API call).
+	// A background flusher debounces these into a single Save() per
+	// statsFlushInterval, replacing the previous per-request fsync hot path.
+	// The flag is cleared inside the same write that produces the snapshot
+	// so a successful flush truly drains the queue.
+	statsDirty   atomic.Bool
+	statsSaverOn atomic.Bool // ensures we only spin up one saver goroutine
+
+	// statsFlushMu serializes FlushStats() calls so the shutdown drain
+	// can't return while the background ticker is mid-write. Without it,
+	// FlushStats() from main.go's shutdown path could see Swap(false)
+	// because a tick already grabbed the dirty flag, return immediately,
+	// and let the process exit before the tick's saveLocked finishes.
+	statsFlushMu sync.Mutex
 )
+
+// statsFlushInterval is the debounce window for coalescing per-request stats
+// writes into a single config.json save. Five seconds keeps the admin UI
+// responsive (refreshes show roughly current numbers) while collapsing
+// hundreds of requests into one fsync.
+const statsFlushInterval = 5 * time.Second
 
 // FirstRunStarterKey returns the API key generated on first-run bootstrap, or
 // "" if the config was loaded from an existing file. main.go calls this once
@@ -306,11 +329,23 @@ func Load() error {
 // Uses indented formatting for human readability and writes atomically
 // (temp file + rename) so a crash mid-write cannot leave config.json
 // truncated or empty.
+//
+// Save assumes the caller is already holding cfgLock (most callers are
+// inside a "Lock + mutate + Save" block). Use FlushStats / saveLocked when
+// you want a snapshot under your own lock discipline.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
+	return writeConfigBytes(data)
+}
+
+// writeConfigBytes does the temp-file + fsync + rename dance with a
+// pre-marshaled byte slice. Split out so Save (caller holds cfgLock) and
+// saveLocked (acquires RLock for marshaling) can share the disk-side
+// implementation.
+func writeConfigBytes(data []byte) error {
 	dir := filepath.Dir(cfgPath)
 	if dir == "" {
 		dir = "."
@@ -509,9 +544,14 @@ func GetStats() (int, int, int, int, float64) {
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
 }
 
+// UpdateAccountStats updates per-account counters in memory and marks the
+// config as dirty. The actual disk write is coalesced by the background
+// stats saver started via StartStatsSaver, so a burst of N successful
+// requests collapses into a single config.json fsync rather than N. Call
+// FlushStats from the shutdown path to drain any pending mutation before
+// exit.
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].RequestCount = requestCount
@@ -519,10 +559,68 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].TotalTokens = totalTokens
 			cfg.Accounts[i].TotalCredits = totalCredits
 			cfg.Accounts[i].LastUsed = lastUsed
-			return Save()
+			cfgLock.Unlock()
+			statsDirty.Store(true)
+			return nil
 		}
 	}
+	cfgLock.Unlock()
 	return nil
+}
+
+// StartStatsSaver launches the background coalescing flusher. Idempotent:
+// only the first call wins, so re-invoking from tests or hot-reload paths
+// is safe. The flusher checks statsDirty every statsFlushInterval and
+// runs Save() only when there is unflushed mutation.
+func StartStatsSaver() {
+	if !statsSaverOn.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(statsFlushInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			FlushStats()
+		}
+	}()
+}
+
+// FlushStats writes the current in-memory config to disk if anything has
+// been marked dirty since the last flush. Safe to call concurrently with
+// the background saver; both paths atomically swap the dirty flag before
+// taking the disk lock so a flush in progress can't mask a fresh mutation
+// that arrives between the swap and the rename. Exported so the shutdown
+// path can drain pending stats before exit.
+//
+// statsFlushMu serializes flushers so the shutdown call doesn't return
+// while a ticker tick is mid-write — otherwise the process could exit
+// before the on-disk file is fully replaced.
+func FlushStats() {
+	statsFlushMu.Lock()
+	defer statsFlushMu.Unlock()
+	if !statsDirty.Swap(false) {
+		return
+	}
+	if err := saveLocked(); err != nil {
+		// Restore the dirty flag so the next tick retries; otherwise a
+		// transient disk error would silently lose the most recent batch
+		// of mutations.
+		statsDirty.Store(true)
+	}
+}
+
+// saveLocked is Save with caller-holds-no-lock semantics; it acquires the
+// read lock around marshaling so concurrent mutators can't observe a
+// partial snapshot. Save() itself does not lock because most callers are
+// already holding cfgLock.Lock at the time of the call.
+func saveLocked() error {
+	cfgLock.RLock()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	cfgLock.RUnlock()
+	if err != nil {
+		return err
+	}
+	return writeConfigBytes(data)
 }
 
 // IsQuotaExhausted reports whether either the paid or the trial quota has

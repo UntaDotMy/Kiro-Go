@@ -23,6 +23,17 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// refreshFanoutConcurrency caps the number of in-flight upstream calls when
+// fan-outing background refreshes (token + RefreshAccountInfo, model list)
+// across accounts. Sequential refresh extended the stale-token window to
+// O(N * upstreamLatency); fully unbounded fan-out would burst N parallel
+// auth/usage calls at boot. 8 in-flight is a comfortable middle ground:
+// for typical pools (10–30 accounts) it cuts wall time to <= ~ceil(N/8) *
+// per-call latency, while staying well below any reasonable upstream rate
+// limit on the auth and usage endpoints (those are per-account, not per-
+// proxy, so concurrency between accounts doesn't compound).
+const refreshFanoutConcurrency = 8
+
 // maxRequestBodyBytes caps every JSON request body the proxy will read into
 // memory. 32 MiB is more than any reasonable Claude / OpenAI / Responses
 // payload (largest practical conversations top out around 5–10 MiB even with
@@ -48,6 +59,12 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	// modelsRefreshing collapses concurrent refreshModelsCache fan-outs into
+	// a single in-flight call. Set with atomic CAS at the entry point and
+	// cleared in defer so a panic/error path doesn't strand the gate. Without
+	// this gate, a burst of /v1/models requests during cold start each kicked
+	// off their own N-account fan-out.
+	modelsRefreshing atomic.Bool
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
 	// Per-account debounce for lazy quota refresh after a request completes.
@@ -393,44 +410,69 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 }
 
 // refreshAllAccounts 刷新所有账户信息
+//
+// Per-account work (token refresh + RefreshAccountInfo) is independent, so
+// we fan out across accounts with a bounded worker pool. Sequential refresh
+// took O(N * upstreamLatency) wall time which extended the
+// stale-quota / stale-token window for the whole pool. Concurrency is
+// capped at refreshFanoutConcurrency to avoid hammering the upstream auth /
+// usage endpoints during boot or on the periodic background tick.
 func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
+	if len(accounts) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, refreshFanoutConcurrency)
+	var wg sync.WaitGroup
 	for i := range accounts {
 		account := &accounts[i]
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(account *config.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("[BackgroundRefresh] worker panic for %s: %v", account.Email, r)
+				}
+			}()
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+			// 检查 token 是否需要刷新
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+				if err != nil {
+					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+					return
+				}
+				account.AccessToken = newAccessToken
+				if newRefreshToken != "" {
+					account.RefreshToken = newRefreshToken
+				}
+				account.ExpiresAt = newExpiresAt
+				config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+				h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+				if profileArn != "" {
+					account.ProfileArn = profileArn
+					config.UpdateAccountProfileArn(account.ID, profileArn)
+				}
+			}
+
+			// 刷新账户信息
+			info, err := RefreshAccountInfo(account)
 			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				continue
+				logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
+				return
 			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
-			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
-			}
-		}
 
-		// 刷新账户信息
-		info, err := RefreshAccountInfo(account)
-		if err != nil {
-			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
-			continue
-		}
-
-		config.UpdateAccountInfo(account.ID, *info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+			config.UpdateAccountInfo(account.ID, *info)
+			logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		}(account)
 	}
+	wg.Wait()
 	h.pool.Reload()
 }
 
@@ -664,18 +706,22 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	thinkingSuffix := config.GetThinkingConfig().Suffix
+
 	// 尝试用缓存的真实模型列表
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
-	if len(cached) == 0 {
-		h.refreshModelsCache()
-		h.modelsCacheMu.RLock()
-		cached = h.cachedModels
-		h.modelsCacheMu.RUnlock()
-	}
 
-	thinkingSuffix := config.GetThinkingConfig().Suffix
+	// On cold start (cache empty) we used to block this request on the full
+	// per-account fan-out, which made the first /v1/models call take seconds.
+	// Now we kick off the refresh in the background (collapsed via the
+	// modelsRefreshing gate so concurrent first-hits share one fan-out) and
+	// serve fallbackAnthropicModels immediately. Subsequent requests will
+	// see the populated cache once the refresh completes.
+	if len(cached) == 0 {
+		h.triggerModelsRefreshAsync()
+	}
 
 	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
 	if len(models) == 0 {
@@ -994,32 +1040,73 @@ func modelCreatedUnix(id string) int64 {
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
+//
+// Per-account upstream calls run concurrently with a small worker pool.
+// Each goroutine writes its own per-account result into a slice indexed by
+// account position; the merge into the global aggregate happens once on
+// the main goroutine after all workers finish, so we don't need a mutex
+// around mergeUniqueModels (which is not concurrency-safe).
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
 	if len(accounts) == 0 {
 		return
 	}
 
-	aggregated := make([]ModelInfo, 0)
+	type accountResult struct {
+		models   []ModelInfo
+		modelIDs []string
+		account  *config.Account
+		err      error
+	}
+	results := make([]accountResult, len(accounts))
+	sem := make(chan struct{}, refreshFanoutConcurrency)
+	var wg sync.WaitGroup
+
 	for i := range accounts {
+		i := i
 		account := &accounts[i]
-		if err := h.ensureValidToken(account); err != nil {
-			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("[ModelsCache] refresh worker panic for %s: %v", account.Email, r)
+					results[i] = accountResult{account: account, err: fmt.Errorf("worker panic: %v", r)}
+				}
+			}()
+			if err := h.ensureValidToken(account); err != nil {
+				results[i] = accountResult{account: account, err: fmt.Errorf("token refresh failed: %w", err)}
+				return
+			}
+			models, err := ListAvailableModels(account)
+			if err != nil {
+				results[i] = accountResult{account: account, err: err}
+				return
+			}
+			modelIDs := make([]string, 0, len(models))
+			for _, m := range models {
+				modelIDs = append(modelIDs, m.ModelId)
+			}
+			results[i] = accountResult{models: models, modelIDs: modelIDs, account: account}
+		}()
+	}
+	wg.Wait()
+
+	aggregated := make([]ModelInfo, 0)
+	for i := range results {
+		r := &results[i]
+		if r.account == nil {
 			continue
 		}
-
-		models, err := ListAvailableModels(account)
-		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
+		if r.err != nil {
+			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", r.account.Email, r.err)
 			continue
 		}
 		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		aggregated = mergeUniqueModels(aggregated, models)
+		h.pool.SetModelList(r.account.ID, r.modelIDs)
+		aggregated = mergeUniqueModels(aggregated, r.models)
 	}
 
 	if len(aggregated) > 0 {
@@ -1029,6 +1116,30 @@ func (h *Handler) refreshModelsCache() {
 		h.modelsCacheMu.Unlock()
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
 	}
+}
+
+// triggerModelsRefreshAsync runs refreshModelsCache in the background, collapsing
+// concurrent callers via the modelsRefreshing CAS gate. Used on cold-cache /v1/models
+// hits so the request can serve fallbackAnthropicModels immediately while the per-
+// account fan-out finishes asynchronously. If a refresh is already in flight the
+// new caller returns immediately — the inflight goroutine will populate the cache.
+func (h *Handler) triggerModelsRefreshAsync() {
+	if !h.modelsRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer h.modelsRefreshing.Store(false)
+		// Recover from any panic in the per-account fan-out so a single
+		// upstream surprise can't tear down the whole proxy. The CAS gate
+		// is still cleared by the deferred Store above (deferred funcs run
+		// during unwind in LIFO order, so this recover sees the panic).
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[ModelsCache] async refresh panic: %v", r)
+			}
+		}()
+		h.refreshModelsCache()
+	}()
 }
 
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
@@ -1254,8 +1365,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Snapshot thinking config once at the top of the request so the
+	// downstream mapping + response options + adaptive defaults all share a
+	// single cfgLock.RLock. Earlier revisions called config.GetThinkingConfig
+	// twice in this handler and three times in the OpenAI variant.
+	thinkingCfg := config.GetThinkingConfig()
+
 	// 获取账号（按模型过滤，优先选支持该模型的账号）
-	actualModel, _ := ParseModelAndThinking(req.Model, config.GetThinkingConfig().Suffix)
+	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
 	if !ok {
 		if retryAfter > 0 {
@@ -1274,7 +1391,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	_ = actualModel // mapping happens inside ClaudeToKiro; keep req.Model as the
 	// original id (e.g. "claude-opus-4-7" or a dated alias the client still
@@ -1607,9 +1723,35 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
 	jsonData, _ := json.Marshal(data)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
+	// Build the SSE frame in a single allocation and emit it with one Write
+	// call. fmt.Fprintf parses the format string and issues multiple writes
+	// per frame; on a streaming hot path that adds up. Pre-sizing the slice
+	// avoids the implicit grow inside append.
+	frame := make([]byte, 0, len(event)+len(jsonData)+16)
+	frame = append(frame, "event: "...)
+	frame = append(frame, event...)
+	frame = append(frame, "\ndata: "...)
+	frame = append(frame, jsonData...)
+	frame = append(frame, "\n\n"...)
+	w.Write(frame)
 	flusher.Flush()
 }
+
+// writeOpenAIDataFrame emits an OpenAI-style "data: <json>\n\n" SSE chunk in
+// a single Write, avoiding the format-string parse on the streaming hot path.
+// Caller is expected to Flush — sometimes multiple frames are written before
+// a flush (e.g. final chunk + [DONE]).
+func writeOpenAIDataFrame(w http.ResponseWriter, jsonData []byte) {
+	frame := make([]byte, 0, len(jsonData)+10)
+	frame = append(frame, "data: "...)
+	frame = append(frame, jsonData...)
+	frame = append(frame, "\n\n"...)
+	w.Write(frame)
+}
+
+// openAIDoneFrame is the byte-for-byte termination chunk for an OpenAI stream.
+// Pre-built to skip the format string and string conversion on every request.
+var openAIDoneFrame = []byte("data: [DONE]\n\n")
 
 // backgroundStatsSaver 后台定时保存统计数据
 func (h *Handler) backgroundStatsSaver() {
@@ -1847,7 +1989,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actualModel, _ := ParseModelAndThinking(req.Model, config.GetThinkingConfig().Suffix)
+	// Snapshot thinking config once (see handleClaudeMessages for rationale).
+	thinkingCfg := config.GetThinkingConfig()
+
+	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
 	if !ok {
 		if retryAfter > 0 {
@@ -1865,7 +2010,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 解析模型和 thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	_ = actualModel // OpenAIToKiro maps the model internally for the Kiro upstream call;
 	// keep req.Model as the original id so the response echoes what the client sent.
@@ -2014,7 +2158,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			}
 		}
 		data, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		writeOpenAIDataFrame(w, data)
 		flusher.Flush()
 	}
 
@@ -2070,7 +2214,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			}
 			toolCallIndex++
 			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			writeOpenAIDataFrame(w, data)
 			flusher.Flush()
 		},
 		OnComplete: func(inTok, outTok int) {
@@ -2143,8 +2287,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 	data, _ := json.Marshal(chunk)
-	fmt.Fprintf(w, "data: %s\n\n", string(data))
-	fmt.Fprintf(w, "data: [DONE]\n\n")
+	writeOpenAIDataFrame(w, data)
+	w.Write(openAIDoneFrame)
 	flusher.Flush()
 }
 

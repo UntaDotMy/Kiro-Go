@@ -487,6 +487,22 @@ func parseRetryAfter(h http.Header) time.Duration {
 
 // ==================== Event Stream Parsing ====================
 
+// eventStreamMsgPool reuses message buffers across SSE frames. Each Kiro
+// streaming response can deliver hundreds of small frames; allocating a
+// fresh []byte per frame was a dominant GC source. The pool stores pointers
+// to byte slices (the slice header itself is a value type, so we pool the
+// pointer to avoid the well-known sync.Pool slice-pinning footgun). The
+// returned slice is grown to the required size via append on cold-path and
+// reused otherwise.
+var eventStreamMsgPool = sync.Pool{
+	New: func() interface{} {
+		// 4 KiB covers the typical text/reasoning frame. Larger frames grow
+		// the slice; smaller ones reuse the existing capacity.
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// Read directly without bufio to avoid buffering latency in streaming responses.
@@ -507,10 +523,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 	}
 
+	// Stack-allocated prelude buffer reused for every frame. The 12-byte
+	// header structure (total_len + headers_len + crc) is fixed-size so we
+	// don't need a heap alloc per frame.
+	var prelude [12]byte
+
+	// Borrow a single message buffer from the pool for the lifetime of this
+	// stream. Returned on function exit. We grow it as needed inside the
+	// loop and reset its length each iteration.
+	msgBufPtr := eventStreamMsgPool.Get().(*[]byte)
+	defer eventStreamMsgPool.Put(msgBufPtr)
+
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
-		prelude := make([]byte, 12)
-		_, err := io.ReadFull(body, prelude)
+		_, err := io.ReadFull(body, prelude[:])
 		if err == io.EOF {
 			break
 		}
@@ -525,9 +551,18 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
-		// Read the remaining message bytes.
+		// Read the remaining message bytes into the pooled scratch buffer.
+		// We grow capacity only when the frame exceeds what we already have
+		// — the typical case is reuse with zero allocation.
 		remaining := totalLength - 12
-		msgBuf := make([]byte, remaining)
+		buf := *msgBufPtr
+		if cap(buf) < remaining {
+			buf = make([]byte, remaining)
+		} else {
+			buf = buf[:remaining]
+		}
+		*msgBufPtr = buf
+		msgBuf := buf
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
 			return err
