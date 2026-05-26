@@ -87,6 +87,41 @@ func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
 	}
 }
 
+func TestGetNextForModelMatchesClaudeDottedAndDashedAliases(t *testing.T) {
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "acct-1"}})
+
+	p.SetModelList("acct-1", []string{"claude-opus-4-7"})
+	if account, _, ok := p.GetNextForModel("claude-opus-4.7"); !ok || account == nil || account.ID != "acct-1" {
+		t.Fatalf("expected dotted Kiro id to match dashed picker alias, got account=%#v ok=%v", account, ok)
+	}
+
+	p.SetModelList("acct-1", []string{"claude-sonnet-4.6"})
+	if account, _, ok := p.GetNextForModel("claude-sonnet-4-6"); !ok || account == nil || account.ID != "acct-1" {
+		t.Fatalf("expected dashed picker id to match dotted Kiro id, got account=%#v ok=%v", account, ok)
+	}
+}
+
+func TestSetModelListKeepsStoredModelListExact(t *testing.T) {
+	p := newTestPool()
+	p.SetModelList("acct-1", []string{"claude-opus-4-7"})
+
+	models := p.GetModelList("acct-1")
+	if len(models) != 1 || models[0] != "claude-opus-4-7" {
+		t.Fatalf("expected stored model list to stay exact, got %#v", models)
+	}
+}
+
+func TestGetNextForModelRejectsUnsupportedKnownModel(t *testing.T) {
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "acct-1"}})
+	p.SetModelList("acct-1", []string{"claude-sonnet-4.5"})
+
+	if account, _, ok := p.GetNextForModel("claude-opus-4.7"); ok || account != nil {
+		t.Fatalf("expected unsupported model to be rejected, got account=%#v ok=%v", account, ok)
+	}
+}
+
 // TestSWRRSpreadsLoadEvenlyAcrossEqualWeightAccounts verifies that with equal
 // weights, 100 sequential picks distribute close to evenly across N accounts —
 // the property that protects us from the 429-cascade. The previous slot-

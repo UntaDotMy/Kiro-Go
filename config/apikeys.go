@@ -15,62 +15,64 @@ import (
 //  1. Per-minute rate limit  (MinuteReqLimit)         — burst protection
 //  2. Per-hour rate limit    (HourReqLimit)           — coarse burst control
 //  3. Periodic budget        (DailyReqLimit, etc.)    — main quota; window
-//                                                      controlled by
-//                                                      ResetPeriod + ResetTZ
+//     controlled by
+//     ResetPeriod + ResetTZ
 //  4. Lifetime budget        (LifetimeReqLimit, etc.) — never resets;
-//                                                      key auto-disables
-//                                                      when any dimension is
-//                                                      exhausted
+//     key auto-disables
+//     when any dimension is
+//     exhausted
 //
 // All limits are independent. A zero on any dimension means "no limit on that
 // dimension". Zero on every dimension means an unlimited key.
 //
 // ResetPeriod controls when the periodic counters (DailyRequests/Tokens/
 // Credits) reset:
-//   "daily"   — every day at midnight in ResetTZ (default "UTC")
-//   "weekly"  — every Monday at midnight in ResetTZ
-//   "monthly" — first day of every month at midnight in ResetTZ
-//   ""        — same as "daily" for backward compat
+//
+//	"daily"   — every day at midnight in ResetTZ (default "UTC")
+//	"weekly"  — every Monday at midnight in ResetTZ
+//	"monthly" — first day of every month at midnight in ResetTZ
+//	""        — same as "daily" for backward compat
 //
 // Expiry has three orthogonal modes; first one to fire wins:
-//   ExpiresAt        — absolute Unix-seconds timestamp; 0 = ignored
-//   LazyExpirySeconds — counts down from FirstUsedAt; 0 = ignored. Useful for
-//                      "this key is valid for 30 days from first use".
+//
+//	ExpiresAt        — absolute Unix-seconds timestamp; 0 = ignored
+//	LazyExpirySeconds — counts down from FirstUsedAt; 0 = ignored. Useful for
+//	                   "this key is valid for 30 days from first use".
 //
 // Models is an optional whitelist; empty = any model.
 type APIKey struct {
-	ID         string  `json:"id"`
-	Name       string  `json:"name,omitempty"`
-	Key        string  `json:"key"`
-	Enabled    bool    `json:"enabled"`
-	CreatedAt  int64   `json:"createdAt"`
-	LastUsedAt int64   `json:"lastUsedAt,omitempty"`
-	FirstUsedAt int64  `json:"firstUsedAt,omitempty"`
-	ExpiresAt  int64   `json:"expiresAt,omitempty"`        // absolute Unix seconds
-	LazyExpirySeconds int64 `json:"lazyExpirySeconds,omitempty"` // countdown from FirstUsedAt
-	Models     []string `json:"models,omitempty"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name,omitempty"`
+	Key               string   `json:"key"`
+	Enabled           bool     `json:"enabled"`
+	CreatedAt         int64    `json:"createdAt"`
+	LastUsedAt        int64    `json:"lastUsedAt,omitempty"`
+	FirstUsedAt       int64    `json:"firstUsedAt,omitempty"`
+	ExpiresAt         int64    `json:"expiresAt,omitempty"`         // absolute Unix seconds
+	LazyExpirySeconds int64    `json:"lazyExpirySeconds,omitempty"` // countdown from FirstUsedAt
+	Models            []string `json:"models,omitempty"`
 
 	// Periodic limits. Period defaults to daily (UTC midnight) for backward
 	// compatibility with pre-A13 keys.
-	ResetPeriod   string `json:"resetPeriod,omitempty"` // "daily" | "weekly" | "monthly"
-	ResetTZ       string `json:"resetTZ,omitempty"`     // IANA tz, e.g. "Asia/Singapore"; default "UTC"
+	ResetPeriod    string  `json:"resetPeriod,omitempty"` // "daily" | "weekly" | "monthly"
+	ResetTZ        string  `json:"resetTZ,omitempty"`     // IANA tz, e.g. "Asia/Singapore"; default "UTC"
 	DailyReqLimit  int     `json:"dailyReqLimit,omitempty"`
 	DailyTokLimit  int     `json:"dailyTokLimit,omitempty"`
 	DailyCredLimit float64 `json:"dailyCredLimit,omitempty"`
 
 	// Periodic counters; reset when the period rolls over.
-	CountersDate    string  `json:"countersDate,omitempty"` // identifies the current period bucket
-	DailyRequests   int     `json:"dailyRequests,omitempty"`
-	DailyTokens     int     `json:"dailyTokens,omitempty"`
-	DailyCredits    float64 `json:"dailyCredits,omitempty"`
+	CountersDate  string  `json:"countersDate,omitempty"` // identifies the current period bucket
+	DailyRequests int     `json:"dailyRequests,omitempty"`
+	DailyTokens   int     `json:"dailyTokens,omitempty"`
+	DailyCredits  float64 `json:"dailyCredits,omitempty"`
 
 	// Per-minute / per-hour rate limits (request count only).
-	MinuteReqLimit  int   `json:"minuteReqLimit,omitempty"`
-	HourReqLimit    int   `json:"hourReqLimit,omitempty"`
+	MinuteReqLimit  int    `json:"minuteReqLimit,omitempty"`
+	HourReqLimit    int    `json:"hourReqLimit,omitempty"`
 	minuteBucketKey string // not persisted
 	hourBucketKey   string // not persisted
-	MinuteRequests  int   `json:"minuteRequests,omitempty"`
-	HourRequests    int   `json:"hourRequests,omitempty"`
+	MinuteRequests  int    `json:"minuteRequests,omitempty"`
+	HourRequests    int    `json:"hourRequests,omitempty"`
 
 	// Lifetime caps. When any non-zero limit is reached, the key auto-disables.
 	LifetimeReqLimit  int     `json:"lifetimeReqLimit,omitempty"`
@@ -139,6 +141,57 @@ func minuteBucket(tz string) string {
 }
 func hourBucket(tz string) string {
 	return time.Now().In(resolveResetTZ(tz)).Format("2006010215")
+}
+
+var apiKeyModelAliases = map[string][]string{
+	"claude-opus-4-7":   {"claude-opus-4.7"},
+	"claude-opus-4.7":   {"claude-opus-4-7"},
+	"claude-opus-4-6":   {"claude-opus-4.6"},
+	"claude-opus-4.6":   {"claude-opus-4-6"},
+	"claude-opus-4-5":   {"claude-opus-4.5"},
+	"claude-opus-4.5":   {"claude-opus-4-5"},
+	"claude-sonnet-4-6": {"claude-sonnet-4.6"},
+	"claude-sonnet-4.6": {"claude-sonnet-4-6"},
+	"claude-sonnet-4-5": {"claude-sonnet-4.5"},
+	"claude-sonnet-4.5": {"claude-sonnet-4-5"},
+	"claude-haiku-4-5":  {"claude-haiku-4.5"},
+	"claude-haiku-4.5":  {"claude-haiku-4-5"},
+}
+
+func modelWhitelistCandidates(model string) []string {
+	normalizedModel := strings.ToLower(strings.TrimSpace(model))
+	if normalizedModel == "" {
+		return nil
+	}
+
+	candidates := []string{normalizedModel}
+	for _, alias := range apiKeyModelAliases[normalizedModel] {
+		candidates = append(candidates, alias)
+	}
+	return candidates
+}
+
+func modelIsAllowedByWhitelist(allowedModels []string, model string) bool {
+	if len(allowedModels) == 0 {
+		return true
+	}
+	candidates := modelWhitelistCandidates(model)
+	if len(candidates) == 0 {
+		return false
+	}
+
+	for _, allowedModel := range allowedModels {
+		normalizedAllowed := strings.ToLower(strings.TrimSpace(allowedModel))
+		if normalizedAllowed == "" {
+			continue
+		}
+		for _, candidate := range candidates {
+			if normalizedAllowed == candidate {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GetAPIKeys returns a snapshot of all configured API keys.
@@ -322,17 +375,8 @@ func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
 			_ = Save()
 			return true, "key expired (lazy)"
 		}
-		if len(k.Models) > 0 && model != "" {
-			allowed := false
-			for _, m := range k.Models {
-				if m == model {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				return true, "model '" + model + "' not allowed for this key"
-			}
+		if model != "" && !modelIsAllowedByWhitelist(k.Models, model) {
+			return true, "model '" + model + "' not allowed for this key"
 		}
 		curMin := minuteBucket(k.ResetTZ)
 		if k.minuteBucketKey != curMin {
@@ -386,14 +430,14 @@ func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
 // ConsumeAPIKey records request usage against a key's counters and lifetime
 // totals. Order of checks (any failure rejects without consuming):
 //
-//	1. Key disabled               → reject
-//	2. Absolute expiry passed     → reject (also auto-disables)
-//	3. Lazy expiry triggered      → reject (also auto-disables)
-//	4. Model not in whitelist     → reject
-//	5. Per-minute rate limit hit  → reject
-//	6. Per-hour rate limit hit    → reject
-//	7. Periodic limit reached     → reject
-//	8. Lifetime limit reached     → reject (also auto-disables)
+//  1. Key disabled               → reject
+//  2. Absolute expiry passed     → reject (also auto-disables)
+//  3. Lazy expiry triggered      → reject (also auto-disables)
+//  4. Model not in whitelist     → reject
+//  5. Per-minute rate limit hit  → reject
+//  6. Per-hour rate limit hit    → reject
+//  7. Periodic limit reached     → reject
+//  8. Lifetime limit reached     → reject (also auto-disables)
 //
 // On success: increments all counters, updates LastUsedAt + FirstUsedAt,
 // persists.
@@ -423,17 +467,8 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 			return true, "key expired (lazy)"
 		}
 		// Model whitelist.
-		if len(k.Models) > 0 && model != "" {
-			allowed := false
-			for _, m := range k.Models {
-				if m == model {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				return true, "model '" + model + "' not allowed for this key"
-			}
+		if model != "" && !modelIsAllowedByWhitelist(k.Models, model) {
+			return true, "model '" + model + "' not allowed for this key"
 		}
 		// Reset minute / hour buckets if rolled over.
 		curMin := minuteBucket(k.ResetTZ)

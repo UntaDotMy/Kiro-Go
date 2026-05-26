@@ -120,11 +120,11 @@ type PromptFilterRule struct {
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
-	Password      string    `json:"password"`         // Admin panel password
-	Port          int       `json:"port"`             // HTTP server port (default: 8080)
-	Host          string    `json:"host"`             // HTTP server bind address (default: 0.0.0.0)
-	ApiKey        string    `json:"apiKey,omitempty"` // Legacy single API key (kept for backward compatibility)
-	RequireApiKey bool      `json:"requireApiKey"`    // Whether to enforce API key validation
+	Password      string    `json:"password"`          // Admin panel password
+	Port          int       `json:"port"`              // HTTP server port (default: 8080)
+	Host          string    `json:"host"`              // HTTP server bind address (default: 0.0.0.0)
+	ApiKey        string    `json:"apiKey,omitempty"`  // Legacy single API key (kept for backward compatibility)
+	RequireApiKey bool      `json:"requireApiKey"`     // Whether to enforce API key validation
 	APIKeys       []APIKey  `json:"apiKeys,omitempty"` // Multi API keys with per-key limits
 	KiroVersion   string    `json:"kiroVersion,omitempty"`
 	SystemVersion string    `json:"systemVersion,omitempty"`
@@ -206,7 +206,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.9-A2"
+const Version = "1.0.9-A3"
 
 var (
 	cfg     *Config
@@ -278,10 +278,10 @@ func Load() error {
 			starterKey, _ := generateAPIKeySecret()
 			firstRunStarterKey = starterKey
 			cfg = &Config{
-				Password:              "changeme",
-				Port:                  8080,
-				Host:                  "0.0.0.0",
-				RequireApiKey:         true,
+				Password:      "changeme",
+				Port:          8080,
+				Host:          "0.0.0.0",
+				RequireApiKey: true,
 				APIKeys: []APIKey{{
 					ID:        generateAPIKeyID(),
 					Name:      "default",

@@ -396,6 +396,19 @@ func TestBuildAnthropicModelsResponseCollapsesAlreadyDashedID(t *testing.T) {
 	}
 }
 
+func TestFallbackAnthropicModelsIncludesOpus47PickerAlias(t *testing.T) {
+	models := fallbackAnthropicModels("-thinking")
+	seen := map[string]bool{}
+	for _, model := range models {
+		if id, ok := model["id"].(string); ok {
+			seen[id] = true
+		}
+	}
+	if !seen["claude-opus-4-7"] || !seen["claude-opus-4.7"] {
+		t.Fatalf("expected fallback to include Opus 4.7 picker and Kiro aliases, got %#v", seen)
+	}
+}
+
 // TestBuildAnthropicModelsResponseHandlesAutoAndKnownAliases confirms that
 // when Kiro itself returns one of the alias names (e.g. "auto") in its
 // model list, buildAnthropicModelsResponse passes it through as a single
@@ -461,4 +474,3 @@ func TestApplyAdaptiveThinkingDefaultSkipsNonClaude(t *testing.T) {
 		t.Fatalf("expected no thinking config for non-Claude model, got %#v", req.Thinking)
 	}
 }
-

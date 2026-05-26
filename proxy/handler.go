@@ -65,8 +65,8 @@ type Handler struct {
 	// this gate, a burst of /v1/models requests during cold start each kicked
 	// off their own N-account fan-out.
 	modelsRefreshing atomic.Bool
-	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
+	promptCache      *promptCacheTracker
+	tokenRefreshMu   sync.Mutex
 	// Per-account debounce for lazy quota refresh after a request completes.
 	refreshDebounceMu sync.Mutex
 	refreshScheduled  map[string]bool
@@ -920,14 +920,14 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"output_modalities":          []string{"text"},
 		"modalities":                 modalitiesMap,
 		"capabilities": map[string]bool{
-			"vision":             supportsImage,
-			"image":              supportsImage,
-			"image_vision":       supportsImage,
-			"tools":              true,
-			"streaming":          true,
-			"function_calling":   true,
-			"extended_thinking":  supportsExtendedThinking,
-			"reasoning":          supportsExtendedThinking,
+			"vision":            supportsImage,
+			"image":             supportsImage,
+			"image_vision":      supportsImage,
+			"tools":             true,
+			"streaming":         true,
+			"function_calling":  true,
+			"extended_thinking": supportsExtendedThinking,
+			"reasoning":         supportsExtendedThinking,
 		},
 		"info": map[string]interface{}{
 			"meta": map[string]interface{}{
@@ -1702,7 +1702,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	if apiKeyID != "" {
+		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
+	}
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	// 发送 message_delta
@@ -1914,7 +1916,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	if apiKeyID != "" {
+		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
+	}
 	h.promptCache.Update(account.ID, cacheProfile)
 
 	responseThinkingContent := rawThinkingContent
@@ -2265,7 +2269,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	if apiKeyID != "" {
+		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
+	}
 
 	// 发送结束
 	finishReason := resolveOpenAIFinishReason(upstreamStopReason, len(toolCalls) > 0)
@@ -2346,7 +2352,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
+	if apiKeyID != "" {
+		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
+	}
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason)

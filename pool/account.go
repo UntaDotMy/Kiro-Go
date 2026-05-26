@@ -225,7 +225,40 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 	if !ok || len(list) == 0 {
 		return true
 	}
-	return list[modelKey]
+	for _, key := range modelLookupKeys(modelKey) {
+		if list[key] {
+			return true
+		}
+	}
+	return false
+}
+
+var modelRouteAliases = map[string][]string{
+	"claude-opus-4-7":   {"claude-opus-4.7"},
+	"claude-opus-4.7":   {"claude-opus-4-7"},
+	"claude-opus-4-6":   {"claude-opus-4.6"},
+	"claude-opus-4.6":   {"claude-opus-4-6"},
+	"claude-opus-4-5":   {"claude-opus-4.5"},
+	"claude-opus-4.5":   {"claude-opus-4-5"},
+	"claude-sonnet-4-6": {"claude-sonnet-4.6"},
+	"claude-sonnet-4.6": {"claude-sonnet-4-6"},
+	"claude-sonnet-4-5": {"claude-sonnet-4.5"},
+	"claude-sonnet-4.5": {"claude-sonnet-4-5"},
+	"claude-haiku-4-5":  {"claude-haiku-4.5"},
+	"claude-haiku-4.5":  {"claude-haiku-4-5"},
+}
+
+func modelLookupKeys(modelID string) []string {
+	normalizedModelID := strings.ToLower(strings.TrimSpace(modelID))
+	if normalizedModelID == "" {
+		return nil
+	}
+
+	keys := []string{normalizedModelID}
+	for _, alias := range modelRouteAliases[normalizedModelID] {
+		keys = append(keys, alias)
+	}
+	return keys
 }
 
 // GetNextForModel returns the next account that supports the requested model.
