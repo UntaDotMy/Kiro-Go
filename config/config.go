@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -270,7 +271,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.9-A3"
+const Version = "1.0.9-A4"
 
 var (
 	cfg     *Config
@@ -1058,7 +1059,16 @@ func GetKiroAPIRegions() []string {
 	out := make([]string, 0, len(raw))
 	for _, r := range raw {
 		s := strings.ToLower(strings.TrimSpace(r))
-		if s == "" || seen[s] || !isValidAWSRegionShape(s) {
+		if s == "" {
+			continue
+		}
+		if seen[s] {
+			continue
+		}
+		if !isValidAWSRegionShape(s) {
+			// Operator-visible warn so a typo in KIRO_API_REGIONS / config
+			// isn't silently dropped on every accessor call.
+			logger.Warnf("[Config] KiroAPIRegions: dropping malformed region %q", s)
 			continue
 		}
 		seen[s] = true
@@ -1078,7 +1088,14 @@ func UpdateKiroAPIRegions(regions []string) error {
 	seen := map[string]bool{}
 	for _, r := range regions {
 		s := strings.ToLower(strings.TrimSpace(r))
-		if s == "" || seen[s] || !isValidAWSRegionShape(s) {
+		if s == "" {
+			continue
+		}
+		if seen[s] {
+			continue
+		}
+		if !isValidAWSRegionShape(s) {
+			logger.Warnf("[Config] UpdateKiroAPIRegions: dropping malformed region %q", s)
 			continue
 		}
 		seen[s] = true
