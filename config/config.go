@@ -172,6 +172,13 @@ type Config struct {
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
 
+	// FilterDefaultsApplied marks that the one-shot migration which sets the
+	// three Filter* flags ON for upgrading users has run. Without this flag
+	// we'd keep flipping them ON every restart, trampling explicit user
+	// "off" choices. New installs go through the bootstrap path in Load()
+	// and arrive here pre-migrated. See migrateFilterDefaults.
+	FilterDefaultsApplied bool `json:"filterDefaultsApplied,omitempty"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
@@ -278,10 +285,10 @@ func Load() error {
 			starterKey, _ := generateAPIKeySecret()
 			firstRunStarterKey = starterKey
 			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: true,
+				Password:              "changeme",
+				Port:                  8080,
+				Host:                  "0.0.0.0",
+				RequireApiKey:         true,
 				APIKeys: []APIKey{{
 					ID:        generateAPIKeyID(),
 					Name:      "default",
@@ -293,6 +300,7 @@ func Load() error {
 				FilterClaudeCode:      true,
 				FilterEnvNoise:        true,
 				FilterStripBoundaries: true,
+				FilterDefaultsApplied: true,
 			}
 			return Save()
 		}
@@ -304,6 +312,14 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// One-shot migration: configs created before the FilterDefaultsApplied
+	// flag existed have FilterClaudeCode/FilterEnvNoise/FilterStripBoundaries
+	// silently zeroed by Go's json.Unmarshal whenever those fields were
+	// absent from the JSON document. Without this migration, every upgrade
+	// would surface a "filters off by default" UX regression. We only set
+	// this once per install; subsequent runs respect operator toggles.
+	migrateFilterDefaults()
 
 	// Auto-migrate the legacy single-key field into the multi-key list so the
 	// dashboard's "API Keys" tab is the single source of truth. Triggers only
@@ -374,6 +390,26 @@ func writeConfigBytes(data []byte) error {
 		return err
 	}
 	return os.Rename(tmpPath, cfgPath)
+}
+
+// migrateFilterDefaults sets the three prompt-filter flags ON for any
+// pre-existing config that was loaded before the FilterDefaultsApplied
+// migration marker existed. Caller must hold cfgLock for write — Load()
+// satisfies that. The migration runs at most once per install: once
+// FilterDefaultsApplied is true (either from this migration or from the
+// fresh-install bootstrap), we never re-apply, so explicit operator
+// "off" toggles are preserved.
+func migrateFilterDefaults() {
+	if cfg == nil || cfg.FilterDefaultsApplied {
+		return
+	}
+	cfg.FilterClaudeCode = true
+	cfg.FilterEnvNoise = true
+	cfg.FilterStripBoundaries = true
+	cfg.FilterDefaultsApplied = true
+	// Persist immediately so a subsequent restart sees the marker even if
+	// no other state changes between now and the next save.
+	_ = Save()
 }
 
 // SetPassword updates the admin password.

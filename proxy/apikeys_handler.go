@@ -8,6 +8,26 @@ import (
 	"strconv"
 )
 
+// apiRevealAPIKey returns the full secret for one key. The list endpoint
+// masks every key by design so an admin XSS / accidental screenshare
+// doesn't leak the secret; this endpoint is the explicit "copy key"
+// affordance — the operator clicks a button per row, the dashboard fetches
+// the full secret over the same admin-authed channel, copies it to the
+// clipboard, and discards it from memory. The endpoint requires the
+// admin password (enforced by the routing layer that wraps every
+// /admin/api/* path), so the security boundary is unchanged: anyone who
+// could already authenticate can already see the secrets in config.json.
+func (h *Handler) apiRevealAPIKey(w http.ResponseWriter, r *http.Request, id string) {
+	for _, k := range config.GetAPIKeys() {
+		if k.ID == id {
+			json.NewEncoder(w).Encode(map[string]string{"key": k.Key})
+			return
+		}
+	}
+	w.WriteHeader(404)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Key not found"})
+}
+
 // apiListAPIKeys returns all configured API keys with their counters and
 // limits. Secrets are masked to the last 4 characters of each key (e.g.
 // "sk-kg-...abcd") so an admin XSS / accidental screenshare cannot leak

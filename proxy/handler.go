@@ -2530,6 +2530,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiListAPIKeys(w, r)
 	case path == "/apikeys" && r.Method == "POST":
 		h.apiCreateAPIKey(w, r)
+	case strings.HasPrefix(path, "/apikeys/") && strings.HasSuffix(path, "/reveal") && r.Method == "GET":
+		// /apikeys/<id>/reveal — fetch the full secret for a copy-to-clipboard
+		// affordance. Same admin auth as everything else under /admin/api/*.
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/apikeys/"), "/reveal")
+		h.apiRevealAPIKey(w, r, id)
 	case strings.HasPrefix(path, "/apikeys/") && r.Method == "PUT":
 		h.apiUpdateAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
 	case strings.HasPrefix(path, "/apikeys/") && r.Method == "DELETE":
@@ -3207,7 +3212,19 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	// Aggregate per-account subscription quotas so the dashboard can show
 	// "Credits Total" / "Remaining" alongside the cumulative "Credits Used"
 	// without having to refetch the full /accounts list every poll.
+	//
+	// Two parallel sums are exposed:
+	//   - quotaTotal / quotaUsed: ALL accounts (includes disabled).
+	//     Useful for capacity planning ("we have N credits across the
+	//     fleet, however many we're actually using").
+	//   - activeQuotaTotal / activeQuotaUsed / activeTokens / activeRequests:
+	//     ENABLED accounts only. Matches the operator intuition that
+	//     turning off an account should make its credits stop counting
+	//     toward the live dashboard.
 	var quotaTotal, quotaUsed float64
+	var activeQuotaTotal, activeQuotaUsed float64
+	var activeTokens int
+	var activeRequests int
 	for _, a := range config.GetAccounts() {
 		if a.UsageLimit > 0 {
 			quotaTotal += a.UsageLimit
@@ -3215,19 +3232,33 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		if a.UsageCurrent > 0 {
 			quotaUsed += a.UsageCurrent
 		}
+		if a.Enabled {
+			if a.UsageLimit > 0 {
+				activeQuotaTotal += a.UsageLimit
+			}
+			if a.UsageCurrent > 0 {
+				activeQuotaUsed += a.UsageCurrent
+			}
+			activeTokens += a.TotalTokens
+			activeRequests += a.RequestCount
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"quotaTotal":      quotaTotal,
-		"quotaUsed":       quotaUsed,
-		"uptime":          time.Now().Unix() - h.startTime,
+		"accounts":         h.pool.Count(),
+		"available":        h.pool.AvailableCount(),
+		"totalRequests":    atomic.LoadInt64(&h.totalRequests),
+		"successRequests":  atomic.LoadInt64(&h.successRequests),
+		"failedRequests":   atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":      atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":     h.getCredits(),
+		"quotaTotal":       quotaTotal,
+		"quotaUsed":        quotaUsed,
+		"activeQuotaTotal": activeQuotaTotal,
+		"activeQuotaUsed":  activeQuotaUsed,
+		"activeTokens":     activeTokens,
+		"activeRequests":   activeRequests,
+		"uptime":           time.Now().Unix() - h.startTime,
 	})
 }
 

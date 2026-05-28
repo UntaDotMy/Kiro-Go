@@ -12,10 +12,18 @@ import (
 )
 
 // recordPoolError feeds an upstream error back into the pool's cooldown
-// state machine. If the error is a *QuotaError, we honor the Retry-After
-// from the upstream response; otherwise we fall back to substring matching
-// on legacy error strings ("429" / "quota") for paths that wrap before
-// returning.
+// state machine. We discriminate three tiers:
+//
+//   - *QuotaError → 429 throttling. Honor upstream Retry-After.
+//   - 402 OVERAGE → monthly quota exhausted. Long cooldown (~1h) so the
+//     SWRR walk doesn't keep selecting an account that will keep failing
+//     until the next billing reset.
+//   - everything else → generic non-quota error. Soft cooldown after 3
+//     consecutive failures.
+//
+// Substring matching on err.Error() is the fallback for paths that wrap
+// before returning; it covers the legacy "429" / "quota" surface plus the
+// 402 OVERAGE messages from CodeWhisperer.
 func (h *Handler) recordPoolError(accountID string, err error) {
 	if err == nil {
 		return
@@ -26,6 +34,12 @@ func (h *Handler) recordPoolError(accountID string, err error) {
 		return
 	}
 	msg := err.Error()
+	if strings.Contains(msg, "402") && strings.Contains(msg, "OVERAGE") {
+		// Monthly quota exhausted — short cooldowns won't help, schedule
+		// a long park instead.
+		h.pool.RecordQuotaExhaustion(accountID)
+		return
+	}
 	isQuota := strings.Contains(msg, "429") || strings.Contains(msg, "quota")
 	h.pool.RecordError(accountID, isQuota, 0)
 }

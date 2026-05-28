@@ -46,12 +46,26 @@ const (
 	// oversized header can't park an account longer than ~5 min. AWS's own
 	// SDK clamps server-supplied retry-after to [computed_backoff,
 	// computed_backoff + 5s] for the same reason.
-	softCooldownBase  = 5 * time.Second
-	softCooldownMax   = 5 * time.Minute
-	retryAfterMin     = 5 * time.Second
-	retryAfterMax     = 5 * time.Minute
-	nonQuotaCooldown  = 60 * time.Second
-	errorCounterDecay = 5 * time.Minute
+	//
+	// retryAfterMin is the floor for synthesized backoff when upstream does
+	// NOT provide a Retry-After. Real upstream hints (which arrive from
+	// AWS's throttling layer with values as small as ~1s during light
+	// throttling) bypass this floor — clamping a server-supplied 1s up to
+	// 5s wasted four free seconds of capacity per recovery.
+	softCooldownBase    = 5 * time.Second
+	softCooldownMax     = 5 * time.Minute
+	retryAfterMin       = 5 * time.Second
+	retryAfterMax       = 5 * time.Minute
+	retryAfterAbsoluteMin = 1 * time.Second
+	nonQuotaCooldown    = 60 * time.Second
+	errorCounterDecay   = 5 * time.Minute
+
+	// quotaExhaustedCooldown is the cooldown applied when the upstream
+	// returns 402 OVERAGE / monthly-quota exhaustion. These are not
+	// recoverable on a per-minute timescale — the quota resets at month
+	// boundary — so we park the account for an hour and let the periodic
+	// RefreshAccountInfo path notice the reset and re-enable.
+	quotaExhaustedCooldown = 1 * time.Hour
 )
 
 // accountSlot is one entry in the SWRR scheduler. The slot is keyed
@@ -411,9 +425,13 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 
 	switch {
 	case isQuotaError && retryAfter > 0:
+		// Honor upstream Retry-After down to retryAfterAbsoluteMin (1s).
+		// Earlier revisions clamped to 5s, which threw away free capacity
+		// whenever AWS hinted at a fast recovery. We still cap the upper
+		// bound so a malformed header can't park the account indefinitely.
 		clamped := retryAfter
-		if clamped < retryAfterMin {
-			clamped = retryAfterMin
+		if clamped < retryAfterAbsoluteMin {
+			clamped = retryAfterAbsoluteMin
 		}
 		if clamped > retryAfterMax {
 			clamped = retryAfterMax
@@ -452,6 +470,34 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 	}
 
 	// Bump the persisted ErrorCount so the admin UI reflects reality.
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ErrorCount++
+			break
+		}
+	}
+}
+
+// RecordQuotaExhaustion is RecordError's heavier sibling for monthly /
+// hard-quota exhaustion (HTTP 402 OVERAGE from upstream). The recoverable
+// timescale here is hours-to-days, not seconds, so we apply a long
+// cooldown (1h) so the SWRR walk skips this account until the periodic
+// RefreshAccountInfo path either notices a quota reset or the operator
+// manually intervenes. Callers that already record the same error via
+// RecordError should NOT also call this — the longer cooldown wins.
+func (p *AccountPool) RecordQuotaExhaustion(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cd := p.cooldowns[id]
+	if cd == nil {
+		cd = &cooldownEntry{}
+		p.cooldowns[id] = cd
+	}
+	now := time.Now()
+	cd.lastErrorAt = now
+	cd.until = now.Add(quotaExhaustedCooldown)
+	cd.lastSleep = quotaExhaustedCooldown
+	cd.consecutiveErrs = 0
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
 			p.accounts[i].ErrorCount++

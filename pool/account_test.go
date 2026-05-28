@@ -247,13 +247,17 @@ func TestRecordErrorHonorsRetryAfter(t *testing.T) {
 		t.Fatalf("expected ~45s cooldown, got %s", d)
 	}
 
-	// Tiny Retry-After should be clamped up to retryAfterMin.
+	// Tiny Retry-After (1s) is now honored directly: dropping the 5s clamp
+	// floor is intentional. Upstream sometimes hints "retry in 1s" during
+	// light throttling and burning four extra seconds wasted free capacity.
+	// We still honor retryAfterAbsoluteMin (1s) so a misformed 0/negative
+	// header can't pin the account on a hot loop.
 	p2 := newTestPool()
 	p2.setAccounts([]config.Account{{ID: "b"}})
 	p2.RecordError("b", true, 1*time.Second)
 	d2 := p2.CooldownRemaining("b")
-	if d2 < retryAfterMin-time.Second || d2 > retryAfterMin+time.Second {
-		t.Fatalf("expected cooldown clamped to %s, got %s", retryAfterMin, d2)
+	if d2 < retryAfterAbsoluteMin-time.Second || d2 > retryAfterAbsoluteMin+time.Second {
+		t.Fatalf("expected cooldown ~%s, got %s", retryAfterAbsoluteMin, d2)
 	}
 
 	// Huge Retry-After should be clamped down to retryAfterMax.
