@@ -3293,6 +3293,7 @@
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.basic')) +
                 '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="' + prefix + 'KeyName" value="' + escape(v('name', '')) + '" placeholder="my-app"></div>' +
                 '<div class="form-group"><label>Account Group</label><input type="text" id="' + prefix + 'KeyGroup" value="' + escape(v('group', '')) + '" placeholder="premium (optional)"><small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Restricts this API key to Kiro accounts that include this group name in their Groups field. Leave empty to use all accounts. Set per-account groups in the Accounts tab.</small></div>' +
+                '<div class="form-group"><label>Allowed Models</label><input type="text" id="' + prefix + 'KeyModels" value="' + escape((Array.isArray(v(\'models\', [])) ? v(\'models\', []) : []).join(\', \')) + '" placeholder="claude-opus-4-7, claude-sonnet-4-5 (optional, default: all)"><small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Comma-separated list of model ids this key may invoke. Leave empty to allow every model. Dotted/dashed forms (claude-opus-4.7 ↔ claude-opus-4-7) match interchangeably; calls to disallowed models are rejected before any upstream account is touched, and /v1/models returns only the allowed entries when this key is used.</small></div>' +
                 '</div>' +
                 // Periodic
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.periodic')) +
@@ -3333,9 +3334,16 @@
             const expiresAt = expIso ? Math.floor(new Date(expIso).getTime() / 1000) : 0;
             const lazyDays = parseFloat(document.getElementById(prefix + 'KeyLazyDays').value) || 0;
             const lazyExpirySeconds = lazyDays > 0 ? Math.floor(lazyDays * 86400) : 0;
+            // Allowed-models input: split comma OR newline (operator may
+            // paste from the UI's models picker which uses newlines).
+            // Empty = no restriction (default: all models).
+            const modelsRaw = (document.getElementById(prefix + 'KeyModels').value || '').trim();
+            const models = modelsRaw === '' ? [] :
+                modelsRaw.split(/[,\n]/).map(s => s.trim()).filter(s => s.length > 0);
             return {
                 name: document.getElementById(prefix + 'KeyName').value.trim(),
                 group: document.getElementById(prefix + 'KeyGroup').value.trim(),
+                models,
                 resetPeriod: periodVal,
                 resetTZ: tzVal,
                 dailyReqLimit: parseInt(document.getElementById(prefix + 'KeyReqLim').value) || 0,

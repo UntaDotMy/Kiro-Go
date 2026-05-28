@@ -203,6 +203,19 @@ func modelIsAllowedByWhitelist(allowedModels []string, model string) bool {
 	return false
 }
 
+// IsModelAllowedForAPIKey reports whether the given model id is permitted
+// for the supplied API key. Empty key.Models = "no restriction" (returns
+// true for any model). Comparison uses the same dotted/dashed alias
+// resolver that the request-time pre-flight gate (CheckAPIKeyLimit) uses,
+// so a key configured with "claude-opus-4.7" still matches an inbound
+// "claude-opus-4-7" and vice versa.
+//
+// Used by /v1/models to filter the listed models down to what the calling
+// key is allowed to invoke.
+func IsModelAllowedForAPIKey(k APIKey, model string) bool {
+	return modelIsAllowedByWhitelist(k.Models, model)
+}
+
 // GetAPIKeys returns a snapshot of all configured API keys.
 func GetAPIKeys() []APIKey {
 	cfgLock.RLock()

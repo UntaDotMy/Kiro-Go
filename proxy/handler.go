@@ -772,6 +772,29 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
 	}
 
+	// Per-key model whitelist filter. When the caller authenticated with an
+	// API key that has a non-empty Models list, restrict the /v1/models
+	// response to entries on that list. Empty list (or no key, e.g.
+	// unauthenticated legacy path) returns the full set — preserves the
+	// existing "default is everything" behavior. We use the same alias
+	// resolver as the request-time pre-flight gate (config.modelIsAllowedBy
+	// Whitelist exposed via config.IsModelAllowedForAPIKey) so a key
+	// configured with "claude-opus-4.7" still sees "claude-opus-4-7" in the
+	// list.
+	if k := matchedAPIKey(r); k != nil && len(k.Models) > 0 {
+		filtered := make([]map[string]interface{}, 0, len(models))
+		for _, m := range models {
+			id, _ := m["id"].(string)
+			if id == "" {
+				continue
+			}
+			if config.IsModelAllowedForAPIKey(*k, id) {
+				filtered = append(filtered, m)
+			}
+		}
+		models = filtered
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
