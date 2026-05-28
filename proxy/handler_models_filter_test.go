@@ -71,6 +71,54 @@ func TestHandleModelsFiltersByAPIKey(t *testing.T) {
 	}
 }
 
+// TestApiGetAvailableModelsReturnsCatalog confirms the admin endpoint
+// returns the unfiltered model catalog as a flat sorted id list — this
+// is what the API key form uses to render checkboxes. The endpoint must
+// NOT apply any per-key filter (the form is showing the universe of
+// options, not what some specific key can already access).
+func TestApiGetAvailableModelsReturnsCatalog(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgPath); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	h := &Handler{startTime: 0}
+
+	req := httptest.NewRequest("GET", "/admin/api/available-models", nil)
+	rec := httptest.NewRecorder()
+	h.apiGetAvailableModels(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Models []string `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Models) == 0 {
+		t.Fatalf("expected non-empty catalog, got 0 entries")
+	}
+	// Catalog must include both canonical and dotted alias forms (the
+	// form's UI collapses them, but the API contract is the full list).
+	want := map[string]bool{"claude-opus-4-7": true, "claude-opus-4.7": true}
+	got := map[string]bool{}
+	for _, id := range resp.Models {
+		got[id] = true
+	}
+	for w := range want {
+		if !got[w] {
+			t.Errorf("expected catalog to include %q, got %v", w, resp.Models)
+		}
+	}
+	// Sort guarantee from the handler — checkbox grid relies on it for
+	// stable ordering.
+	for i := 1; i < len(resp.Models); i++ {
+		if resp.Models[i-1] > resp.Models[i] {
+			t.Fatalf("catalog not sorted at index %d: %v", i, resp.Models[i-1:i+1])
+		}
+	}
+}
+
 func decodeModelsResponse(t *testing.T, rec *httptest.ResponseRecorder) []map[string]interface{} {
 	t.Helper()
 	var resp struct {

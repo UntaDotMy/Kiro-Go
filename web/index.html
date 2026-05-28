@@ -3293,7 +3293,11 @@
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.basic')) +
                 '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="' + prefix + 'KeyName" value="' + escape(v('name', '')) + '" placeholder="my-app"></div>' +
                 '<div class="form-group"><label>Account Group</label><input type="text" id="' + prefix + 'KeyGroup" value="' + escape(v('group', '')) + '" placeholder="premium (optional)"><small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Restricts this API key to Kiro accounts that include this group name in their Groups field. Leave empty to use all accounts. Set per-account groups in the Accounts tab.</small></div>' +
-                '<div class="form-group"><label>Allowed Models</label><input type="text" id="' + prefix + 'KeyModels" value="' + escape((Array.isArray(v(\'models\', [])) ? v(\'models\', []) : []).join(\', \')) + '" placeholder="claude-opus-4-7, claude-sonnet-4-5 (optional, default: all)"><small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Comma-separated list of model ids this key may invoke. Leave empty to allow every model. Dotted/dashed forms (claude-opus-4.7 ↔ claude-opus-4-7) match interchangeably; calls to disallowed models are rejected before any upstream account is touched, and /v1/models returns only the allowed entries when this key is used.</small></div>' +
+                '<div class="form-group"><label>Allowed Models</label>' +
+                '<div id="' + prefix + 'KeyModelsChecks" data-current="' + escape((Array.isArray(v(\'models\', [])) ? v(\'models\', []) : []).join(\',\')) + '" style="border:1px solid #e5e7eb;border-radius:6px;padding:8px;background:#fff;max-height:180px;overflow-y:auto;font-size:12px">Loading models…</div>' +
+                '<input type="text" id="' + prefix + 'KeyModelsExtra" value="" placeholder="extra ids not in the list, comma-separated (rare)" style="margin-top:6px;font-size:12px">' +
+                '<small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Tick the models this key may invoke. Default (none ticked) = all models allowed. Dotted/dashed forms (claude-opus-4.7 ↔ claude-opus-4-7) match interchangeably; calls to disallowed models are rejected before any upstream account is touched, and /v1/models returns only the allowed entries when this key is used. The extra-ids field is for models not yet in the catalog (e.g. preview ids).</small>' +
+                '</div>' +
                 '</div>' +
                 // Periodic
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.periodic')) +
@@ -3327,6 +3331,110 @@
                 '</div>'
             );
         }
+        // Catalog of every available model id, used to render the
+        // "Allowed Models" checkbox grid in the API key form. Cached for
+        // the page lifetime so opening multiple key dialogs doesn't
+        // re-hit /admin/api/available-models. Refreshed when the dialog
+        // is opened on a cold cache or after a manual reload.
+        let availableModelsCache = null;
+        async function fetchAvailableModels(force) {
+            if (availableModelsCache && !force) return availableModelsCache;
+            try {
+                const res = await fetch('/admin/api/available-models', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                availableModelsCache = Array.isArray(d.models) ? d.models : [];
+            } catch (e) {
+                availableModelsCache = [];
+            }
+            return availableModelsCache;
+        }
+        async function populateModelCheckboxes(prefix) {
+            const host = document.getElementById(prefix + 'KeyModelsChecks');
+            if (!host) return;
+            const currentRaw = host.getAttribute('data-current') || '';
+            // Selected ids the operator persisted; lowercased for the
+            // case-insensitive match against catalog ids.
+            const selected = new Set(currentRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+            const models = await fetchAvailableModels(false);
+            if (!models.length) {
+                host.innerHTML = '<div style="color:#94a3b8;padding:4px">No models in catalog yet — try saving and reopening once accounts have refreshed, or use the extra-ids field below.</div>';
+                return;
+            }
+            // The catalog includes both the canonical dashed form and the
+            // dotted Kiro alias for every model (Phase 1 dedup leaves them
+            // both in /v1/models). The whitelist matcher treats them as the
+            // same model, so showing both as separate checkboxes would
+            // double the rows. Collapse on the canonical (dot→dash) form.
+            const canonical = new Map();
+            for (const id of models) {
+                const key = id.toLowerCase().replace(/\./g, '-');
+                if (!canonical.has(key)) canonical.set(key, id);
+            }
+            // Detect "extra" ids the user previously had selected that
+            // aren't in the catalog — render them in the extra-ids
+            // textbox so they're not silently lost on save.
+            const catalogKeys = new Set(canonical.keys());
+            const extras = [];
+            for (const sel of selected) {
+                const k = sel.replace(/\./g, '-');
+                if (!catalogKeys.has(k)) extras.push(sel);
+            }
+            const extraInput = document.getElementById(prefix + 'KeyModelsExtra');
+            if (extraInput && extras.length > 0) extraInput.value = extras.join(', ');
+
+            // Quick "all / none" controls + the checkboxes themselves.
+            const ids = Array.from(canonical.values()).sort();
+            // Pre-tick rule: a stored id matches a displayed catalog id
+            // when their canonical forms are equal. Canonical = lowercase
+            // + every "." → "-" (mirrors the catalog dedup key built
+            // above and the request-time alias matcher in
+            // config.IsModelAllowedForAPIKey). Without this, a key
+            // persisted as "claude-opus-4.7" against a catalog row
+            // displayed as "claude-opus-4-7" rendered unchecked, and
+            // saving without other edits would silently strip the
+            // allowlist entry — a security regression.
+            const selectedCanon = new Set(
+                Array.from(selected).map(s => s.replace(/\./g, '-'))
+            );
+            let html = '<div style="display:flex;gap:8px;margin-bottom:6px;font-size:11px">' +
+                '<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 8px;font-size:11px" onclick="toggleAllModelChecks(\'' + prefix + '\', true)">Select all</button>' +
+                '<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 8px;font-size:11px" onclick="toggleAllModelChecks(\'' + prefix + '\', false)">Clear</button>' +
+                '<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 8px;font-size:11px" onclick="reloadModelCheckboxes(\'' + prefix + '\')" title="Re-fetch the catalog from the server (use after adding new Kiro accounts)">↻</button>' +
+                '<span style="color:#94a3b8">No selection = all allowed (default)</span></div>' +
+                '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:4px">';
+            for (const id of ids) {
+                const idCanon = id.toLowerCase().replace(/\./g, '-');
+                const checked = selectedCanon.has(idCanon);
+                html += '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">' +
+                    '<input type="checkbox" data-model-id="' + escapeHTML(id) + '"' + (checked ? ' checked' : '') + '>' +
+                    '<span style="font-family:monospace">' + escapeHTML(id) + '</span></label>';
+            }
+            html += '</div>';
+            host.innerHTML = html;
+        }
+        function toggleAllModelChecks(prefix, on) {
+            const host = document.getElementById(prefix + 'KeyModelsChecks');
+            if (!host) return;
+            host.querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = on; });
+        }
+        // reloadModelCheckboxes drops the cached catalog and re-renders the
+        // grid. Useful when the operator just added a Kiro account whose
+        // models weren't in the cache when the dialog opened.
+        async function reloadModelCheckboxes(prefix) {
+            availableModelsCache = null;
+            // Persist whatever was ticked + the extras textbox so the
+            // re-render restores them. populateModelCheckboxes reads
+            // data-current and the extras input as the source of truth.
+            const host = document.getElementById(prefix + 'KeyModelsChecks');
+            if (host) {
+                const ticked = Array.from(host.querySelectorAll('input[type=checkbox]:checked'))
+                    .map(cb => cb.getAttribute('data-model-id') || '').filter(Boolean);
+                const extra = (document.getElementById(prefix + 'KeyModelsExtra')?.value || '').trim();
+                const extras = extra === '' ? [] : extra.split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+                host.setAttribute('data-current', ticked.concat(extras).join(','));
+            }
+            await populateModelCheckboxes(prefix);
+        }
         function readApiKeyForm(prefix) {
             const tzVal = document.getElementById(prefix + 'KeyTZ').value || 'UTC';
             const periodVal = document.getElementById(prefix + 'KeyPeriod').value || 'daily';
@@ -3334,12 +3442,25 @@
             const expiresAt = expIso ? Math.floor(new Date(expIso).getTime() / 1000) : 0;
             const lazyDays = parseFloat(document.getElementById(prefix + 'KeyLazyDays').value) || 0;
             const lazyExpirySeconds = lazyDays > 0 ? Math.floor(lazyDays * 86400) : 0;
-            // Allowed-models input: split comma OR newline (operator may
-            // paste from the UI's models picker which uses newlines).
-            // Empty = no restriction (default: all models).
-            const modelsRaw = (document.getElementById(prefix + 'KeyModels').value || '').trim();
-            const models = modelsRaw === '' ? [] :
-                modelsRaw.split(/[,\n]/).map(s => s.trim()).filter(s => s.length > 0);
+            // Allowed-models input: collect ticked checkboxes from the
+            // catalog grid plus any "extra" ids in the secondary textbox
+            // (operators may pre-authorize models not yet in the cached
+            // catalog, e.g. preview names). Empty result = no
+            // restriction (default: all models allowed).
+            const checkHost = document.getElementById(prefix + 'KeyModelsChecks');
+            const ticked = checkHost
+                ? Array.from(checkHost.querySelectorAll('input[type=checkbox]:checked')).map(cb => cb.getAttribute('data-model-id') || '').filter(Boolean)
+                : [];
+            const extraRaw = (document.getElementById(prefix + 'KeyModelsExtra')?.value || '').trim();
+            const extra = extraRaw === '' ? [] : extraRaw.split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+            const seenModel = new Set();
+            const models = [];
+            for (const id of ticked.concat(extra)) {
+                const key = id.toLowerCase();
+                if (seenModel.has(key)) continue;
+                seenModel.add(key);
+                models.push(id);
+            }
             return {
                 name: document.getElementById(prefix + 'KeyName').value.trim(),
                 group: document.getElementById(prefix + 'KeyGroup').value.trim(),
@@ -3364,6 +3485,7 @@
             body.innerHTML = buildApiKeyForm('new', null) +
                 '<div class="modal-footer"><button class="btn btn-primary" onclick="submitCreateApiKey()">' + t('common.create') + '</button></div>';
             document.getElementById('addModal').classList.add('active');
+            populateModelCheckboxes('new');
         }
         async function submitCreateApiKey() {
             const payload = readApiKeyForm('new');
@@ -3397,6 +3519,7 @@
             body.innerHTML = buildApiKeyForm('ed', k) +
                 '<div class="modal-footer"><button class="btn btn-primary" onclick="submitEditApiKey(\'' + id + '\')">' + t('common.save') + '</button></div>';
             document.getElementById('addModal').classList.add('active');
+            populateModelCheckboxes('ed');
         }
         async function submitEditApiKey(id) {
             const payload = readApiKeyForm('ed');

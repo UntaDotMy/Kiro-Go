@@ -2594,6 +2594,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiDeleteAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
 	case path == "/modelstats" && r.Method == "GET":
 		h.apiGetModelStats(w, r)
+	case path == "/available-models" && r.Method == "GET":
+		h.apiGetAvailableModels(w, r)
 	case path == "/stats/totals" && r.Method == "GET":
 		h.apiGetStatsTotals(w, r)
 	case path == "/stats/history" && r.Method == "GET":

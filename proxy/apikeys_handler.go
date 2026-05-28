@@ -5,6 +5,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/stats"
 	"net/http"
+	"sort"
 	"strconv"
 )
 
@@ -162,6 +163,56 @@ func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
+}
+
+// apiGetAvailableModels returns the unfiltered model catalog the API key
+// editor should show as checkboxes. This is the same source /v1/models
+// uses BEFORE the per-key allowlist filter — the canonical Anthropic ids
+// (claude-opus-4-7) plus their dotted Kiro aliases (claude-opus-4.7),
+// deduplicated. The non-Claude aliases (auto / gpt-4o / gpt-4) are also
+// included because the runtime path translates them to Claude models, so
+// an operator may legitimately want to include or exclude them.
+//
+// Cold-start fallback applies: if the per-account model cache is empty
+// we serve fallbackAnthropicModels so the form has something to render
+// while a background refresh fills the cache.
+func (h *Handler) apiGetAvailableModels(w http.ResponseWriter, r *http.Request) {
+	thinkingSuffix := config.GetThinkingConfig().Suffix
+	h.modelsCacheMu.RLock()
+	cached := h.cachedModels
+	h.modelsCacheMu.RUnlock()
+	if len(cached) == 0 {
+		h.triggerModelsRefreshAsync()
+	}
+	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	if len(models) == 0 {
+		models = fallbackAnthropicModels(thinkingSuffix)
+	}
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			seen[id] = true
+		}
+	}
+	for _, alias := range []string{"auto", "gpt-4o", "gpt-4"} {
+		if seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
+	}
+	// Surface a flat list of ids — the form only needs the id strings,
+	// and the existing /v1/models response shape (full objects with
+	// owned_by, supportsImage, etc.) carries fields the checkbox form
+	// doesn't render. Keep the payload lean.
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	json.NewEncoder(w).Encode(map[string]interface{}{"models": ids})
 }
 
 // apiGetStatsTotals returns the persisted lifetime global counters loaded
