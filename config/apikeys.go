@@ -52,6 +52,15 @@ type APIKey struct {
 	LazyExpirySeconds int64    `json:"lazyExpirySeconds,omitempty"` // countdown from FirstUsedAt
 	Models            []string `json:"models,omitempty"`
 
+	// Group restricts this API key to Kiro accounts whose Groups list
+	// includes the named group. Empty = no restriction (any account is
+	// eligible). This is the per-API-key flavor of pool routing — the
+	// operator can set up a "premium" key that only routes to premium
+	// Kiro accounts, and a "free" key that only routes to a smaller pool,
+	// without the requesting client needing to know which model picks
+	// which pool.
+	Group string `json:"group,omitempty"`
+
 	// Periodic limits. Period defaults to daily (UTC midnight) for backward
 	// compatibility with pre-A13 keys.
 	ResetPeriod    string  `json:"resetPeriod,omitempty"` // "daily" | "weekly" | "monthly"
@@ -206,8 +215,11 @@ func GetAPIKeys() []APIKey {
 	return out
 }
 
-// AddAPIKey appends a new key with a freshly generated id+secret.
-func AddAPIKey(name string, models []string, reqLimit, tokLimit int, credLimit float64, expiresAt int64) (*APIKey, error) {
+// AddAPIKey appends a new key with a freshly generated id+secret. The
+// optional group string restricts which Kiro accounts the key can route
+// to (passed via per-key Group field). An empty group means no
+// restriction.
+func AddAPIKey(name string, models []string, reqLimit, tokLimit int, credLimit float64, expiresAt int64, group string) (*APIKey, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	secret, err := generateAPIKeySecret()
@@ -222,6 +234,7 @@ func AddAPIKey(name string, models []string, reqLimit, tokLimit int, credLimit f
 		CreatedAt:      time.Now().Unix(),
 		ExpiresAt:      expiresAt,
 		Models:         models,
+		Group:          strings.ToLower(strings.TrimSpace(group)),
 		DailyReqLimit:  reqLimit,
 		DailyTokLimit:  tokLimit,
 		DailyCredLimit: credLimit,
@@ -242,6 +255,7 @@ type UpdateAPIKeyOptions struct {
 	Name              *string
 	Enabled           *bool
 	Models            *[]string
+	Group             *string
 	ExpiresAt         *int64
 	LazyExpirySeconds *int64
 	ResetPeriod       *string
@@ -273,6 +287,11 @@ func UpdateAPIKey(id string, opts UpdateAPIKeyOptions) bool {
 		}
 		if opts.Models != nil {
 			k.Models = *opts.Models
+		}
+		if opts.Group != nil {
+			// Lowercase + trim so admin-typed casing matches account.Groups
+			// lookups (which use EqualFold via accountInGroup).
+			k.Group = strings.ToLower(strings.TrimSpace(*opts.Group))
 		}
 		if opts.ExpiresAt != nil {
 			k.ExpiresAt = *opts.ExpiresAt

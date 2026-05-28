@@ -1471,7 +1471,7 @@
                         data-i18n="settings.endpointFallbackHint"></small>
                 </div>
                 <div class="form-group">
-                    <label>AWS Region</label>
+                    <label>AWS Region (primary)</label>
                     <select id="kiroAPIRegion">
                         <option value="us-east-1">us-east-1 (N. Virginia, default)</option>
                         <option value="us-west-2">us-west-2 (Oregon)</option>
@@ -1481,7 +1481,12 @@
                         <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
                         <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
                     </select>
-                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">AWS region the Kiro/CodeWhisperer endpoints are built from. AWS rate-limits per (identity, region), so switching regions can dodge persistent 429s. Latency varies — pick the region nearest your users. Overridden by KIRO_API_REGION env var if set.</small>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Per research (jwadow/kiro-gateway #58): the codewhisperer.&lt;region&gt; hostname only resolves in us-east-1; outside us-east-1 we substitute runtime.&lt;region&gt;.kiro.dev. Q Developer (q.&lt;region&gt;) is verified working in us-east-1, eu-west-1, eu-central-1. Other regions may work but are unverified. Overridden by KIRO_API_REGION env.</small>
+                </div>
+                <div class="form-group">
+                    <label>Cross-region failover (optional)</label>
+                    <input type="text" id="kiroAPIRegions" placeholder="us-east-1, eu-west-1" style="width:100%">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Comma-separated AWS regions. When set, every endpoint in the first region is tried before any endpoint in the second, and so on — extra mitigation when the primary region throttles your entire pool. Empty = single-region (Primary above). Overridden by KIRO_API_REGIONS env. No competitor proxy does this; it is novel and unverified at scale, so use deliberately.</small>
                 </div>
                 <div class="form-group">
                     <label>Pool Strategy</label>
@@ -1500,17 +1505,6 @@
                 <div class="form-group"><label data-i18n="settings.newPassword"></label><input type="password"
                         id="newPassword" data-i18n-placeholder="settings.newPasswordPlaceholder"></div>
                 <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword"></button>
-            </div>
-            <div class="card">
-                <div class="card-header"><span class="card-title">Model Group Routing</span></div>
-                <p style="font-size:12px;color:#64748b;padding:0 0 12px">Map specific models to account groups. Accounts in the matching group serve those models exclusively. Accounts with no groups participate in every model (back-compat). Set per-account groups in the Accounts tab.</p>
-                <div id="modelGroupsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
-                <div style="display:flex;gap:8px;margin-bottom:8px">
-                    <input type="text" id="newModelGroupModel" placeholder="model id (e.g. claude-opus-4-7)" style="flex:1">
-                    <input type="text" id="newModelGroupGroup" placeholder="group name (e.g. premium)" style="flex:1">
-                    <button class="btn btn-secondary btn-sm" onclick="addModelGroupEntry()">Add</button>
-                </div>
-                <button class="btn btn-primary" onclick="saveModelGroups()">Save</button>
             </div>
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.proxySettings"></span></div>
@@ -3298,6 +3292,7 @@
                 // Basic
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.basic')) +
                 '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="' + prefix + 'KeyName" value="' + escape(v('name', '')) + '" placeholder="my-app"></div>' +
+                '<div class="form-group"><label>Account Group</label><input type="text" id="' + prefix + 'KeyGroup" value="' + escape(v('group', '')) + '" placeholder="premium (optional)"><small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Restricts this API key to Kiro accounts that include this group name in their Groups field. Leave empty to use all accounts. Set per-account groups in the Accounts tab.</small></div>' +
                 '</div>' +
                 // Periodic
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.periodic')) +
@@ -3340,6 +3335,7 @@
             const lazyExpirySeconds = lazyDays > 0 ? Math.floor(lazyDays * 86400) : 0;
             return {
                 name: document.getElementById(prefix + 'KeyName').value.trim(),
+                group: document.getElementById(prefix + 'KeyGroup').value.trim(),
                 resetPeriod: periodVal,
                 resetTZ: tzVal,
                 dailyReqLimit: parseInt(document.getElementById(prefix + 'KeyReqLim').value) || 0,
@@ -3480,7 +3476,6 @@
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
-            loadModelGroups();
             loadPromptFilter();
         }
         async function loadThinkingConfig() {
@@ -3498,60 +3493,6 @@
             const d = await res.json();
             if (d.success) { alert(t('settings.thinkingSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
-        // Model group routing — UI for configuring which models route to
-        // which account groups. The mapping is stored canonically server-side
-        // (lowercase, dot->dash, no thinking suffix); we display whatever
-        // the server returns and let it normalize on save.
-        let modelGroupsState = {};
-        async function loadModelGroups() {
-            try {
-                const res = await fetch('/admin/api/model-groups', { headers: { 'X-Admin-Password': password } });
-                const d = await res.json();
-                modelGroupsState = d.groups || {};
-                renderModelGroups();
-            } catch (e) { /* defensive */ }
-        }
-        function renderModelGroups() {
-            const el = document.getElementById('modelGroupsList');
-            if (!el) return;
-            const keys = Object.keys(modelGroupsState).sort();
-            if (keys.length === 0) {
-                el.innerHTML = '<div style="font-size:12px;color:#94a3b8;padding:8px 0">No mappings configured. Models without a mapping use the full pool.</div>';
-                return;
-            }
-            el.innerHTML = keys.map(k => {
-                const v = modelGroupsState[k];
-                return '<div style="display:flex;gap:8px;align-items:center"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:11px;flex:1">' + escapeHTML(k) + '</code><span style="font-size:11px;color:#64748b">→</span><code style="background:#e0e7ff;padding:2px 6px;border-radius:4px;font-size:11px;flex:1">' + escapeHTML(v) + '</code><button class="btn btn-sm btn-danger" style="padding:2px 8px;font-size:11px" onclick="removeModelGroup(\'' + k.replace(/'/g, "\\'") + '\')">×</button></div>';
-            }).join('');
-        }
-        function addModelGroupEntry() {
-            const m = (document.getElementById('newModelGroupModel').value || '').trim();
-            const g = (document.getElementById('newModelGroupGroup').value || '').trim();
-            if (!m || !g) {
-                alert('Both model and group are required.');
-                return;
-            }
-            modelGroupsState[m] = g;
-            document.getElementById('newModelGroupModel').value = '';
-            document.getElementById('newModelGroupGroup').value = '';
-            renderModelGroups();
-        }
-        function removeModelGroup(model) {
-            delete modelGroupsState[model];
-            renderModelGroups();
-        }
-        async function saveModelGroups() {
-            try {
-                const res = await fetch('/admin/api/model-groups', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                    body: JSON.stringify({ groups: modelGroupsState })
-                });
-                const d = await res.json();
-                if (d.success) { alert(t('common.saved') || 'Saved'); loadModelGroups(); }
-                else alert((t('common.saveFailed') || 'Save failed') + ': ' + d.error);
-            } catch (e) { alert('Save failed: ' + e.message); }
-        }
         async function loadEndpointConfig() {
             const res = await fetch('/admin/api/endpoint', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
@@ -3559,9 +3500,6 @@
             document.getElementById('endpointFallback').checked = d.endpointFallback !== false;
             const regionEl = document.getElementById('kiroAPIRegion');
             if (regionEl) {
-                // If the persisted region isn't in the dropdown's preset list,
-                // append it as an extra option so the form doesn't silently
-                // reset to us-east-1. Keeps custom / future regions visible.
                 const r = (d.region || 'us-east-1').toLowerCase();
                 if (!Array.from(regionEl.options).some(o => o.value === r)) {
                     const opt = document.createElement('option');
@@ -3570,6 +3508,10 @@
                     regionEl.appendChild(opt);
                 }
                 regionEl.value = r;
+            }
+            const regionsEl = document.getElementById('kiroAPIRegions');
+            if (regionsEl) {
+                regionsEl.value = Array.isArray(d.regions) ? d.regions.join(', ') : '';
             }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) {
@@ -3583,6 +3525,11 @@
             };
             const regionEl = document.getElementById('kiroAPIRegion');
             if (regionEl) body.region = regionEl.value;
+            const regionsEl = document.getElementById('kiroAPIRegions');
+            if (regionsEl) {
+                const raw = (regionsEl.value || '').trim();
+                body.regions = raw === '' ? [] : raw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+            }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) body.poolStrategy = stratEl.value;
             const res = await fetch('/admin/api/endpoint', {

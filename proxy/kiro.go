@@ -35,15 +35,34 @@ type kiroEndpoint struct {
 var kiroEndpointsOverride []kiroEndpoint
 
 // kiroEndpointsForRegion builds the endpoint chain for a specific AWS
-// region. Each call constructs three endpoints — Kiro IDE, CodeWhisperer,
-// AmazonQ — that share the same path but hit different AWS service hosts
-// or X-Amz-Target headers. AWS rate-limits per (identity, action), so a
-// 429 on one of these does NOT imply the others are also throttled — that
-// is why the per-account loop in CallKiroAPI tries each endpoint before
-// surfacing a QuotaError.
+// region. AWS rate-limits per (identity, action), so a 429 on one of
+// these does NOT imply the others are also throttled — that is why the
+// per-account loop in CallKiroAPI tries each endpoint before surfacing a
+// QuotaError.
 //
-// Region defaults to us-east-1 if empty so callers don't have to handle
-// the zero value.
+// Region defaults to us-east-1 if empty. Per research against jwadow
+// kiro-gateway issue #58 and source, the endpoint set is region-specific:
+//
+//   - "https://q.<region>.amazonaws.com/generateAssistantResponse"
+//     Works in us-east-1, eu-west-1, eu-central-1, and likely other Q
+//     Developer regions. Default Kiro IDE target.
+//
+//   - "https://codewhisperer.<region>.amazonaws.com/generateAssistantResponse"
+//     **Only resolves in us-east-1** — the codewhisperer.* hostname
+//     returns NXDOMAIN in every other region (jwadow #58). We skip this
+//     entry outside us-east-1 so we don't burn a network round-trip on
+//     a guaranteed DNS failure.
+//
+//   - "https://runtime.<region>.kiro.dev/generateAssistantResponse"
+//     Universal Kiro runtime hostname used by jwadow as a regional
+//     replacement for codewhisperer.*. Works in any region where Kiro
+//     is provisioned. We append this for non-us-east-1 regions so the
+//     three-endpoint chain stays full-length.
+//
+//   - q.<region>.amazonaws.com again with X-Amz-Target=AmazonQDeveloper-
+//     StreamingService.SendMessage.
+//
+// All three are tried per-request with auto-fallback on 429.
 func kiroEndpointsForRegion(region string) []kiroEndpoint {
 	if kiroEndpointsOverride != nil {
 		out := make([]kiroEndpoint, len(kiroEndpointsOverride))
@@ -53,35 +72,53 @@ func kiroEndpointsForRegion(region string) []kiroEndpoint {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return []kiroEndpoint{
+	endpoints := []kiroEndpoint{
 		{
 			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
 			AmzTarget: "",
 			Name:      "Kiro IDE",
 		},
-		{
+	}
+	if region == "us-east-1" {
+		// codewhisperer.* only resolves in us-east-1.
+		endpoints = append(endpoints, kiroEndpoint{
 			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
 			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			Name:      "CodeWhisperer",
-		},
-		{
-			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+		})
+	} else {
+		// Use the runtime.<region>.kiro.dev hostname as the regional
+		// replacement for codewhisperer.*.
+		endpoints = append(endpoints, kiroEndpoint{
+			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
-			AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-			Name:      "AmazonQ",
-		},
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "Kiro Runtime",
+		})
 	}
+	endpoints = append(endpoints, kiroEndpoint{
+		URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
+		Name:      "AmazonQ",
+	})
+	return endpoints
 }
 
 // kiroRESTBaseForRegion returns the REST base URL for usage / profile
-// queries in a specific region. Mirrors kiroEndpointsForRegion.
+// queries in a specific region. us-east-1 uses codewhisperer.<region>;
+// other regions fall back to runtime.<region>.kiro.dev because the
+// codewhisperer.* hostname doesn't resolve outside us-east-1.
 func kiroRESTBaseForRegion(region string) string {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return fmt.Sprintf("https://codewhisperer.%s.amazonaws.com", region)
+	if region == "us-east-1" {
+		return "https://codewhisperer.us-east-1.amazonaws.com"
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev", region)
 }
 
 // Streaming-call timeout knobs. We deliberately do NOT set
@@ -307,31 +344,74 @@ type KiroStreamCallback struct {
 
 // ==================== API Call ====================
 
-// getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
+// maxEndpointChain bounds the worst-case number of endpoints CallKiroAPI
+// will sequentially attempt for a single request. With one configured
+// region this is 3 (Kiro IDE / CodeWhisperer / AmazonQ); a multi-region
+// failover chain (KiroAPIRegions) multiplies that by region count. We
+// cap at 12 so a misconfigured 5-region list can't produce a 15-attempt
+// per-request stall — under responseHeaderTimeout=60s, 12 sequential
+// stuck handshakes is already 12 minutes worst-case, which is the
+// outer limit of "client will tolerate" for a single API call.
+const maxEndpointChain = 12
+
+// getSortedEndpoints returns endpoints ordered by user preference, with
+// optional fallback. When config.KiroAPIRegions is non-empty, the chain
+// expands across all listed regions in order: every endpoint in region[0]
+// is tried before any endpoint in region[1]. With auto-fallback off, only
+// the preferred endpoint in the primary region is used. The total chain
+// is capped at maxEndpointChain to prevent a misconfigured multi-region
+// list from producing per-request timeouts that exceed reasonable client
+// tolerance.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
-	region := config.GetKiroAPIRegion()
-	endpoints := kiroEndpointsForRegion(region)
+	regions := config.GetKiroAPIRegions()
+	if len(regions) == 0 {
+		regions = []string{config.GetKiroAPIRegion()}
+	}
 
+	var all []kiroEndpoint
+	for _, region := range regions {
+		regional := kiroEndpointsForRegion(region)
+		all = append(all, sortRegionalEndpoints(regional, preferred, fallback)...)
+		if !fallback {
+			break
+		}
+		if len(all) >= maxEndpointChain {
+			break
+		}
+	}
+	if len(all) > maxEndpointChain {
+		all = all[:maxEndpointChain]
+	}
+	return all
+}
+
+// sortRegionalEndpoints orders one region's endpoints by the preferred
+// service target, then any others. Returns just the preferred entry when
+// fallback is disabled.
+func sortRegionalEndpoints(endpoints []kiroEndpoint, preferred string, fallback bool) []kiroEndpoint {
 	var primary int
 	switch preferred {
 	case "kiro":
 		primary = 0
 	case "codewhisperer":
+		// Position 1 is CodeWhisperer-style (or the regional Kiro Runtime
+		// replacement) regardless of region.
 		primary = 1
 	case "amazonq":
 		primary = 2
 	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{endpoints[0], endpoints[1], endpoints[2]}
+		// "auto" — try in declared order.
+		out := make([]kiroEndpoint, len(endpoints))
+		copy(out, endpoints)
+		return out
 	}
-
+	if primary >= len(endpoints) {
+		primary = 0
+	}
 	if !fallback {
-		// No fallback: only use the selected endpoint
 		return []kiroEndpoint{endpoints[primary]}
 	}
-
-	// With fallback: selected first, then others in order
 	result := []kiroEndpoint{endpoints[primary]}
 	for i, ep := range endpoints {
 		if i != primary {

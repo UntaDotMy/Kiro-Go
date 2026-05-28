@@ -97,6 +97,7 @@ The setting takes effect immediately without restarting.
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
 | `LOG_LEVEL` | Log verbosity: `debug` / `info` / `warn` / `error` | `info` |
 | `KIRO_API_REGION` | AWS region for the Kiro/CodeWhisperer endpoints (e.g. `us-east-1`, `eu-west-1`, `ap-northeast-1`). Overrides the admin-UI setting. | `us-east-1` |
+| `KIRO_API_REGIONS` | Comma-separated cross-region failover list (e.g. `us-east-1,eu-west-1`). When set, the proxy tries every endpoint in the first region before falling through to the next region. Empty = single-region (`KIRO_API_REGION`). | - |
 | `KIRO_ALLOW_DEFAULT_PASSWORD` | Set to `1` to allow startup with the default password (not recommended in production) | - |
 | `KIRO_WS_ALLOW_ANY_ORIGIN` | Set to `1` to revert WebSocket Origin check to permissive (older A11 behaviour) | - |
 | `DATA_DIR` | (entrypoint) Path to chown to runtime UID/GID before drop | `/app/data` |

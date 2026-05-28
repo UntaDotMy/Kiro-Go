@@ -59,12 +59,13 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
-	// Groups assigns this account to one or more named pools. Combined with
-	// cfg.ModelGroups (model id -> group name), this lets the operator route
-	// specific models to specific accounts (e.g. premium accounts handle
-	// claude-opus-4-7 while free accounts handle claude-haiku-4-5). An
-	// account with no groups participates in every model's selection (the
-	// historical behavior). Group names are case-insensitive at lookup time.
+	// Groups assigns this Kiro account to one or more named pools. Combined
+	// with the per-API-key Group field (cfg.APIKey.Group), this lets the
+	// operator route specific keys to specific accounts (e.g. a "premium"
+	// API key only routes to accounts whose Groups list contains
+	// "premium"). An account with no groups participates in every group
+	// restriction (back-compat: existing setups without grouping keep
+	// working without changes). Group names are case-insensitive.
 	Groups []string `json:"groups,omitempty"`
 
 	// Priority weight for load balancing (higher = more requests)
@@ -166,6 +167,21 @@ type Config struct {
 	// are reasonable alternates.
 	KiroAPIRegion string `json:"kiroAPIRegion,omitempty"`
 
+	// KiroAPIRegions is the optional multi-region failover chain. When
+	// set, the endpoint loop will expand to try every region in this list
+	// before declaring all-endpoints-throttled. The first region in the
+	// list is the preferred / lowest-latency target; later regions are
+	// only hit if every endpoint in the prior region 429s. This is the
+	// "auto" mode mentioned in admin docs — empty = single-region
+	// (KiroAPIRegion), non-empty = cross-region failover.
+	//
+	// No competitor project documented in the field survey rotates
+	// regions on 429 — they only rotate accounts. We do this because AWS
+	// rate-limits per (identity, region), so a fresh region is the one
+	// remaining mitigation when an entire account pool is throttled in
+	// the primary region.
+	KiroAPIRegions []string `json:"kiroAPIRegions,omitempty"`
+
 	// PoolStrategy chooses how the account pool picks the next account for a
 	// request. Recognized values:
 	//
@@ -183,18 +199,6 @@ type Config struct {
 	// All strategies obey cooldowns and model-list filters identically;
 	// only the picker among the eligible subset differs.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
-
-	// ModelGroups maps a (canonical) model id to a group name. When a
-	// request comes in for a mapped model, the pool will only consider
-	// accounts whose Groups list includes the target group. Models without
-	// an entry fall through to the full pool — this preserves backward
-	// compatibility for existing deployments.
-	//
-	// Keys are stored in canonical form (lowercase, dot->dash, no thinking
-	// suffix) so the same model under different spellings routes to the
-	// same group. Use AddModelGroup / GetModelGroupForModel which handle
-	// canonicalization.
-	ModelGroups map[string]string `json:"modelGroups,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
@@ -988,119 +992,6 @@ func UpdateEndpointFallback(enabled bool) error {
 	return Save()
 }
 
-// canonicalModelKeyForGroups normalizes a model id to the form used as
-// the key in ModelGroups. Mirrors stats.CanonicalModelID's rules so the
-// same model recorded under "claude-opus-4.7" / "claude-opus-4-7" /
-// "claude-opus-4.7-thinking" all route to the same group.
-func canonicalModelKeyForGroups(model string) string {
-	s := strings.ToLower(strings.TrimSpace(model))
-	if s == "" {
-		return ""
-	}
-	s = strings.ReplaceAll(s, ".", "-")
-	for _, suffix := range []string{"-thinking", "-think", "-reasoning"} {
-		if strings.HasSuffix(s, suffix) {
-			s = strings.TrimSuffix(s, suffix)
-			break
-		}
-	}
-	return s
-}
-
-// GetModelGroupForModel returns the group name configured for the given
-// model, or "" if the model is not mapped (in which case the pool
-// considers all eligible accounts).
-func GetModelGroupForModel(model string) string {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || len(cfg.ModelGroups) == 0 {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSpace(cfg.ModelGroups[canonicalModelKeyForGroups(model)]))
-}
-
-// SetModelGroupForModel stores or clears (when group=="") a model->group
-// mapping. Empty model is a no-op.
-func SetModelGroupForModel(model, group string) error {
-	key := canonicalModelKeyForGroups(model)
-	if key == "" {
-		return nil
-	}
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	if cfg.ModelGroups == nil {
-		cfg.ModelGroups = make(map[string]string)
-	}
-	g := strings.ToLower(strings.TrimSpace(group))
-	if g == "" {
-		delete(cfg.ModelGroups, key)
-	} else {
-		cfg.ModelGroups[key] = g
-	}
-	return Save()
-}
-
-// ReplaceModelGroups atomically swaps the model->group mapping for the
-// supplied snapshot. Each key is canonicalized; entries with an empty
-// group string are dropped (matches SetModelGroupForModel's "empty =
-// delete" semantics). One cfgLock acquisition + one Save, so the admin
-// UI can no longer leave the disk in a hybrid state if a single
-// SetModelGroupForModel call fails part-way through a multi-entry edit.
-func ReplaceModelGroups(snapshot map[string]string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	next := make(map[string]string, len(snapshot))
-	for k, v := range snapshot {
-		key := canonicalModelKeyForGroups(k)
-		if key == "" {
-			continue
-		}
-		g := strings.ToLower(strings.TrimSpace(v))
-		if g == "" {
-			continue
-		}
-		next[key] = g
-	}
-	cfg.ModelGroups = next
-	return Save()
-}
-
-// GetModelGroups returns a copy of the current model->group map. Used by
-// the admin UI to render the configured routing rules.
-func GetModelGroups() map[string]string {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.ModelGroups == nil {
-		return map[string]string{}
-	}
-	out := make(map[string]string, len(cfg.ModelGroups))
-	for k, v := range cfg.ModelGroups {
-		out[k] = v
-	}
-	return out
-}
-
-// AccountInGroup reports whether the supplied account is a member of the
-// named group. An empty group always returns true (no restriction). An
-// account with no groups configured is considered universal — it
-// participates in every model's selection — to preserve historical
-// behavior for deployments that don't use grouping.
-func AccountInGroup(a Account, group string) bool {
-	g := strings.ToLower(strings.TrimSpace(group))
-	if g == "" {
-		return true
-	}
-	if len(a.Groups) == 0 {
-		return true
-	}
-	for _, ag := range a.Groups {
-		if strings.EqualFold(strings.TrimSpace(ag), g) {
-			return true
-		}
-	}
-	return false
-}
-
 // GetKiroAPIRegion returns the AWS region used to construct Kiro endpoints.
 // Resolution precedence:
 //
@@ -1137,6 +1028,96 @@ func UpdateKiroAPIRegion(region string) error {
 	defer cfgLock.Unlock()
 	cfg.KiroAPIRegion = strings.TrimSpace(region)
 	return Save()
+}
+
+// GetKiroAPIRegions returns the multi-region failover list. Resolution:
+//
+//  1. KIRO_API_REGIONS environment variable (comma-separated).
+//  2. cfg.KiroAPIRegions array.
+//  3. Empty (caller falls back to single-region GetKiroAPIRegion).
+//
+// Empty values, duplicates, and malformed regions are filtered out so
+// the env-var path matches the admin-handler contract — passing
+// "us-east-1, junk, eu-west-1" to KIRO_API_REGIONS yields
+// ["us-east-1","eu-west-1"] rather than carrying the invalid entry into
+// endpoint construction. First entry is preferred / lowest-latency;
+// later regions only get traffic on 429 from earlier regions.
+func GetKiroAPIRegions() []string {
+	var raw []string
+	if env := strings.TrimSpace(os.Getenv("KIRO_API_REGIONS")); env != "" {
+		raw = strings.Split(env, ",")
+	} else {
+		cfgLock.RLock()
+		if cfg != nil && len(cfg.KiroAPIRegions) > 0 {
+			raw = make([]string, len(cfg.KiroAPIRegions))
+			copy(raw, cfg.KiroAPIRegions)
+		}
+		cfgLock.RUnlock()
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		s := strings.ToLower(strings.TrimSpace(r))
+		if s == "" || seen[s] || !isValidAWSRegionShape(s) {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// UpdateKiroAPIRegions persists the multi-region failover list. An empty
+// slice clears it (single-region fallback to GetKiroAPIRegion). Invalid
+// entries (empty, duplicates, malformed) are dropped silently so the
+// stored list is always usable.
+func UpdateKiroAPIRegions(regions []string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	clean := make([]string, 0, len(regions))
+	seen := map[string]bool{}
+	for _, r := range regions {
+		s := strings.ToLower(strings.TrimSpace(r))
+		if s == "" || seen[s] || !isValidAWSRegionShape(s) {
+			continue
+		}
+		seen[s] = true
+		clean = append(clean, s)
+	}
+	cfg.KiroAPIRegions = clean
+	return Save()
+}
+
+// isValidAWSRegionShape mirrors the proxy-layer isValidAWSRegion check
+// but kept here so config doesn't depend on proxy. Cheap shape check —
+// "us-east-1", "eu-west-1", "us-gov-east-1" all pass; obvious typos and
+// unicode garbage don't.
+func isValidAWSRegionShape(s string) bool {
+	if len(s) < 9 || len(s) > 32 {
+		return false
+	}
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	if len(parts[0]) != 2 {
+		return false
+	}
+	for _, c := range parts[0] {
+		if c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	last := parts[len(parts)-1]
+	if len(last) == 0 {
+		return false
+	}
+	for _, c := range last {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // GetPoolStrategy returns the configured pool selection strategy. Empty /

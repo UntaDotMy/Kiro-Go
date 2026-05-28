@@ -253,18 +253,22 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 // config.GetPoolStrategy.
 var strategyResolver = func() string { return config.GetPoolStrategy() }
 
-// modelGroupResolver returns the group for a given model id. Indirection
-// via package-level variable lets unit tests configure model groups
-// without going through config; production points it at
-// config.GetModelGroupForModel.
-var modelGroupResolver = func(model string) string { return config.GetModelGroupForModel(model) }
-
-// SetModelGroupResolverForTesting replaces the resolver. Returns a
-// restore func; test caller is expected to defer the restore.
-func SetModelGroupResolverForTesting(fn func(model string) string) (restore func()) {
-	prev := modelGroupResolver
-	modelGroupResolver = fn
-	return func() { modelGroupResolver = prev }
+// accountInGroup reports whether the given account belongs to the named
+// group. Empty group is treated as "no restriction" by the caller; this
+// helper assumes group is non-empty and lower-cased. An account with no
+// Groups configured is universal — it participates in every grouped
+// call so existing deployments that don't use grouping keep working
+// without configuration changes.
+func accountInGroup(a config.Account, group string) bool {
+	if len(a.Groups) == 0 {
+		return true
+	}
+	for _, ag := range a.Groups {
+		if strings.EqualFold(strings.TrimSpace(ag), group) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetStrategyResolverForTesting replaces the strategy resolver so unit
@@ -304,7 +308,8 @@ func modelLookupKeys(modelID string) []string {
 	return keys
 }
 
-// GetNextForModel returns the next account that supports the requested model.
+// GetNextForModel returns the next account that supports the requested
+// model and belongs to the requested group.
 //
 //   - acc == nil, ok == false                 → no account configured at all
 //     (caller should return 503 / "No available accounts").
@@ -314,11 +319,22 @@ func modelLookupKeys(modelID string) []string {
 //   - acc != nil, ok == true                  → caller should proceed; the
 //     account is eligible and not cooling.
 //
-// model may be empty to skip the model-list filter. When non-empty, the
-// pool also consults cfg.ModelGroups: if the model maps to a group, only
-// accounts whose Groups includes that group are eligible. This is how
-// premium-vs-free routing is enforced.
+// model may be empty to skip the model-list filter. group may be empty
+// to skip the group filter. When non-empty, group restricts the pool to
+// accounts whose Groups list includes the named group; accounts with
+// empty Groups participate in every group-restricted call (back-compat
+// for deployments that don't use grouping). The group is supplied by the
+// per-API-key configuration: the handler resolves the inbound API key
+// to a group and passes it here.
 func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Duration, bool) {
+	return p.GetNextForModelInGroup(model, "")
+}
+
+// GetNextForModelInGroup is the group-aware variant of GetNextForModel.
+// New callers should use this directly; GetNextForModel is preserved as a
+// thin wrapper so existing call sites that don't yet thread an API-key
+// group don't have to change.
+func (p *AccountPool) GetNextForModelInGroup(model, group string) (*config.Account, time.Duration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -332,12 +348,7 @@ func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Durat
 	// Normalize once before the per-slot walk so accountHasModel doesn't pay
 	// strings.ToLower + TrimSpace per candidate.
 	modelKey := strings.ToLower(strings.TrimSpace(model))
-	// Resolve the model->group mapping once. Empty group means "no
-	// restriction" — every account is eligible for the group filter.
-	modelGroup := ""
-	if model != "" {
-		modelGroup = modelGroupResolver(model)
-	}
+	groupKey := strings.ToLower(strings.TrimSpace(group))
 
 	// SWRR walk over eligible slots only. We collect indices of slots that
 	// are currently eligible (model match, group match, no cooldown, token
@@ -348,7 +359,7 @@ func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Durat
 	var soonest time.Time
 	for i := range p.slots {
 		acc := &p.accounts[i]
-		if modelGroup != "" && !config.AccountInGroup(*acc, modelGroup) {
+		if groupKey != "" && !accountInGroup(*acc, groupKey) {
 			continue
 		}
 		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {

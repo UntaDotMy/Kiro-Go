@@ -563,6 +563,18 @@ func matchedAPIKeyID(r *http.Request) string {
 	return ""
 }
 
+// apiKeyGroup returns the Group field of the API key that authenticated
+// this request, or "" if no key is set or the key has no group. The pool
+// uses this to restrict eligible accounts; "" means no restriction.
+// Matches matchedAPIKeyID's nil-tolerant shape so unauthenticated paths
+// (legacy single-key, no key) just see no group restriction.
+func apiKeyGroup(r *http.Request) string {
+	if k, ok := r.Context().Value(apiKeyCtxKey{}).(*config.APIKey); ok && k != nil {
+		return k.Group
+	}
+	return ""
+}
+
 // enforceAPIKeyLimit is the pre-flight gate: if the request was authenticated
 // by a multi-key entry, run CheckAPIKeyLimit before we burn upstream quota.
 // Returns true when the request was rejected (429 already written).
@@ -1387,7 +1399,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 获取账号（按模型过滤，优先选支持该模型的账号）
 	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
+	account, retryAfter, ok := h.pool.GetNextForModelInGroup(actualModel, apiKeyGroup(r))
 	if !ok {
 		if retryAfter > 0 {
 			setRetryAfter(w, retryAfter)
@@ -2015,7 +2027,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 
 	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
+	account, retryAfter, ok := h.pool.GetNextForModelInGroup(actualModel, apiKeyGroup(r))
 	if !ok {
 		if retryAfter > 0 {
 			setRetryAfter(w, retryAfter)
@@ -2548,10 +2560,6 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiListAPIKeys(w, r)
 	case path == "/apikeys" && r.Method == "POST":
 		h.apiCreateAPIKey(w, r)
-	case path == "/model-groups" && r.Method == "GET":
-		h.apiGetModelGroups(w, r)
-	case path == "/model-groups" && r.Method == "POST":
-		h.apiUpdateModelGroups(w, r)
 	case strings.HasPrefix(path, "/apikeys/") && strings.HasSuffix(path, "/reveal") && r.Method == "GET":
 		// /apikeys/<id>/reveal — fetch the full secret for a copy-to-clipboard
 		// affordance. Same admin auth as everything else under /admin/api/*.
@@ -2736,8 +2744,8 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["groups"].([]interface{}); ok {
 		// JSON arrays decode to []interface{}; coerce to a clean []string,
 		// dropping non-strings, empties, and duplicates. Lowercase so the
-		// AccountInGroup compare is consistent regardless of casing chosen
-		// in the UI.
+		// pool's accountInGroup compare (EqualFold-based) is consistent
+		// regardless of casing chosen in the UI.
 		seen := map[string]bool{}
 		groups := make([]string, 0, len(v))
 		for _, raw := range v {
@@ -3797,6 +3805,7 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 		"preferredEndpoint": config.GetPreferredEndpoint(),
 		"endpointFallback":  config.GetEndpointFallback(),
 		"region":            config.GetKiroAPIRegion(),
+		"regions":           config.GetKiroAPIRegions(),
 		"poolStrategy":      config.GetPoolStrategy(),
 	})
 }
@@ -3804,10 +3813,11 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 // apiUpdateEndpointConfig 更新端点配置
 func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PreferredEndpoint string  `json:"preferredEndpoint"`
-		EndpointFallback  *bool   `json:"endpointFallback"`
-		Region            *string `json:"region,omitempty"`
-		PoolStrategy      *string `json:"poolStrategy,omitempty"`
+		PreferredEndpoint string    `json:"preferredEndpoint"`
+		EndpointFallback  *bool     `json:"endpointFallback"`
+		Region            *string   `json:"region,omitempty"`
+		Regions           *[]string `json:"regions,omitempty"`
+		PoolStrategy      *string   `json:"poolStrategy,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3833,10 +3843,6 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	if req.Region != nil {
-		// Validate region: AWS region names match `^[a-z]{2}-[a-z]+-\d+$`.
-		// We're permissive here — a wrong region just produces 4xx/5xx
-		// from AWS, which is recoverable, but reject obvious junk so the
-		// admin gets immediate feedback instead of opaque upstream errors.
 		region := strings.ToLower(strings.TrimSpace(*req.Region))
 		if region != "" && !isValidAWSRegion(region) {
 			w.WriteHeader(400)
@@ -3844,6 +3850,29 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if err := config.UpdateKiroAPIRegion(region); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.Regions != nil {
+		// Validate every region; reject the whole list if any entry is
+		// malformed so the operator gets immediate feedback.
+		clean := make([]string, 0, len(*req.Regions))
+		for _, raw := range *req.Regions {
+			s := strings.ToLower(strings.TrimSpace(raw))
+			if s == "" {
+				continue
+			}
+			if !isValidAWSRegion(s) {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid AWS region in failover list: " + s})
+				return
+			}
+			clean = append(clean, s)
+		}
+		if err := config.UpdateKiroAPIRegions(clean); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
