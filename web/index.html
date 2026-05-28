@@ -1470,6 +1470,28 @@
                     <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
                         data-i18n="settings.endpointFallbackHint"></small>
                 </div>
+                <div class="form-group">
+                    <label>AWS Region</label>
+                    <select id="kiroAPIRegion">
+                        <option value="us-east-1">us-east-1 (N. Virginia, default)</option>
+                        <option value="us-west-2">us-west-2 (Oregon)</option>
+                        <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                        <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+                        <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+                        <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+                        <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
+                    </select>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">AWS region the Kiro/CodeWhisperer endpoints are built from. AWS rate-limits per (identity, region), so switching regions can dodge persistent 429s. Latency varies — pick the region nearest your users. Overridden by KIRO_API_REGION env var if set.</small>
+                </div>
+                <div class="form-group">
+                    <label>Pool Strategy</label>
+                    <select id="poolStrategy">
+                        <option value="swr">Smooth Weighted Round-Robin (default)</option>
+                        <option value="least-used">Least-Used (drain freshest first)</option>
+                        <option value="random">Random</option>
+                    </select>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. SWR is the existing balanced rotation. Least-used naturally tilts traffic toward less-burned accounts when the pool is heterogeneous. Random is useful as a control or to break unintended request synchronisation.</small>
+                </div>
                 <button class="btn btn-primary" onclick="saveEndpointConfig()"
                     data-i18n="settings.saveEndpoint"></button>
             </div>
@@ -3495,11 +3517,37 @@
             const d = await res.json();
             document.getElementById('preferredEndpoint').value = d.preferredEndpoint || 'auto';
             document.getElementById('endpointFallback').checked = d.endpointFallback !== false;
+            const regionEl = document.getElementById('kiroAPIRegion');
+            if (regionEl) {
+                // If the persisted region isn't in the dropdown's preset list,
+                // append it as an extra option so the form doesn't silently
+                // reset to us-east-1. Keeps custom / future regions visible.
+                const r = (d.region || 'us-east-1').toLowerCase();
+                if (!Array.from(regionEl.options).some(o => o.value === r)) {
+                    const opt = document.createElement('option');
+                    opt.value = r;
+                    opt.textContent = r + ' (custom)';
+                    regionEl.appendChild(opt);
+                }
+                regionEl.value = r;
+            }
+            const stratEl = document.getElementById('poolStrategy');
+            if (stratEl) {
+                stratEl.value = d.poolStrategy || 'swr';
+            }
         }
         async function saveEndpointConfig() {
+            const body = {
+                preferredEndpoint: document.getElementById('preferredEndpoint').value,
+                endpointFallback: document.getElementById('endpointFallback').checked
+            };
+            const regionEl = document.getElementById('kiroAPIRegion');
+            if (regionEl) body.region = regionEl.value;
+            const stratEl = document.getElementById('poolStrategy');
+            if (stratEl) body.poolStrategy = stratEl.value;
             const res = await fetch('/admin/api/endpoint', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ preferredEndpoint: document.getElementById('preferredEndpoint').value, endpointFallback: document.getElementById('endpointFallback').checked })
+                body: JSON.stringify(body)
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.endpointSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }

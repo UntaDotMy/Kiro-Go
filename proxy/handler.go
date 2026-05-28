@@ -3752,14 +3752,18 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"preferredEndpoint": config.GetPreferredEndpoint(),
 		"endpointFallback":  config.GetEndpointFallback(),
+		"region":            config.GetKiroAPIRegion(),
+		"poolStrategy":      config.GetPoolStrategy(),
 	})
 }
 
 // apiUpdateEndpointConfig 更新端点配置
 func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PreferredEndpoint string `json:"preferredEndpoint"`
-		EndpointFallback  *bool  `json:"endpointFallback"`
+		PreferredEndpoint string  `json:"preferredEndpoint"`
+		EndpointFallback  *bool   `json:"endpointFallback"`
+		Region            *string `json:"region,omitempty"`
+		PoolStrategy      *string `json:"poolStrategy,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3784,7 +3788,73 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		config.UpdateEndpointFallback(*req.EndpointFallback)
 	}
 
+	if req.Region != nil {
+		// Validate region: AWS region names match `^[a-z]{2}-[a-z]+-\d+$`.
+		// We're permissive here — a wrong region just produces 4xx/5xx
+		// from AWS, which is recoverable, but reject obvious junk so the
+		// admin gets immediate feedback instead of opaque upstream errors.
+		region := strings.ToLower(strings.TrimSpace(*req.Region))
+		if region != "" && !isValidAWSRegion(region) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid AWS region (expected like 'us-east-1', 'eu-west-1', 'ap-northeast-1')"})
+			return
+		}
+		if err := config.UpdateKiroAPIRegion(region); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.PoolStrategy != nil {
+		strat := strings.ToLower(strings.TrimSpace(*req.PoolStrategy))
+		validStrats := map[string]bool{"": true, "swr": true, "least-used": true, "random": true}
+		if !validStrats[strat] {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid poolStrategy, must be: swr, least-used, or random"})
+			return
+		}
+		if err := config.UpdatePoolStrategy(strat); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// isValidAWSRegion does a cheap shape check: two lowercase letters, dash,
+// 1-2 lowercase region segments, dash, digits. Doesn't enforce the full
+// list of real regions because AWS adds new ones routinely; we just reject
+// obvious typos.
+func isValidAWSRegion(s string) bool {
+	if len(s) < 9 || len(s) > 32 {
+		return false
+	}
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	// First part: 2 letters (us, eu, ap, ca, sa, af, me).
+	if len(parts[0]) != 2 {
+		return false
+	}
+	for _, c := range parts[0] {
+		if c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	// Last part: digits only.
+	if len(parts[len(parts)-1]) == 0 {
+		return false
+	}
+	for _, c := range parts[len(parts)-1] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // applyProxyConfig 将代理配置应用到所有出站 HTTP 客户端（Kiro API + auth 模块）

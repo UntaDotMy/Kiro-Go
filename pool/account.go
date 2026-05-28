@@ -247,6 +247,21 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 	return false
 }
 
+// strategyResolver returns the active pool selection strategy. Indirection
+// via a package-level variable lets tests override the strategy without
+// having to bring up a full config; production code points it at
+// config.GetPoolStrategy.
+var strategyResolver = func() string { return config.GetPoolStrategy() }
+
+// SetStrategyResolverForTesting replaces the strategy resolver so unit
+// tests can drive each branch of the picker without going through config.
+// Tests are expected to restore the previous resolver in a defer.
+func SetStrategyResolverForTesting(fn func() string) (restore func()) {
+	prev := strategyResolver
+	strategyResolver = fn
+	return func() { strategyResolver = prev }
+}
+
 var modelRouteAliases = map[string][]string{
 	"claude-opus-4-7":   {"claude-opus-4.7"},
 	"claude-opus-4.7":   {"claude-opus-4-7"},
@@ -335,20 +350,56 @@ func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Durat
 		return nil, 0, false
 	}
 
-	// SWRR pick among the eligible subset.
-	totalEligibleWeight := 0
-	for _, i := range eligible {
-		totalEligibleWeight += p.slots[i].effectiveWeight
-	}
-
-	winner := eligible[0]
-	for _, i := range eligible {
-		p.slots[i].currentWeight += p.slots[i].effectiveWeight
-		if p.slots[i].currentWeight > p.slots[winner].currentWeight {
-			winner = i
+	// Strategy dispatch among the eligible subset. The default is SWRR
+	// (smooth weighted round-robin) — see the package comment for why we
+	// prefer it over plain RR for AWS-identity-bound traffic. The other
+	// strategies trade SWRR's interleaving guarantee for either per-account
+	// "freshness" weighting (least-used) or pure jitter (random); both can
+	// help when the pool is heterogeneous (mixed quotas) or when the
+	// operator wants to break a synchronisation that SWRR alone can't.
+	winner := -1
+	switch strategyResolver() {
+	case "least-used":
+		// Pick the eligible account with the lowest RequestCount. When
+		// counts tie, fall back to LastUsed (older = preferred) so we
+		// drain freshly-added accounts before re-hitting the pool's
+		// long-tenured ones. This naturally tilts traffic toward less
+		// burned accounts without needing an explicit weight.
+		bestReq := -1
+		var bestLastUsed int64
+		for _, i := range eligible {
+			rc := p.accounts[i].RequestCount
+			lu := p.accounts[i].LastUsed
+			if winner == -1 || rc < bestReq || (rc == bestReq && lu < bestLastUsed) {
+				winner = i
+				bestReq = rc
+				bestLastUsed = lu
+			}
 		}
+	case "random":
+		// Uniform random pick among eligible — useful as a control or to
+		// break unintended synchronisation.
+		winner = eligible[rand.Intn(len(eligible))]
+	default:
+		// SWRR (smooth weighted round-robin) — original behavior. Each
+		// pick adds the effective weight to every eligible slot's running
+		// counter, picks the slot with the highest counter, then subtracts
+		// the total eligible weight from the winner. With weights
+		// {a:5, b:1, c:1} this produces a,a,b,a,c,a,a instead of bursting
+		// a,a,a,a,a then b then c.
+		totalEligibleWeight := 0
+		for _, i := range eligible {
+			totalEligibleWeight += p.slots[i].effectiveWeight
+		}
+		winner = eligible[0]
+		for _, i := range eligible {
+			p.slots[i].currentWeight += p.slots[i].effectiveWeight
+			if p.slots[i].currentWeight > p.slots[winner].currentWeight {
+				winner = i
+			}
+		}
+		p.slots[winner].currentWeight -= totalEligibleWeight
 	}
-	p.slots[winner].currentWeight -= totalEligibleWeight
 
 	// Return a copy so the caller can't mutate pool state through the pointer.
 	accCopy := p.accounts[winner]

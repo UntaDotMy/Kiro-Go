@@ -29,25 +29,59 @@ type kiroEndpoint struct {
 	Name      string
 }
 
-var kiroEndpoints = []kiroEndpoint{
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "",
-		Name:      "Kiro IDE",
-	},
-	{
-		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-		Name:      "CodeWhisperer",
-	},
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-		Name:      "AmazonQ",
-	},
+// kiroEndpointsOverride, when non-nil, replaces the result of
+// kiroEndpointsForRegion. Set only by tests via swapKiroEndpoints; production
+// code never touches it.
+var kiroEndpointsOverride []kiroEndpoint
+
+// kiroEndpointsForRegion builds the endpoint chain for a specific AWS
+// region. Each call constructs three endpoints — Kiro IDE, CodeWhisperer,
+// AmazonQ — that share the same path but hit different AWS service hosts
+// or X-Amz-Target headers. AWS rate-limits per (identity, action), so a
+// 429 on one of these does NOT imply the others are also throttled — that
+// is why the per-account loop in CallKiroAPI tries each endpoint before
+// surfacing a QuotaError.
+//
+// Region defaults to us-east-1 if empty so callers don't have to handle
+// the zero value.
+func kiroEndpointsForRegion(region string) []kiroEndpoint {
+	if kiroEndpointsOverride != nil {
+		out := make([]kiroEndpoint, len(kiroEndpointsOverride))
+		copy(out, kiroEndpointsOverride)
+		return out
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+	return []kiroEndpoint{
+		{
+			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "",
+			Name:      "Kiro IDE",
+		},
+		{
+			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "CodeWhisperer",
+		},
+		{
+			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
+			Name:      "AmazonQ",
+		},
+	}
+}
+
+// kiroRESTBaseForRegion returns the REST base URL for usage / profile
+// queries in a specific region. Mirrors kiroEndpointsForRegion.
+func kiroRESTBaseForRegion(region string) string {
+	if region == "" {
+		region = "us-east-1"
+	}
+	return fmt.Sprintf("https://codewhisperer.%s.amazonaws.com", region)
 }
 
 // Streaming-call timeout knobs. We deliberately do NOT set
@@ -276,6 +310,8 @@ type KiroStreamCallback struct {
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
+	region := config.GetKiroAPIRegion()
+	endpoints := kiroEndpointsForRegion(region)
 
 	var primary int
 	switch preferred {
@@ -287,17 +323,17 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 		primary = 2
 	default:
 		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		return []kiroEndpoint{endpoints[0], endpoints[1], endpoints[2]}
 	}
 
 	if !fallback {
 		// No fallback: only use the selected endpoint
-		return []kiroEndpoint{kiroEndpoints[primary]}
+		return []kiroEndpoint{endpoints[primary]}
 	}
 
 	// With fallback: selected first, then others in order
-	result := []kiroEndpoint{kiroEndpoints[primary]}
-	for i, ep := range kiroEndpoints {
+	result := []kiroEndpoint{endpoints[primary]}
+	for i, ep := range endpoints {
 		if i != primary {
 			result = append(result, ep)
 		}

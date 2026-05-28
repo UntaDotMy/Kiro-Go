@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -136,12 +137,44 @@ type Config struct {
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
-	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
+	// PreferredEndpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
 	// EndpointFallback controls whether to try other endpoints when the preferred one fails.
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
+
+	// KiroAPIRegion is the AWS region used when constructing the streaming +
+	// REST endpoints (e.g. "us-east-1", "eu-west-1"). Defaults to "us-east-1"
+	// to preserve historical behavior. The KIRO_API_REGION environment variable
+	// overrides this if set, so docker users can rotate regions without
+	// editing config.json.
+	//
+	// AWS rate-limits per (identity, region) — moving traffic to a different
+	// region is one of the few mitigations that genuinely reduces 429s when
+	// the operator has a shared identity (e.g. one Builder ID across many
+	// accounts). It also impacts latency: us-east-1 is fastest from the US
+	// East coast and will be slow from APAC; eu-west-1 / ap-northeast-1
+	// are reasonable alternates.
+	KiroAPIRegion string `json:"kiroAPIRegion,omitempty"`
+
+	// PoolStrategy chooses how the account pool picks the next account for a
+	// request. Recognized values:
+	//
+	//   "swr" / ""       — smooth weighted round-robin (default; existing
+	//                      behavior). Best for evenly weighted pools and
+	//                      operators who want predictable interleaving.
+	//   "least-used"     — pick the eligible account with the lowest
+	//                      RequestCount (lifetime) so traffic naturally
+	//                      tilts toward fresher / less-burned accounts.
+	//                      Useful when accounts have heterogeneous quota
+	//                      and you want to drain the freshest first.
+	//   "random"         — uniform random pick among eligible accounts.
+	//                      Cheap, jitter-friendly, useful as a control.
+	//
+	// All strategies obey cooldowns and model-list filters identically;
+	// only the picker among the eligible subset differs.
+	PoolStrategy string `json:"poolStrategy,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
@@ -932,6 +965,72 @@ func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
+	return Save()
+}
+
+// GetKiroAPIRegion returns the AWS region used to construct Kiro endpoints.
+// Resolution precedence:
+//
+//  1. KIRO_API_REGION environment variable (if set + non-empty).
+//  2. cfg.KiroAPIRegion from config.json (if set + non-empty).
+//  3. "us-east-1" hard default.
+//
+// We sniff the env var live (not at startup) so the operator can rotate the
+// region by editing the env in their compose file and restarting; we don't
+// require the proxy to be aware of init-time vs runtime overrides.
+//
+// Region strings are lowercased + trimmed to be tolerant of operator typos
+// like "  US-East-1  " from a copy-pasted dashboard URL.
+func GetKiroAPIRegion() string {
+	if envRegion := strings.ToLower(strings.TrimSpace(os.Getenv("KIRO_API_REGION"))); envRegion != "" {
+		return envRegion
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg != nil {
+		region := strings.ToLower(strings.TrimSpace(cfg.KiroAPIRegion))
+		if region != "" {
+			return region
+		}
+	}
+	return "us-east-1"
+}
+
+// UpdateKiroAPIRegion persists the region setting. Empty string clears the
+// override and falls back to env / default. Caller is responsible for
+// reinitializing any region-dependent state (handler endpoint cache, etc.).
+func UpdateKiroAPIRegion(region string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.KiroAPIRegion = strings.TrimSpace(region)
+	return Save()
+}
+
+// GetPoolStrategy returns the configured pool selection strategy. Empty /
+// unrecognized values map to "swr". See cfg.PoolStrategy for the full menu.
+func GetPoolStrategy() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return "swr"
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.PoolStrategy)) {
+	case "least-used", "leastused", "least_used":
+		return "least-used"
+	case "random":
+		return "random"
+	default:
+		return "swr"
+	}
+}
+
+// UpdatePoolStrategy persists the pool strategy setting. Caller should call
+// pool.Reload() if they want the change to take effect mid-run; otherwise
+// the next pool selection picks up the new value via GetPoolStrategy.
+func UpdatePoolStrategy(strategy string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PoolStrategy = strings.TrimSpace(strategy)
 	return Save()
 }
 
