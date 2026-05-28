@@ -70,6 +70,10 @@ type Handler struct {
 	// Per-account debounce for lazy quota refresh after a request completes.
 	refreshDebounceMu sync.Mutex
 	refreshScheduled  map[string]bool
+	// dashboardHub fans realtime status updates to subscribed admin
+	// dashboards (see proxy/dashboard_ws.go). Initialized in NewHandler;
+	// nil-safe because broadcastDashboardUpdate guards against nil.
+	dashboardHub *dashboardHub
 }
 
 type thinkingStreamSource int
@@ -299,6 +303,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		dashboardHub:    newDashboardHub(),
 	}
 	// 启动后台刷新
 	safeGo("backgroundRefresh", h.backgroundRefresh)
@@ -406,6 +411,8 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 			logger.Infof("[AutoDisable] Account %s enabled-state flipped on refresh (current=%.1f/%.1f trial=%.1f/%.1f)",
 				redactForLog(acc.Email), info.UsageCurrent, info.UsageLimit, info.TrialUsageCurrent, info.TrialUsageLimit)
 		}
+		// Credit / quota numbers just changed — push to dashboards.
+		h.broadcastDashboardUpdate()
 	})
 }
 
@@ -653,6 +660,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
+	case path == "/admin/ws/status":
+		// Realtime dashboard push. The WS handshake carries the admin
+		// password in Sec-WebSocket-Protocol because browsers can't set
+		// custom headers on the upgrade. Auth is verified inside the
+		// handler with constant-time compare; this route bypasses the
+		// header-based admin middleware on purpose.
+		h.handleDashboardWS(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)
 	case strings.HasPrefix(path, "/admin/"):
@@ -1821,6 +1835,9 @@ func (h *Handler) recordSuccess(model, apiKeyID string, inputTokens, outputToken
 		atomic.LoadInt64(&h.totalTokens),
 		h.getCredits(),
 	)
+	// Realtime push to subscribed dashboards. Best-effort, non-blocking;
+	// see broadcastDashboardUpdate for the slow-consumer policy.
+	h.broadcastDashboardUpdate()
 }
 
 // apiKeyIDForLog returns "-" when no key is associated, so the log line is
@@ -1836,6 +1853,7 @@ func (h *Handler) recordFailure(model, apiKeyID string) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 	stats.Record(model, apiKeyID, false, 0, 0, 0)
+	h.broadcastDashboardUpdate()
 }
 
 // checkOverageError 检测 402 超额错误，自动关闭对应账号的超额使用

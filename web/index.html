@@ -2561,70 +2561,20 @@
         async function loadStats() {
             const res = await fetch('/admin/api/status', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
+            // Delegate to the shared renderer so push and poll paths agree
+            // on every tile. renderStatusFromObject is defined further down
+            // alongside the WS plumbing; calling order works because both
+            // exist by the time loadStats fires (DOM-ready handler runs
+            // after script parse).
+            try { renderStatusFromObject(d); return; } catch (e) {}
+            // Fallback (shouldn't normally hit) — original inline render to
+            // keep the dashboard alive even if the renderer throws.
             document.getElementById('statAccounts').textContent = d.accounts || 0;
             document.getElementById('statAvailable').textContent = (d.available !== undefined ? d.available : (d.accounts || 0));
             document.getElementById('statRequests').textContent = d.totalRequests || 0;
             document.getElementById('statSuccess').textContent = d.successRequests || 0;
             document.getElementById('statFailed').textContent = d.failedRequests || 0;
             document.getElementById('statTokens').textContent = formatNum(d.totalTokens || 0);
-
-            const total = d.totalRequests || 0;
-            const ok = d.successRequests || 0;
-            const rate = total > 0 ? (ok / total * 100) : 0;
-            document.getElementById('statSuccessRate').textContent = total > 0 ? rate.toFixed(1) + '%' : '-';
-
-            // "Credits Used" and "Credits Total" come straight from Kiro's
-            // account-info endpoint (each account.UsageCurrent / UsageLimit,
-            // summed across all configured accounts). This is the only
-            // account-true number — it tells you what Kiro itself thinks
-            // you've spent and what your subscription cap is, so you always
-            // know how much is left.
-            //
-            // We prefer the *active* aggregate (enabled accounts only) so
-            // disabling an account immediately stops its credits from
-            // counting toward the live dashboard tile. Falls back to the
-            // total aggregate if the server didn't supply the active fields
-            // (older API), and finally to the per-account list.
-            //
-            // The proxy refreshes Kiro's account-info ~3 seconds after each
-            // request (lazy debounced refresh) plus a global tick every
-            // 30 minutes, so the displayed number lags real life by at most
-            // a few seconds during active use. The proxy's in-memory
-            // run-time counter (d.totalCredits) is shown as a separate "live"
-            // value and is only used as a fallback when accounts haven't
-            // been refreshed yet (fresh process before the first refresh).
-            let limitSum = 0, currentSum = 0;
-            if (typeof d.activeQuotaTotal === 'number' && d.activeQuotaTotal > 0) {
-                limitSum = d.activeQuotaTotal;
-                currentSum = typeof d.activeQuotaUsed === 'number' ? d.activeQuotaUsed : 0;
-            } else if (typeof d.quotaTotal === 'number' && d.quotaTotal > 0) {
-                limitSum = d.quotaTotal;
-                currentSum = typeof d.quotaUsed === 'number' ? d.quotaUsed : 0;
-            } else if (Array.isArray(accountsData)) {
-                for (const a of accountsData) {
-                    if (a.enabled === false) continue;
-                    if (typeof a.usageLimit === 'number') limitSum += a.usageLimit;
-                    if (typeof a.usageCurrent === 'number') currentSum += a.usageCurrent;
-                }
-            }
-
-            // Real Kiro number first (currentSum). Fall back to proxy run-time
-            // counter only if accounts haven't been polled yet.
-            const usedDisplay = currentSum > 0 ? currentSum : (d.totalCredits || 0);
-            document.getElementById('statCredits').textContent = usedDisplay.toFixed(1);
-
-            document.getElementById('statCreditsTotal').textContent = limitSum > 0 ? limitSum.toFixed(0) : '-';
-            const remaining = Math.max(0, limitSum - currentSum);
-            const remainingEl = document.getElementById('statCreditsRemaining');
-            if (limitSum > 0) {
-                const pct = (currentSum / limitSum * 100);
-                remainingEl.textContent = t('stats.creditsRemaining') + ': ' + remaining.toFixed(0) + ' (' + pct.toFixed(0) + '% used)';
-            } else {
-                remainingEl.textContent = '';
-            }
-
-            const up = d.uptime || 0;
-            document.getElementById('statUptime').textContent = formatUptime(up);
         }
         function formatUptime(secs) {
             if (!secs || secs <= 0) return '-';
@@ -4064,10 +4014,108 @@
                 } else alert(t('common.failed') + ': ' + d.error);
             }
         }
-        // Poll every 3 seconds while the dashboard is open so the live
-        // counters (Requests / Tokens / Credits) feel real-time after each
-        // request. Was 10 s before A20.
-        setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 3000);
+        // Realtime status push via WebSocket (preferred), with polling
+        // fallback. The WS handler authenticates via Sec-WebSocket-Protocol
+        // because browsers cannot set custom headers on WS upgrades — we
+        // pass the admin password as a subprotocol token and the server
+        // echoes it back on accept. If the WS errors out (proxy in front
+        // strips upgrades, server lacks the route, etc.), we fall back to
+        // 3-second polling so the dashboard still updates.
+        let dashboardWS = null;
+        let dashboardWSReconnect = null;
+        let dashboardPollFallback = null;
+        function applyStatusSnapshot(d) {
+            try { renderStatusFromObject(d); } catch (e) { /* defensive */ }
+        }
+        function renderStatusFromObject(d) {
+            document.getElementById('statAccounts').textContent = d.accounts || 0;
+            document.getElementById('statAvailable').textContent = (d.available !== undefined ? d.available : (d.accounts || 0));
+            document.getElementById('statRequests').textContent = d.totalRequests || 0;
+            document.getElementById('statSuccess').textContent = d.successRequests || 0;
+            document.getElementById('statFailed').textContent = d.failedRequests || 0;
+            document.getElementById('statTokens').textContent = formatNum(d.totalTokens || 0);
+            const total = d.totalRequests || 0;
+            const ok = d.successRequests || 0;
+            const rate = total > 0 ? (ok / total * 100) : 0;
+            document.getElementById('statSuccessRate').textContent = total > 0 ? rate.toFixed(1) + '%' : '-';
+            let limitSum = 0, currentSum = 0;
+            if (typeof d.activeQuotaTotal === 'number' && d.activeQuotaTotal > 0) {
+                limitSum = d.activeQuotaTotal;
+                currentSum = typeof d.activeQuotaUsed === 'number' ? d.activeQuotaUsed : 0;
+            } else if (typeof d.quotaTotal === 'number' && d.quotaTotal > 0) {
+                limitSum = d.quotaTotal;
+                currentSum = typeof d.quotaUsed === 'number' ? d.quotaUsed : 0;
+            } else if (Array.isArray(accountsData)) {
+                for (const a of accountsData) {
+                    if (a.enabled === false) continue;
+                    if (typeof a.usageLimit === 'number') limitSum += a.usageLimit;
+                    if (typeof a.usageCurrent === 'number') currentSum += a.usageCurrent;
+                }
+            }
+            const usedDisplay = currentSum > 0 ? currentSum : (d.totalCredits || 0);
+            document.getElementById('statCredits').textContent = usedDisplay.toFixed(1);
+            document.getElementById('statCreditsTotal').textContent = limitSum > 0 ? limitSum.toFixed(0) : '-';
+            const remaining = Math.max(0, limitSum - currentSum);
+            const remainingEl = document.getElementById('statCreditsRemaining');
+            if (limitSum > 0) {
+                const pct = (currentSum / limitSum * 100);
+                remainingEl.textContent = t('stats.creditsRemaining') + ': ' + remaining.toFixed(0) + ' (' + pct.toFixed(0) + '% used)';
+            } else {
+                remainingEl.textContent = '';
+            }
+            const up = d.uptime || 0;
+            document.getElementById('statUptime').textContent = formatUptime(up);
+        }
+        function startDashboardWS() {
+            if (!password) return;
+            try {
+                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const url = proto + '//' + location.host + '/admin/ws/status';
+                // Subprotocol must be a token (no comma, no whitespace).
+                // We pass the admin password after the prefix; the server
+                // verifies it with constant-time compare and echoes the
+                // matching subprotocol back to complete the handshake.
+                const ws = new WebSocket(url, ['admin-password.' + password]);
+                dashboardWS = ws;
+                ws.onmessage = (ev) => {
+                    if (document.getElementById('mainPage').classList.contains('hidden')) return;
+                    try {
+                        const data = JSON.parse(ev.data);
+                        applyStatusSnapshot(data);
+                    } catch (e) { /* ignore malformed frame */ }
+                };
+                ws.onclose = () => {
+                    dashboardWS = null;
+                    // Reconnect with backoff. If the server is down or auth
+                    // changed, the polling fallback keeps the dashboard alive.
+                    if (dashboardWSReconnect) clearTimeout(dashboardWSReconnect);
+                    dashboardWSReconnect = setTimeout(startDashboardWS, 5000);
+                    ensurePollFallback();
+                };
+                ws.onerror = () => {
+                    // onclose handles cleanup; just trigger fallback so the
+                    // dashboard stays current while the WS retries.
+                    ensurePollFallback();
+                };
+            } catch (e) {
+                ensurePollFallback();
+            }
+        }
+        function ensurePollFallback() {
+            if (dashboardPollFallback) return;
+            dashboardPollFallback = setInterval(() => {
+                if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats();
+            }, 3000);
+        }
+        // Wait until the user authenticates (password set) before opening
+        // the WS. main.html stores password in a module-level var; we hook
+        // here at the end-of-script so the var is defined.
+        setTimeout(() => { if (password) startDashboardWS(); }, 0);
+        // Polling fallback is always armed at a coarser cadence — even if
+        // the WS is healthy, polling every 10 s catches anything the push
+        // path forgot (e.g. account enable toggled via direct API call
+        // without going through broadcastDashboardUpdate).
+        setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
 
         // ==================== 版本检查 ====================
         let currentVersion = '';
