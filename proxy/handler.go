@@ -2548,6 +2548,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiListAPIKeys(w, r)
 	case path == "/apikeys" && r.Method == "POST":
 		h.apiCreateAPIKey(w, r)
+	case path == "/model-groups" && r.Method == "GET":
+		h.apiGetModelGroups(w, r)
+	case path == "/model-groups" && r.Method == "POST":
+		h.apiUpdateModelGroups(w, r)
 	case strings.HasPrefix(path, "/apikeys/") && strings.HasSuffix(path, "/reveal") && r.Method == "GET":
 		// /apikeys/<id>/reveal — fetch the full secret for a copy-to-clipboard
 		// affordance. Same admin auth as everything else under /admin/api/*.
@@ -2610,6 +2614,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"allowOverage":      a.AllowOverage,
 			"overageWeight":     a.OverageWeight,
 			"proxyURL":          a.ProxyURL,
+			"groups":            a.Groups,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -2727,6 +2732,27 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
+	}
+	if v, ok := updates["groups"].([]interface{}); ok {
+		// JSON arrays decode to []interface{}; coerce to a clean []string,
+		// dropping non-strings, empties, and duplicates. Lowercase so the
+		// AccountInGroup compare is consistent regardless of casing chosen
+		// in the UI.
+		seen := map[string]bool{}
+		groups := make([]string, 0, len(v))
+		for _, raw := range v {
+			s, ok := raw.(string)
+			if !ok {
+				continue
+			}
+			s = strings.ToLower(strings.TrimSpace(s))
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			groups = append(groups, s)
+		}
+		existing.Groups = groups
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {

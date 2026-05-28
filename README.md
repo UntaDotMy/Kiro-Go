@@ -96,10 +96,29 @@ The setting takes effect immediately without restarting.
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
 | `LOG_LEVEL` | Log verbosity: `debug` / `info` / `warn` / `error` | `info` |
+| `KIRO_API_REGION` | AWS region for the Kiro/CodeWhisperer endpoints (e.g. `us-east-1`, `eu-west-1`, `ap-northeast-1`). Overrides the admin-UI setting. | `us-east-1` |
 | `KIRO_ALLOW_DEFAULT_PASSWORD` | Set to `1` to allow startup with the default password (not recommended in production) | - |
 | `KIRO_WS_ALLOW_ANY_ORIGIN` | Set to `1` to revert WebSocket Origin check to permissive (older A11 behaviour) | - |
 | `DATA_DIR` | (entrypoint) Path to chown to runtime UID/GID before drop | `/app/data` |
 | `RUN_UID` / `RUN_GID` | (entrypoint) UID/GID to drop privileges to | `1000` / `1000` |
+
+## Reverse proxy notes
+
+The realtime dashboard at `/admin/ws/status` requires WebSocket upgrade-header passthrough. Reverse proxies in front of Kiro-Go must forward `Upgrade` and `Connection`:
+
+```nginx
+# nginx
+location /admin/ws/ {
+    proxy_pass http://kiro-go:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 300s;
+}
+```
+
+The dashboard authenticates the WebSocket via `Sec-WebSocket-Protocol` (browsers can't set custom headers on WS upgrades). **If your reverse proxy logs request headers, the admin password will appear in the access log.** Either strip the header from logs or terminate the WebSocket internally. If logs are uncomfortable, the dashboard automatically falls back to 10-second polling — disable the WebSocket route to force that path.
 
 ## Backup and restore
 

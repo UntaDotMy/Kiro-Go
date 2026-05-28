@@ -59,6 +59,14 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// Groups assigns this account to one or more named pools. Combined with
+	// cfg.ModelGroups (model id -> group name), this lets the operator route
+	// specific models to specific accounts (e.g. premium accounts handle
+	// claude-opus-4-7 while free accounts handle claude-haiku-4-5). An
+	// account with no groups participates in every model's selection (the
+	// historical behavior). Group names are case-insensitive at lookup time.
+	Groups []string `json:"groups,omitempty"`
+
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
@@ -175,6 +183,18 @@ type Config struct {
 	// All strategies obey cooldowns and model-list filters identically;
 	// only the picker among the eligible subset differs.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
+
+	// ModelGroups maps a (canonical) model id to a group name. When a
+	// request comes in for a mapped model, the pool will only consider
+	// accounts whose Groups list includes the target group. Models without
+	// an entry fall through to the full pool — this preserves backward
+	// compatibility for existing deployments.
+	//
+	// Keys are stored in canonical form (lowercase, dot->dash, no thinking
+	// suffix) so the same model under different spellings routes to the
+	// same group. Use AddModelGroup / GetModelGroupForModel which handle
+	// canonicalization.
+	ModelGroups map[string]string `json:"modelGroups,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
@@ -966,6 +986,119 @@ func UpdateEndpointFallback(enabled bool) error {
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
 	return Save()
+}
+
+// canonicalModelKeyForGroups normalizes a model id to the form used as
+// the key in ModelGroups. Mirrors stats.CanonicalModelID's rules so the
+// same model recorded under "claude-opus-4.7" / "claude-opus-4-7" /
+// "claude-opus-4.7-thinking" all route to the same group.
+func canonicalModelKeyForGroups(model string) string {
+	s := strings.ToLower(strings.TrimSpace(model))
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, ".", "-")
+	for _, suffix := range []string{"-thinking", "-think", "-reasoning"} {
+		if strings.HasSuffix(s, suffix) {
+			s = strings.TrimSuffix(s, suffix)
+			break
+		}
+	}
+	return s
+}
+
+// GetModelGroupForModel returns the group name configured for the given
+// model, or "" if the model is not mapped (in which case the pool
+// considers all eligible accounts).
+func GetModelGroupForModel(model string) string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || len(cfg.ModelGroups) == 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(cfg.ModelGroups[canonicalModelKeyForGroups(model)]))
+}
+
+// SetModelGroupForModel stores or clears (when group=="") a model->group
+// mapping. Empty model is a no-op.
+func SetModelGroupForModel(model, group string) error {
+	key := canonicalModelKeyForGroups(model)
+	if key == "" {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.ModelGroups == nil {
+		cfg.ModelGroups = make(map[string]string)
+	}
+	g := strings.ToLower(strings.TrimSpace(group))
+	if g == "" {
+		delete(cfg.ModelGroups, key)
+	} else {
+		cfg.ModelGroups[key] = g
+	}
+	return Save()
+}
+
+// ReplaceModelGroups atomically swaps the model->group mapping for the
+// supplied snapshot. Each key is canonicalized; entries with an empty
+// group string are dropped (matches SetModelGroupForModel's "empty =
+// delete" semantics). One cfgLock acquisition + one Save, so the admin
+// UI can no longer leave the disk in a hybrid state if a single
+// SetModelGroupForModel call fails part-way through a multi-entry edit.
+func ReplaceModelGroups(snapshot map[string]string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	next := make(map[string]string, len(snapshot))
+	for k, v := range snapshot {
+		key := canonicalModelKeyForGroups(k)
+		if key == "" {
+			continue
+		}
+		g := strings.ToLower(strings.TrimSpace(v))
+		if g == "" {
+			continue
+		}
+		next[key] = g
+	}
+	cfg.ModelGroups = next
+	return Save()
+}
+
+// GetModelGroups returns a copy of the current model->group map. Used by
+// the admin UI to render the configured routing rules.
+func GetModelGroups() map[string]string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ModelGroups == nil {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(cfg.ModelGroups))
+	for k, v := range cfg.ModelGroups {
+		out[k] = v
+	}
+	return out
+}
+
+// AccountInGroup reports whether the supplied account is a member of the
+// named group. An empty group always returns true (no restriction). An
+// account with no groups configured is considered universal — it
+// participates in every model's selection — to preserve historical
+// behavior for deployments that don't use grouping.
+func AccountInGroup(a Account, group string) bool {
+	g := strings.ToLower(strings.TrimSpace(group))
+	if g == "" {
+		return true
+	}
+	if len(a.Groups) == 0 {
+		return true
+	}
+	for _, ag := range a.Groups {
+		if strings.EqualFold(strings.TrimSpace(ag), g) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetKiroAPIRegion returns the AWS region used to construct Kiro endpoints.

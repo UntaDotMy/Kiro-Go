@@ -253,6 +253,20 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 // config.GetPoolStrategy.
 var strategyResolver = func() string { return config.GetPoolStrategy() }
 
+// modelGroupResolver returns the group for a given model id. Indirection
+// via package-level variable lets unit tests configure model groups
+// without going through config; production points it at
+// config.GetModelGroupForModel.
+var modelGroupResolver = func(model string) string { return config.GetModelGroupForModel(model) }
+
+// SetModelGroupResolverForTesting replaces the resolver. Returns a
+// restore func; test caller is expected to defer the restore.
+func SetModelGroupResolverForTesting(fn func(model string) string) (restore func()) {
+	prev := modelGroupResolver
+	modelGroupResolver = fn
+	return func() { modelGroupResolver = prev }
+}
+
 // SetStrategyResolverForTesting replaces the strategy resolver so unit
 // tests can drive each branch of the picker without going through config.
 // Tests are expected to restore the previous resolver in a defer.
@@ -300,7 +314,10 @@ func modelLookupKeys(modelID string) []string {
 //   - acc != nil, ok == true                  → caller should proceed; the
 //     account is eligible and not cooling.
 //
-// model may be empty to skip the model-list filter.
+// model may be empty to skip the model-list filter. When non-empty, the
+// pool also consults cfg.ModelGroups: if the model maps to a group, only
+// accounts whose Groups includes that group are eligible. This is how
+// premium-vs-free routing is enforced.
 func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Duration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -315,15 +332,25 @@ func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Durat
 	// Normalize once before the per-slot walk so accountHasModel doesn't pay
 	// strings.ToLower + TrimSpace per candidate.
 	modelKey := strings.ToLower(strings.TrimSpace(model))
+	// Resolve the model->group mapping once. Empty group means "no
+	// restriction" — every account is eligible for the group filter.
+	modelGroup := ""
+	if model != "" {
+		modelGroup = modelGroupResolver(model)
+	}
 
 	// SWRR walk over eligible slots only. We collect indices of slots that
-	// are currently eligible (model match, no cooldown, token not about to
-	// expire) and run SWRR on that subset. Ineligible slots don't accumulate
-	// currentWeight, so they don't bias future picks toward themselves.
+	// are currently eligible (model match, group match, no cooldown, token
+	// not about to expire) and run SWRR on that subset. Ineligible slots
+	// don't accumulate currentWeight, so they don't bias future picks
+	// toward themselves.
 	var eligible []int
 	var soonest time.Time
 	for i := range p.slots {
 		acc := &p.accounts[i]
+		if modelGroup != "" && !config.AccountInGroup(*acc, modelGroup) {
+			continue
+		}
 		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {
 			continue
 		}

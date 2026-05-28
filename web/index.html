@@ -1502,6 +1502,17 @@
                 <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title">Model Group Routing</span></div>
+                <p style="font-size:12px;color:#64748b;padding:0 0 12px">Map specific models to account groups. Accounts in the matching group serve those models exclusively. Accounts with no groups participate in every model (back-compat). Set per-account groups in the Accounts tab.</p>
+                <div id="modelGroupsList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+                <div style="display:flex;gap:8px;margin-bottom:8px">
+                    <input type="text" id="newModelGroupModel" placeholder="model id (e.g. claude-opus-4-7)" style="flex:1">
+                    <input type="text" id="newModelGroupGroup" placeholder="group name (e.g. premium)" style="flex:1">
+                    <button class="btn btn-secondary btn-sm" onclick="addModelGroupEntry()">Add</button>
+                </div>
+                <button class="btn btn-primary" onclick="saveModelGroups()">Save</button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.proxySettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.proxyType"></label>
@@ -2544,6 +2555,11 @@
         function showMain() {
             document.getElementById('loginPage').classList.add('hidden');
             document.getElementById('mainPage').classList.remove('hidden');
+            // Open the realtime status WebSocket on every successful entry
+            // into the main view — covers both fresh logins and the
+            // localStorage auto-login path. startDashboardWS is idempotent
+            // (it checks dashboardWS before opening another connection).
+            startDashboardWS();
         }
         async function loadData() {
             await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
@@ -2896,6 +2912,10 @@
                 '<input type="text" id="proxyURLInput" value="' + (a.proxyURL || '') + '" placeholder="socks5://host:port" style="flex:1">' +
                 '<button class="btn btn-sm btn-primary" onclick="saveProxyURL(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div><p style="color:#64748b;font-size:12px;margin-top:4px">' + t('detail.proxyHint') + '</p></div>' +
+                '<div class="detail-section"><h4>Groups</h4><div class="machine-id-row">' +
+                '<input type="text" id="groupsInput" value="' + escapeHTML((a.groups || []).join(', ')) + '" placeholder="premium, experimental" style="flex:1">' +
+                '<button class="btn btn-sm btn-primary" onclick="saveAccountGroups(\'' + id + '\')">' + t('detail.save') + '</button>' +
+                '</div><p style="color:#64748b;font-size:12px;margin-top:4px">Comma-separated group names. Empty = participates in every model. Combined with the Model Group Routing rules in Settings to send specific models to specific accounts.</p></div>' +
                 '<div class="detail-section"><h4>' + t('detail.subscription') + '</h4><div class="detail-grid">' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.subscriptionType') + '</div><div class="detail-value">' + (a.subscriptionTitle || a.subscriptionType || '-') + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.tokenExpiry') + '</div><div class="detail-value">' + (a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') + '</div></div>' +
@@ -2987,6 +3007,21 @@
                 const d = await res.json();
                 if (d.success) { alert(t('detail.saved')); loadAccounts(); } else { alert(t('detail.saveFailed') + ': ' + d.error); }
             } catch (e) { alert(t('detail.saveFailed')); }
+        }
+        async function saveAccountGroups(id) {
+            const raw = (document.getElementById('groupsInput').value || '').trim();
+            // Comma-split; server lowercases + dedupes, so we just need to
+            // chunk and trim here.
+            const groups = raw === '' ? [] : raw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+            try {
+                const res = await fetch('/admin/api/accounts/' + id, {
+                    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ groups })
+                });
+                const d = await res.json();
+                if (d.success) { alert(t('common.saved') || 'Saved'); loadAccounts(); }
+                else alert((t('common.saveFailed') || 'Save failed') + ': ' + (d.error || ''));
+            } catch (e) { alert('Save failed: ' + e.message); }
         }
         async function saveProxyURL(id) {
             const proxyURL = document.getElementById('proxyURLInput').value.trim();
@@ -3445,6 +3480,7 @@
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
+            loadModelGroups();
             loadPromptFilter();
         }
         async function loadThinkingConfig() {
@@ -3461,6 +3497,60 @@
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.thinkingSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
+        }
+        // Model group routing — UI for configuring which models route to
+        // which account groups. The mapping is stored canonically server-side
+        // (lowercase, dot->dash, no thinking suffix); we display whatever
+        // the server returns and let it normalize on save.
+        let modelGroupsState = {};
+        async function loadModelGroups() {
+            try {
+                const res = await fetch('/admin/api/model-groups', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                modelGroupsState = d.groups || {};
+                renderModelGroups();
+            } catch (e) { /* defensive */ }
+        }
+        function renderModelGroups() {
+            const el = document.getElementById('modelGroupsList');
+            if (!el) return;
+            const keys = Object.keys(modelGroupsState).sort();
+            if (keys.length === 0) {
+                el.innerHTML = '<div style="font-size:12px;color:#94a3b8;padding:8px 0">No mappings configured. Models without a mapping use the full pool.</div>';
+                return;
+            }
+            el.innerHTML = keys.map(k => {
+                const v = modelGroupsState[k];
+                return '<div style="display:flex;gap:8px;align-items:center"><code style="background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:11px;flex:1">' + escapeHTML(k) + '</code><span style="font-size:11px;color:#64748b">→</span><code style="background:#e0e7ff;padding:2px 6px;border-radius:4px;font-size:11px;flex:1">' + escapeHTML(v) + '</code><button class="btn btn-sm btn-danger" style="padding:2px 8px;font-size:11px" onclick="removeModelGroup(\'' + k.replace(/'/g, "\\'") + '\')">×</button></div>';
+            }).join('');
+        }
+        function addModelGroupEntry() {
+            const m = (document.getElementById('newModelGroupModel').value || '').trim();
+            const g = (document.getElementById('newModelGroupGroup').value || '').trim();
+            if (!m || !g) {
+                alert('Both model and group are required.');
+                return;
+            }
+            modelGroupsState[m] = g;
+            document.getElementById('newModelGroupModel').value = '';
+            document.getElementById('newModelGroupGroup').value = '';
+            renderModelGroups();
+        }
+        function removeModelGroup(model) {
+            delete modelGroupsState[model];
+            renderModelGroups();
+        }
+        async function saveModelGroups() {
+            try {
+                const res = await fetch('/admin/api/model-groups', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ groups: modelGroupsState })
+                });
+                const d = await res.json();
+                if (d.success) { alert(t('common.saved') || 'Saved'); loadModelGroups(); }
+                else alert((t('common.saveFailed') || 'Save failed') + ': ' + d.error);
+            } catch (e) { alert('Save failed: ' + e.message); }
         }
         async function loadEndpointConfig() {
             const res = await fetch('/admin/api/endpoint', { headers: { 'X-Admin-Password': password } });
@@ -4068,6 +4158,10 @@
         }
         function startDashboardWS() {
             if (!password) return;
+            // Idempotent: if a connection is already open or in CONNECTING
+            // state, don't open a second. WebSocket states: 0=connecting
+            // 1=open 2=closing 3=closed.
+            if (dashboardWS && (dashboardWS.readyState === 0 || dashboardWS.readyState === 1)) return;
             try {
                 const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const url = proto + '//' + location.host + '/admin/ws/status';
@@ -4107,14 +4201,10 @@
                 if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats();
             }, 3000);
         }
-        // Wait until the user authenticates (password set) before opening
-        // the WS. main.html stores password in a module-level var; we hook
-        // here at the end-of-script so the var is defined.
-        setTimeout(() => { if (password) startDashboardWS(); }, 0);
-        // Polling fallback is always armed at a coarser cadence — even if
-        // the WS is healthy, polling every 10 s catches anything the push
-        // path forgot (e.g. account enable toggled via direct API call
-        // without going through broadcastDashboardUpdate).
+        // showMain() opens the dashboard WS now that auth is established.
+        // The fallback poll runs at a coarser cadence even when the WS is
+        // healthy, so any state-change the push path forgets (rare) still
+        // surfaces within 10 s.
         setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
 
         // ==================== 版本检查 ====================
