@@ -130,7 +130,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
 	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
 
-	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
+	account, retryAfter, ok := h.pool.GetNextForModelInGroup(mappedModel, apiKeyGroup(r))
 	if !ok {
 		errMsg := "No available accounts"
 		errType := "server_error"

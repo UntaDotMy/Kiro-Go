@@ -70,6 +70,10 @@ type Handler struct {
 	// Per-account debounce for lazy quota refresh after a request completes.
 	refreshDebounceMu sync.Mutex
 	refreshScheduled  map[string]bool
+	// dashboardHub fans realtime status updates to subscribed admin
+	// dashboards (see proxy/dashboard_ws.go). Initialized in NewHandler;
+	// nil-safe because broadcastDashboardUpdate guards against nil.
+	dashboardHub *dashboardHub
 }
 
 type thinkingStreamSource int
@@ -299,6 +303,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		dashboardHub:    newDashboardHub(),
 	}
 	// 启动后台刷新
 	safeGo("backgroundRefresh", h.backgroundRefresh)
@@ -406,6 +411,8 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 			logger.Infof("[AutoDisable] Account %s enabled-state flipped on refresh (current=%.1f/%.1f trial=%.1f/%.1f)",
 				redactForLog(acc.Email), info.UsageCurrent, info.UsageLimit, info.TrialUsageCurrent, info.TrialUsageLimit)
 		}
+		// Credit / quota numbers just changed — push to dashboards.
+		h.broadcastDashboardUpdate()
 	})
 }
 
@@ -556,6 +563,18 @@ func matchedAPIKeyID(r *http.Request) string {
 	return ""
 }
 
+// apiKeyGroup returns the Group field of the API key that authenticated
+// this request, or "" if no key is set or the key has no group. The pool
+// uses this to restrict eligible accounts; "" means no restriction.
+// Matches matchedAPIKeyID's nil-tolerant shape so unauthenticated paths
+// (legacy single-key, no key) just see no group restriction.
+func apiKeyGroup(r *http.Request) string {
+	if k, ok := r.Context().Value(apiKeyCtxKey{}).(*config.APIKey); ok && k != nil {
+		return k.Group
+	}
+	return ""
+}
+
 // enforceAPIKeyLimit is the pre-flight gate: if the request was authenticated
 // by a multi-key entry, run CheckAPIKeyLimit before we burn upstream quota.
 // Returns true when the request was rejected (429 already written).
@@ -653,6 +672,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 管理端点
 	case path == "/admin" || path == "/admin/":
 		h.serveAdminPage(w, r)
+	case path == "/admin/ws/status":
+		// Realtime dashboard push. The WS handshake carries the admin
+		// password in Sec-WebSocket-Protocol because browsers can't set
+		// custom headers on the upgrade. Auth is verified inside the
+		// handler with constant-time compare; this route bypasses the
+		// header-based admin middleware on purpose.
+		h.handleDashboardWS(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)
 	case strings.HasPrefix(path, "/admin/"):
@@ -746,6 +772,29 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
 	}
 
+	// Per-key model whitelist filter. When the caller authenticated with an
+	// API key that has a non-empty Models list, restrict the /v1/models
+	// response to entries on that list. Empty list (or no key, e.g.
+	// unauthenticated legacy path) returns the full set — preserves the
+	// existing "default is everything" behavior. We use the same alias
+	// resolver as the request-time pre-flight gate (config.modelIsAllowedBy
+	// Whitelist exposed via config.IsModelAllowedForAPIKey) so a key
+	// configured with "claude-opus-4.7" still sees "claude-opus-4-7" in the
+	// list.
+	if k := matchedAPIKey(r); k != nil && len(k.Models) > 0 {
+		filtered := make([]map[string]interface{}, 0, len(models))
+		for _, m := range models {
+			id, _ := m["id"].(string)
+			if id == "" {
+				continue
+			}
+			if config.IsModelAllowedForAPIKey(*k, id) {
+				filtered = append(filtered, m)
+			}
+		}
+		models = filtered
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
@@ -826,30 +875,17 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 }
 
 // kiroModelToAnthropicID converts Kiro's internal dotted model id (e.g.
-// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed
-// form Claude Code recognizes in its model picker. Dated suffixes (e.g.
-// "-20251101") are intentionally omitted: Claude Code resolves the family
-// from the dashed form alone, and emitting both creates duplicate picker
-// entries that map to the same upstream model.
+// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic
+// dashed form Claude Code recognizes in its model picker. Dated suffixes
+// (e.g. "-20251101") are intentionally NOT stripped: the input from
+// Kiro's ListAvailableModels is the family id, never the dated form.
+//
+// The transformation is purely mechanical (every "." -> "-") which makes
+// it forwards-compatible: a future claude-opus-4.8 / 4.9 / 5.0 just works
+// without a code change. We delegate to canonicalAnthropicModelID so the
+// request response shape and this listing path share one definition.
 func kiroModelToAnthropicID(kiroID string) string {
-	switch strings.ToLower(strings.TrimSpace(kiroID)) {
-	case "claude-opus-4.7":
-		return "claude-opus-4-7"
-	case "claude-opus-4.6":
-		return "claude-opus-4-6"
-	case "claude-opus-4.5":
-		return "claude-opus-4-5"
-	case "claude-sonnet-4.6":
-		return "claude-sonnet-4-6"
-	case "claude-sonnet-4.5":
-		return "claude-sonnet-4-5"
-	case "claude-sonnet-4":
-		return "claude-sonnet-4"
-	case "claude-haiku-4.5":
-		return "claude-haiku-4-5"
-	}
-	// Already in dashed form, or unknown — return as-is.
-	return kiroID
+	return canonicalAnthropicModelID(strings.ToLower(strings.TrimSpace(kiroID)))
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -1373,7 +1409,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 获取账号（按模型过滤，优先选支持该模型的账号）
 	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
+	account, retryAfter, ok := h.pool.GetNextForModelInGroup(actualModel, apiKeyGroup(r))
 	if !ok {
 		if retryAfter > 0 {
 			setRetryAfter(w, retryAfter)
@@ -1821,6 +1857,9 @@ func (h *Handler) recordSuccess(model, apiKeyID string, inputTokens, outputToken
 		atomic.LoadInt64(&h.totalTokens),
 		h.getCredits(),
 	)
+	// Realtime push to subscribed dashboards. Best-effort, non-blocking;
+	// see broadcastDashboardUpdate for the slow-consumer policy.
+	h.broadcastDashboardUpdate()
 }
 
 // apiKeyIDForLog returns "-" when no key is associated, so the log line is
@@ -1836,6 +1875,7 @@ func (h *Handler) recordFailure(model, apiKeyID string) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 	stats.Record(model, apiKeyID, false, 0, 0, 0)
+	h.broadcastDashboardUpdate()
 }
 
 // checkOverageError 检测 402 超额错误，自动关闭对应账号的超额使用
@@ -1997,7 +2037,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 
 	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	account, retryAfter, ok := h.pool.GetNextForModel(actualModel)
+	account, retryAfter, ok := h.pool.GetNextForModelInGroup(actualModel, apiKeyGroup(r))
 	if !ok {
 		if retryAfter > 0 {
 			setRetryAfter(w, retryAfter)
@@ -2530,12 +2570,19 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiListAPIKeys(w, r)
 	case path == "/apikeys" && r.Method == "POST":
 		h.apiCreateAPIKey(w, r)
+	case strings.HasPrefix(path, "/apikeys/") && strings.HasSuffix(path, "/reveal") && r.Method == "GET":
+		// /apikeys/<id>/reveal — fetch the full secret for a copy-to-clipboard
+		// affordance. Same admin auth as everything else under /admin/api/*.
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/apikeys/"), "/reveal")
+		h.apiRevealAPIKey(w, r, id)
 	case strings.HasPrefix(path, "/apikeys/") && r.Method == "PUT":
 		h.apiUpdateAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
 	case strings.HasPrefix(path, "/apikeys/") && r.Method == "DELETE":
 		h.apiDeleteAPIKey(w, r, strings.TrimPrefix(path, "/apikeys/"))
 	case path == "/modelstats" && r.Method == "GET":
 		h.apiGetModelStats(w, r)
+	case path == "/available-models" && r.Method == "GET":
+		h.apiGetAvailableModels(w, r)
 	case path == "/stats/totals" && r.Method == "GET":
 		h.apiGetStatsTotals(w, r)
 	case path == "/stats/history" && r.Method == "GET":
@@ -2587,6 +2634,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"allowOverage":      a.AllowOverage,
 			"overageWeight":     a.OverageWeight,
 			"proxyURL":          a.ProxyURL,
+			"groups":            a.Groups,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -2704,6 +2752,27 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
+	}
+	if v, ok := updates["groups"].([]interface{}); ok {
+		// JSON arrays decode to []interface{}; coerce to a clean []string,
+		// dropping non-strings, empties, and duplicates. Lowercase so the
+		// pool's accountInGroup compare (EqualFold-based) is consistent
+		// regardless of casing chosen in the UI.
+		seen := map[string]bool{}
+		groups := make([]string, 0, len(v))
+		for _, raw := range v {
+			s, ok := raw.(string)
+			if !ok {
+				continue
+			}
+			s = strings.ToLower(strings.TrimSpace(s))
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			groups = append(groups, s)
+		}
+		existing.Groups = groups
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -3207,7 +3276,19 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	// Aggregate per-account subscription quotas so the dashboard can show
 	// "Credits Total" / "Remaining" alongside the cumulative "Credits Used"
 	// without having to refetch the full /accounts list every poll.
+	//
+	// Two parallel sums are exposed:
+	//   - quotaTotal / quotaUsed: ALL accounts (includes disabled).
+	//     Useful for capacity planning ("we have N credits across the
+	//     fleet, however many we're actually using").
+	//   - activeQuotaTotal / activeQuotaUsed / activeTokens / activeRequests:
+	//     ENABLED accounts only. Matches the operator intuition that
+	//     turning off an account should make its credits stop counting
+	//     toward the live dashboard.
 	var quotaTotal, quotaUsed float64
+	var activeQuotaTotal, activeQuotaUsed float64
+	var activeTokens int
+	var activeRequests int
 	for _, a := range config.GetAccounts() {
 		if a.UsageLimit > 0 {
 			quotaTotal += a.UsageLimit
@@ -3215,19 +3296,33 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		if a.UsageCurrent > 0 {
 			quotaUsed += a.UsageCurrent
 		}
+		if a.Enabled {
+			if a.UsageLimit > 0 {
+				activeQuotaTotal += a.UsageLimit
+			}
+			if a.UsageCurrent > 0 {
+				activeQuotaUsed += a.UsageCurrent
+			}
+			activeTokens += a.TotalTokens
+			activeRequests += a.RequestCount
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"quotaTotal":      quotaTotal,
-		"quotaUsed":       quotaUsed,
-		"uptime":          time.Now().Unix() - h.startTime,
+		"accounts":         h.pool.Count(),
+		"available":        h.pool.AvailableCount(),
+		"totalRequests":    atomic.LoadInt64(&h.totalRequests),
+		"successRequests":  atomic.LoadInt64(&h.successRequests),
+		"failedRequests":   atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":      atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":     h.getCredits(),
+		"quotaTotal":       quotaTotal,
+		"quotaUsed":        quotaUsed,
+		"activeQuotaTotal": activeQuotaTotal,
+		"activeQuotaUsed":  activeQuotaUsed,
+		"activeTokens":     activeTokens,
+		"activeRequests":   activeRequests,
+		"uptime":           time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -3721,14 +3816,20 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"preferredEndpoint": config.GetPreferredEndpoint(),
 		"endpointFallback":  config.GetEndpointFallback(),
+		"region":            config.GetKiroAPIRegion(),
+		"regions":           config.GetKiroAPIRegions(),
+		"poolStrategy":      config.GetPoolStrategy(),
 	})
 }
 
 // apiUpdateEndpointConfig 更新端点配置
 func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PreferredEndpoint string `json:"preferredEndpoint"`
-		EndpointFallback  *bool  `json:"endpointFallback"`
+		PreferredEndpoint string    `json:"preferredEndpoint"`
+		EndpointFallback  *bool     `json:"endpointFallback"`
+		Region            *string   `json:"region,omitempty"`
+		Regions           *[]string `json:"regions,omitempty"`
+		PoolStrategy      *string   `json:"poolStrategy,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3753,7 +3854,92 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		config.UpdateEndpointFallback(*req.EndpointFallback)
 	}
 
+	if req.Region != nil {
+		region := strings.ToLower(strings.TrimSpace(*req.Region))
+		if region != "" && !isValidAWSRegion(region) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid AWS region (expected like 'us-east-1', 'eu-west-1', 'ap-northeast-1')"})
+			return
+		}
+		if err := config.UpdateKiroAPIRegion(region); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.Regions != nil {
+		// Validate every region; reject the whole list if any entry is
+		// malformed so the operator gets immediate feedback.
+		clean := make([]string, 0, len(*req.Regions))
+		for _, raw := range *req.Regions {
+			s := strings.ToLower(strings.TrimSpace(raw))
+			if s == "" {
+				continue
+			}
+			if !isValidAWSRegion(s) {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid AWS region in failover list: " + s})
+				return
+			}
+			clean = append(clean, s)
+		}
+		if err := config.UpdateKiroAPIRegions(clean); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.PoolStrategy != nil {
+		strat := strings.ToLower(strings.TrimSpace(*req.PoolStrategy))
+		validStrats := map[string]bool{"": true, "swr": true, "least-used": true, "random": true}
+		if !validStrats[strat] {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid poolStrategy, must be: swr, least-used, or random"})
+			return
+		}
+		if err := config.UpdatePoolStrategy(strat); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// isValidAWSRegion does a cheap shape check: two lowercase letters, dash,
+// 1-2 lowercase region segments, dash, digits. Doesn't enforce the full
+// list of real regions because AWS adds new ones routinely; we just reject
+// obvious typos.
+func isValidAWSRegion(s string) bool {
+	if len(s) < 9 || len(s) > 32 {
+		return false
+	}
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	// First part: 2 letters (us, eu, ap, ca, sa, af, me).
+	if len(parts[0]) != 2 {
+		return false
+	}
+	for _, c := range parts[0] {
+		if c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	// Last part: digits only.
+	if len(parts[len(parts)-1]) == 0 {
+		return false
+	}
+	for _, c := range parts[len(parts)-1] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // applyProxyConfig 将代理配置应用到所有出站 HTTP 客户端（Kiro API + auth 模块）

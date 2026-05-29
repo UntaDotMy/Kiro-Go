@@ -10,21 +10,25 @@ import (
 	"time"
 )
 
-// Replaces kiroEndpoints with httptest URLs for the duration of a test, then
-// restores the original list. Each replacement preserves the original Origin
-// field (the upstream cares about it; httptest itself does not).
+// Replaces the endpoint chain with httptest URLs for the duration of a
+// test, then restores the original list. Each replacement preserves the
+// original Origin field (the upstream cares about it; httptest itself
+// does not).
 func swapKiroEndpoints(t *testing.T, urls []string) {
 	t.Helper()
-	if len(urls) != len(kiroEndpoints) {
-		t.Fatalf("swapKiroEndpoints expected %d urls, got %d", len(kiroEndpoints), len(urls))
+	defaults := kiroEndpointsForRegion("us-east-1")
+	if len(urls) != len(defaults) {
+		t.Fatalf("swapKiroEndpoints expected %d urls, got %d", len(defaults), len(urls))
 	}
-	saved := make([]kiroEndpoint, len(kiroEndpoints))
-	copy(saved, kiroEndpoints)
-	for i := range kiroEndpoints {
-		kiroEndpoints[i].URL = urls[i]
+	override := make([]kiroEndpoint, len(defaults))
+	copy(override, defaults)
+	for i := range override {
+		override[i].URL = urls[i]
 	}
+	prev := kiroEndpointsOverride
+	kiroEndpointsOverride = override
 	t.Cleanup(func() {
-		copy(kiroEndpoints, saved)
+		kiroEndpointsOverride = prev
 	})
 }
 

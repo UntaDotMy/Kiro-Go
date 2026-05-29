@@ -13,26 +13,85 @@ import (
 	"github.com/google/uuid"
 )
 
+// claudeFamilyDottedID maps any recognized Claude family-version id
+// (in either the client's dashed form or Kiro's dotted form) to Kiro's
+// upstream dotted form. Returns "" if the input doesn't match the
+// pattern "claude-<opus|sonnet|haiku>-<digits>{.,-}<digits>" with each
+// side 1-2 digits. The mechanical rule keeps adding new minor versions
+// (claude-opus-4-8, 4-10, 5-0, etc.) a no-code-change event; we
+// deliberately reject the dated form (claude-sonnet-4-20250514) and
+// the bare family form (claude-sonnet-4) so they continue to flow
+// through the explicit modelMapOrdered table.
+//
+// IMPORTANT: keep this implementation in lockstep with
+// pool.claudeAliasTwin and config.claudeAliasTwin. All three handle
+// the same family-version pattern; if Anthropic releases a new family
+// or changes the version shape, all three need the matching tweak.
+func claudeFamilyDottedID(lower string) string {
+	const prefix = "claude-"
+	if !strings.HasPrefix(lower, prefix) {
+		return ""
+	}
+	rest := lower[len(prefix):]
+	for _, fam := range []string{"opus", "sonnet", "haiku"} {
+		famPrefix := fam + "-"
+		if !strings.HasPrefix(rest, famPrefix) {
+			continue
+		}
+		ver := rest[len(famPrefix):]
+		sepIdx := -1
+		for i := 0; i < len(ver); i++ {
+			if ver[i] == '.' || ver[i] == '-' {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx < 1 || sepIdx > 2 {
+			return ""
+		}
+		major := ver[:sepIdx]
+		minor := ver[sepIdx+1:]
+		if len(minor) < 1 || len(minor) > 2 {
+			return ""
+		}
+		if !translatorAllDigits(major) || !translatorAllDigits(minor) {
+			return ""
+		}
+		if sepIdx+1+len(minor) != len(ver) {
+			return ""
+		}
+		// Always emit the dotted form because that's what Kiro's
+		// upstream payload expects, regardless of which separator the
+		// client sent.
+		return prefix + famPrefix + major + "." + minor
+	}
+	return ""
+}
+
+func translatorAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
 // 模型映射（有序，长 key 优先匹配，避免 "claude-sonnet-4" 误匹配 "claude-sonnet-4.5"）
 type modelMapping struct {
 	key   string
 	value string
 }
 
+// modelMapOrdered handles the EXPLICIT, non-mechanical model id
+// translations Claude clients ship — legacy Claude 3 family ids, OpenAI
+// model names that Kiro doesn't serve, and the dated sonnet-4 alias. The
+// dotted-vs-dashed twins for the modern families (opus / sonnet / haiku
+// in 4.x and forward) are handled by the family-derivation branch below
+// in ParseModelAndThinking, so a future claude-opus-4-8 / 4.9 / 5-0 just
+// works without a code change.
 var modelMapOrdered = []modelMapping{
 	{"claude-sonnet-4-20250514", "claude-sonnet-4"},
-	{"claude-sonnet-4-5", "claude-sonnet-4.5"},
-	{"claude-sonnet-4.5", "claude-sonnet-4.5"},
-	{"claude-sonnet-4-6", "claude-sonnet-4.6"},
-	{"claude-sonnet-4.6", "claude-sonnet-4.6"},
-	{"claude-opus-4-7", "claude-opus-4.7"},
-	{"claude-opus-4.7", "claude-opus-4.7"},
-	{"claude-haiku-4-5", "claude-haiku-4.5"},
-	{"claude-haiku-4.5", "claude-haiku-4.5"},
-	{"claude-opus-4-5", "claude-opus-4.5"},
-	{"claude-opus-4.5", "claude-opus-4.5"},
-	{"claude-opus-4-6", "claude-opus-4.6"},
-	{"claude-opus-4.6", "claude-opus-4.6"},
 	{"claude-sonnet-4", "claude-sonnet-4"},
 	{"claude-3-5-sonnet", "claude-sonnet-4.5"},
 	{"claude-3-opus", "claude-sonnet-4.5"},
@@ -78,6 +137,19 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		thinking = true
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
+	}
+
+	// Family-version derivation runs FIRST. The mechanical rule for the
+	// modern Claude families (opus / sonnet / haiku in 4.x and forward)
+	// produces Kiro's dotted upstream form regardless of whether the
+	// client sent dashed or dotted. This must precede the
+	// modelMapOrdered walk because that walk uses strings.Contains and
+	// the explicit "claude-sonnet-4" row would otherwise swallow
+	// "claude-sonnet-4-6" / "-4.6" before the derivation could run. New
+	// minor versions (e.g. claude-opus-4-8 once Anthropic ships it)
+	// work without a code change.
+	if dotted := claudeFamilyDottedID(lower); dotted != "" {
+		return dotted, thinking
 	}
 
 	// 映射模型（有序匹配，长 key 优先）

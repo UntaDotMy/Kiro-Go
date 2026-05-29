@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
-	"time"
 )
 
 func TestNormalizeChunkBasicProgression(t *testing.T) {
@@ -117,18 +116,30 @@ func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
 	assertProxyURL(t, got, "http://env-proxy.local:2323")
 }
 
-func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
+// TestInitKiroHttpClientTimeoutShape validates the asymmetric timeout
+// strategy: REST client keeps a short wall-clock cap, streaming client
+// has Client.Timeout = 0 (idleTimeoutReader handles streaming) plus a
+// transport-level ResponseHeaderTimeout so a stalled handshake can't
+// hang the request.
+func TestInitKiroHttpClientTimeoutShape(t *testing.T) {
 	InitKiroHttpClient("")
 	t.Cleanup(func() { InitKiroHttpClient("") })
 
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	if streamClient.Timeout != 0 {
+		t.Fatalf("expected streaming Client.Timeout to be 0 (governed by idleTimeoutReader), got %s", streamClient.Timeout)
 	}
-	if restClient.Timeout != 30*time.Second {
-		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
+	if restClient.Timeout != restRequestTimeout {
+		t.Fatalf("expected REST timeout to be %s, got %s", restRequestTimeout, restClient.Timeout)
+	}
+	tr, ok := streamClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", streamClient.Transport)
+	}
+	if tr.ResponseHeaderTimeout != responseHeaderTimeout {
+		t.Fatalf("expected ResponseHeaderTimeout %s, got %s", responseHeaderTimeout, tr.ResponseHeaderTimeout)
 	}
 }
 

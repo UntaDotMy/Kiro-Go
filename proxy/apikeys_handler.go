@@ -5,8 +5,29 @@ import (
 	"kiro-go/config"
 	"kiro-go/stats"
 	"net/http"
+	"sort"
 	"strconv"
 )
+
+// apiRevealAPIKey returns the full secret for one key. The list endpoint
+// masks every key by design so an admin XSS / accidental screenshare
+// doesn't leak the secret; this endpoint is the explicit "copy key"
+// affordance — the operator clicks a button per row, the dashboard fetches
+// the full secret over the same admin-authed channel, copies it to the
+// clipboard, and discards it from memory. The endpoint requires the
+// admin password (enforced by the routing layer that wraps every
+// /admin/api/* path), so the security boundary is unchanged: anyone who
+// could already authenticate can already see the secrets in config.json.
+func (h *Handler) apiRevealAPIKey(w http.ResponseWriter, r *http.Request, id string) {
+	for _, k := range config.GetAPIKeys() {
+		if k.ID == id {
+			json.NewEncoder(w).Encode(map[string]string{"key": k.Key})
+			return
+		}
+	}
+	w.WriteHeader(404)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Key not found"})
+}
 
 // apiListAPIKeys returns all configured API keys with their counters and
 // limits. Secrets are masked to the last 4 characters of each key (e.g.
@@ -41,6 +62,7 @@ func maskAPIKeySecret(s string) string {
 // apiCreateAPIKey creates a new key. Body fields:
 //
 //	name:           label
+//	group:          optional Kiro-account group restriction
 //	models:         optional whitelist
 //	dailyReqLimit:  0 = unlimited
 //	dailyTokLimit:  0 = unlimited
@@ -49,6 +71,7 @@ func maskAPIKeySecret(s string) string {
 func (h *Handler) apiCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name           string   `json:"name"`
+		Group          string   `json:"group,omitempty"`
 		Models         []string `json:"models,omitempty"`
 		DailyReqLimit  int      `json:"dailyReqLimit"`
 		DailyTokLimit  int      `json:"dailyTokLimit"`
@@ -60,7 +83,7 @@ func (h *Handler) apiCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-	key, err := config.AddAPIKey(req.Name, req.Models, req.DailyReqLimit, req.DailyTokLimit, req.DailyCredLimit, req.ExpiresAt)
+	key, err := config.AddAPIKey(req.Name, req.Models, req.DailyReqLimit, req.DailyTokLimit, req.DailyCredLimit, req.ExpiresAt, req.Group)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -77,6 +100,7 @@ func (h *Handler) apiUpdateAPIKey(w http.ResponseWriter, r *http.Request, id str
 		Name              *string   `json:"name,omitempty"`
 		Enabled           *bool     `json:"enabled,omitempty"`
 		Models            *[]string `json:"models,omitempty"`
+		Group             *string   `json:"group,omitempty"`
 		ExpiresAt         *int64    `json:"expiresAt,omitempty"`
 		LazyExpirySeconds *int64    `json:"lazyExpirySeconds,omitempty"`
 		ResetPeriod       *string   `json:"resetPeriod,omitempty"`
@@ -96,7 +120,7 @@ func (h *Handler) apiUpdateAPIKey(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	opts := config.UpdateAPIKeyOptions{
-		Name: req.Name, Enabled: req.Enabled, Models: req.Models,
+		Name: req.Name, Enabled: req.Enabled, Models: req.Models, Group: req.Group,
 		ExpiresAt: req.ExpiresAt, LazyExpirySeconds: req.LazyExpirySeconds,
 		ResetPeriod: req.ResetPeriod, ResetTZ: req.ResetTZ,
 		DailyReqLimit: req.DailyReqLimit, DailyTokLimit: req.DailyTokLimit, DailyCredLimit: req.DailyCredLimit,
@@ -139,6 +163,56 @@ func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
+}
+
+// apiGetAvailableModels returns the unfiltered model catalog the API key
+// editor should show as checkboxes. This is the same source /v1/models
+// uses BEFORE the per-key allowlist filter — the canonical Anthropic ids
+// (claude-opus-4-7) plus their dotted Kiro aliases (claude-opus-4.7),
+// deduplicated. The non-Claude aliases (auto / gpt-4o / gpt-4) are also
+// included because the runtime path translates them to Claude models, so
+// an operator may legitimately want to include or exclude them.
+//
+// Cold-start fallback applies: if the per-account model cache is empty
+// we serve fallbackAnthropicModels so the form has something to render
+// while a background refresh fills the cache.
+func (h *Handler) apiGetAvailableModels(w http.ResponseWriter, r *http.Request) {
+	thinkingSuffix := config.GetThinkingConfig().Suffix
+	h.modelsCacheMu.RLock()
+	cached := h.cachedModels
+	h.modelsCacheMu.RUnlock()
+	if len(cached) == 0 {
+		h.triggerModelsRefreshAsync()
+	}
+	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	if len(models) == 0 {
+		models = fallbackAnthropicModels(thinkingSuffix)
+	}
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok {
+			seen[id] = true
+		}
+	}
+	for _, alias := range []string{"auto", "gpt-4o", "gpt-4"} {
+		if seen[alias] {
+			continue
+		}
+		seen[alias] = true
+		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
+	}
+	// Surface a flat list of ids — the form only needs the id strings,
+	// and the existing /v1/models response shape (full objects with
+	// owned_by, supportsImage, etc.) carries fields the checkbox form
+	// doesn't render. Keep the payload lean.
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		if id, ok := m["id"].(string); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	json.NewEncoder(w).Encode(map[string]interface{}{"models": ids})
 }
 
 // apiGetStatsTotals returns the persisted lifetime global counters loaded

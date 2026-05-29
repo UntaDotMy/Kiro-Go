@@ -14,9 +14,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +59,15 @@ type Account struct {
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
+
+	// Groups assigns this Kiro account to one or more named pools. Combined
+	// with the per-API-key Group field (cfg.APIKey.Group), this lets the
+	// operator route specific keys to specific accounts (e.g. a "premium"
+	// API key only routes to accounts whose Groups list contains
+	// "premium"). An account with no groups participates in every group
+	// restriction (back-compat: existing setups without grouping keep
+	// working without changes). Group names are case-insensitive.
+	Groups []string `json:"groups,omitempty"`
 
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
@@ -136,12 +147,59 @@ type Config struct {
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
-	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
+	// PreferredEndpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
 	// EndpointFallback controls whether to try other endpoints when the preferred one fails.
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
+
+	// KiroAPIRegion is the AWS region used when constructing the streaming +
+	// REST endpoints (e.g. "us-east-1", "eu-west-1"). Defaults to "us-east-1"
+	// to preserve historical behavior. The KIRO_API_REGION environment variable
+	// overrides this if set, so docker users can rotate regions without
+	// editing config.json.
+	//
+	// AWS rate-limits per (identity, region) — moving traffic to a different
+	// region is one of the few mitigations that genuinely reduces 429s when
+	// the operator has a shared identity (e.g. one Builder ID across many
+	// accounts). It also impacts latency: us-east-1 is fastest from the US
+	// East coast and will be slow from APAC; eu-west-1 / ap-northeast-1
+	// are reasonable alternates.
+	KiroAPIRegion string `json:"kiroAPIRegion,omitempty"`
+
+	// KiroAPIRegions is the optional multi-region failover chain. When
+	// set, the endpoint loop will expand to try every region in this list
+	// before declaring all-endpoints-throttled. The first region in the
+	// list is the preferred / lowest-latency target; later regions are
+	// only hit if every endpoint in the prior region 429s. This is the
+	// "auto" mode mentioned in admin docs — empty = single-region
+	// (KiroAPIRegion), non-empty = cross-region failover.
+	//
+	// No competitor project documented in the field survey rotates
+	// regions on 429 — they only rotate accounts. We do this because AWS
+	// rate-limits per (identity, region), so a fresh region is the one
+	// remaining mitigation when an entire account pool is throttled in
+	// the primary region.
+	KiroAPIRegions []string `json:"kiroAPIRegions,omitempty"`
+
+	// PoolStrategy chooses how the account pool picks the next account for a
+	// request. Recognized values:
+	//
+	//   "swr" / ""       — smooth weighted round-robin (default; existing
+	//                      behavior). Best for evenly weighted pools and
+	//                      operators who want predictable interleaving.
+	//   "least-used"     — pick the eligible account with the lowest
+	//                      RequestCount (lifetime) so traffic naturally
+	//                      tilts toward fresher / less-burned accounts.
+	//                      Useful when accounts have heterogeneous quota
+	//                      and you want to drain the freshest first.
+	//   "random"         — uniform random pick among eligible accounts.
+	//                      Cheap, jitter-friendly, useful as a control.
+	//
+	// All strategies obey cooldowns and model-list filters identically;
+	// only the picker among the eligible subset differs.
+	PoolStrategy string `json:"poolStrategy,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
@@ -171,6 +229,13 @@ type Config struct {
 
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
+
+	// FilterDefaultsApplied marks that the one-shot migration which sets the
+	// three Filter* flags ON for upgrading users has run. Without this flag
+	// we'd keep flipping them ON every restart, trampling explicit user
+	// "off" choices. New installs go through the bootstrap path in Load()
+	// and arrive here pre-migrated. See migrateFilterDefaults.
+	FilterDefaultsApplied bool `json:"filterDefaultsApplied,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -206,7 +271,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.9-A3"
+const Version = "1.0.9-A4"
 
 var (
 	cfg     *Config
@@ -278,10 +343,10 @@ func Load() error {
 			starterKey, _ := generateAPIKeySecret()
 			firstRunStarterKey = starterKey
 			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: true,
+				Password:              "changeme",
+				Port:                  8080,
+				Host:                  "0.0.0.0",
+				RequireApiKey:         true,
 				APIKeys: []APIKey{{
 					ID:        generateAPIKeyID(),
 					Name:      "default",
@@ -293,6 +358,7 @@ func Load() error {
 				FilterClaudeCode:      true,
 				FilterEnvNoise:        true,
 				FilterStripBoundaries: true,
+				FilterDefaultsApplied: true,
 			}
 			return Save()
 		}
@@ -304,6 +370,14 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+
+	// One-shot migration: configs created before the FilterDefaultsApplied
+	// flag existed have FilterClaudeCode/FilterEnvNoise/FilterStripBoundaries
+	// silently zeroed by Go's json.Unmarshal whenever those fields were
+	// absent from the JSON document. Without this migration, every upgrade
+	// would surface a "filters off by default" UX regression. We only set
+	// this once per install; subsequent runs respect operator toggles.
+	migrateFilterDefaults()
 
 	// Auto-migrate the legacy single-key field into the multi-key list so the
 	// dashboard's "API Keys" tab is the single source of truth. Triggers only
@@ -374,6 +448,26 @@ func writeConfigBytes(data []byte) error {
 		return err
 	}
 	return os.Rename(tmpPath, cfgPath)
+}
+
+// migrateFilterDefaults sets the three prompt-filter flags ON for any
+// pre-existing config that was loaded before the FilterDefaultsApplied
+// migration marker existed. Caller must hold cfgLock for write — Load()
+// satisfies that. The migration runs at most once per install: once
+// FilterDefaultsApplied is true (either from this migration or from the
+// fresh-install bootstrap), we never re-apply, so explicit operator
+// "off" toggles are preserved.
+func migrateFilterDefaults() {
+	if cfg == nil || cfg.FilterDefaultsApplied {
+		return
+	}
+	cfg.FilterClaudeCode = true
+	cfg.FilterEnvNoise = true
+	cfg.FilterStripBoundaries = true
+	cfg.FilterDefaultsApplied = true
+	// Persist immediately so a subsequent restart sees the marker even if
+	// no other state changes between now and the next save.
+	_ = Save()
 }
 
 // SetPassword updates the admin password.
@@ -896,6 +990,178 @@ func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
+	return Save()
+}
+
+// GetKiroAPIRegion returns the AWS region used to construct Kiro endpoints.
+// Resolution precedence:
+//
+//  1. KIRO_API_REGION environment variable (if set + non-empty).
+//  2. cfg.KiroAPIRegion from config.json (if set + non-empty).
+//  3. "us-east-1" hard default.
+//
+// We sniff the env var live (not at startup) so the operator can rotate the
+// region by editing the env in their compose file and restarting; we don't
+// require the proxy to be aware of init-time vs runtime overrides.
+//
+// Region strings are lowercased + trimmed to be tolerant of operator typos
+// like "  US-East-1  " from a copy-pasted dashboard URL.
+func GetKiroAPIRegion() string {
+	if envRegion := strings.ToLower(strings.TrimSpace(os.Getenv("KIRO_API_REGION"))); envRegion != "" {
+		return envRegion
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg != nil {
+		region := strings.ToLower(strings.TrimSpace(cfg.KiroAPIRegion))
+		if region != "" {
+			return region
+		}
+	}
+	return "us-east-1"
+}
+
+// UpdateKiroAPIRegion persists the region setting. Empty string clears the
+// override and falls back to env / default. Caller is responsible for
+// reinitializing any region-dependent state (handler endpoint cache, etc.).
+func UpdateKiroAPIRegion(region string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.KiroAPIRegion = strings.TrimSpace(region)
+	return Save()
+}
+
+// GetKiroAPIRegions returns the multi-region failover list. Resolution:
+//
+//  1. KIRO_API_REGIONS environment variable (comma-separated).
+//  2. cfg.KiroAPIRegions array.
+//  3. Empty (caller falls back to single-region GetKiroAPIRegion).
+//
+// Empty values, duplicates, and malformed regions are filtered out so
+// the env-var path matches the admin-handler contract — passing
+// "us-east-1, junk, eu-west-1" to KIRO_API_REGIONS yields
+// ["us-east-1","eu-west-1"] rather than carrying the invalid entry into
+// endpoint construction. First entry is preferred / lowest-latency;
+// later regions only get traffic on 429 from earlier regions.
+func GetKiroAPIRegions() []string {
+	var raw []string
+	if env := strings.TrimSpace(os.Getenv("KIRO_API_REGIONS")); env != "" {
+		raw = strings.Split(env, ",")
+	} else {
+		cfgLock.RLock()
+		if cfg != nil && len(cfg.KiroAPIRegions) > 0 {
+			raw = make([]string, len(cfg.KiroAPIRegions))
+			copy(raw, cfg.KiroAPIRegions)
+		}
+		cfgLock.RUnlock()
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(raw))
+	for _, r := range raw {
+		s := strings.ToLower(strings.TrimSpace(r))
+		if s == "" {
+			continue
+		}
+		if seen[s] {
+			continue
+		}
+		if !isValidAWSRegionShape(s) {
+			// Operator-visible warn so a typo in KIRO_API_REGIONS / config
+			// isn't silently dropped on every accessor call.
+			logger.Warnf("[Config] KiroAPIRegions: dropping malformed region %q", s)
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// UpdateKiroAPIRegions persists the multi-region failover list. An empty
+// slice clears it (single-region fallback to GetKiroAPIRegion). Invalid
+// entries (empty, duplicates, malformed) are dropped silently so the
+// stored list is always usable.
+func UpdateKiroAPIRegions(regions []string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	clean := make([]string, 0, len(regions))
+	seen := map[string]bool{}
+	for _, r := range regions {
+		s := strings.ToLower(strings.TrimSpace(r))
+		if s == "" {
+			continue
+		}
+		if seen[s] {
+			continue
+		}
+		if !isValidAWSRegionShape(s) {
+			logger.Warnf("[Config] UpdateKiroAPIRegions: dropping malformed region %q", s)
+			continue
+		}
+		seen[s] = true
+		clean = append(clean, s)
+	}
+	cfg.KiroAPIRegions = clean
+	return Save()
+}
+
+// isValidAWSRegionShape mirrors the proxy-layer isValidAWSRegion check
+// but kept here so config doesn't depend on proxy. Cheap shape check —
+// "us-east-1", "eu-west-1", "us-gov-east-1" all pass; obvious typos and
+// unicode garbage don't.
+func isValidAWSRegionShape(s string) bool {
+	if len(s) < 9 || len(s) > 32 {
+		return false
+	}
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	if len(parts[0]) != 2 {
+		return false
+	}
+	for _, c := range parts[0] {
+		if c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	last := parts[len(parts)-1]
+	if len(last) == 0 {
+		return false
+	}
+	for _, c := range last {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// GetPoolStrategy returns the configured pool selection strategy. Empty /
+// unrecognized values map to "swr". See cfg.PoolStrategy for the full menu.
+func GetPoolStrategy() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return "swr"
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.PoolStrategy)) {
+	case "least-used", "leastused", "least_used":
+		return "least-used"
+	case "random":
+		return "random"
+	default:
+		return "swr"
+	}
+}
+
+// UpdatePoolStrategy persists the pool strategy setting. Caller should call
+// pool.Reload() if they want the change to take effect mid-run; otherwise
+// the next pool selection picks up the new value via GetPoolStrategy.
+func UpdatePoolStrategy(strategy string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PoolStrategy = strings.TrimSpace(strategy)
 	return Save()
 }
 

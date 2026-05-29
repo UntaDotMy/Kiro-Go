@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,26 +29,115 @@ type kiroEndpoint struct {
 	Name      string
 }
 
-var kiroEndpoints = []kiroEndpoint{
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "",
-		Name:      "Kiro IDE",
-	},
-	{
-		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-		Name:      "CodeWhisperer",
-	},
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+// kiroEndpointsOverride, when non-nil, replaces the result of
+// kiroEndpointsForRegion. Set only by tests via swapKiroEndpoints; production
+// code never touches it.
+var kiroEndpointsOverride []kiroEndpoint
+
+// kiroEndpointsForRegion builds the endpoint chain for a specific AWS
+// region. AWS rate-limits per (identity, action), so a 429 on one of
+// these does NOT imply the others are also throttled — that is why the
+// per-account loop in CallKiroAPI tries each endpoint before surfacing a
+// QuotaError.
+//
+// Region defaults to us-east-1 if empty. Per research against jwadow
+// kiro-gateway issue #58 and source, the endpoint set is region-specific:
+//
+//   - "https://q.<region>.amazonaws.com/generateAssistantResponse"
+//     Works in us-east-1, eu-west-1, eu-central-1, and likely other Q
+//     Developer regions. Default Kiro IDE target.
+//
+//   - "https://codewhisperer.<region>.amazonaws.com/generateAssistantResponse"
+//     **Only resolves in us-east-1** — the codewhisperer.* hostname
+//     returns NXDOMAIN in every other region (jwadow #58). We skip this
+//     entry outside us-east-1 so we don't burn a network round-trip on
+//     a guaranteed DNS failure.
+//
+//   - "https://runtime.<region>.kiro.dev/generateAssistantResponse"
+//     Universal Kiro runtime hostname used by jwadow as a regional
+//     replacement for codewhisperer.*. Works in any region where Kiro
+//     is provisioned. We append this for non-us-east-1 regions so the
+//     three-endpoint chain stays full-length.
+//
+//   - q.<region>.amazonaws.com again with X-Amz-Target=AmazonQDeveloper-
+//     StreamingService.SendMessage.
+//
+// All three are tried per-request with auto-fallback on 429.
+func kiroEndpointsForRegion(region string) []kiroEndpoint {
+	if kiroEndpointsOverride != nil {
+		out := make([]kiroEndpoint, len(kiroEndpointsOverride))
+		copy(out, kiroEndpointsOverride)
+		return out
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+	endpoints := []kiroEndpoint{
+		{
+			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "",
+			Name:      "Kiro IDE",
+		},
+	}
+	if region == "us-east-1" {
+		// codewhisperer.* only resolves in us-east-1.
+		endpoints = append(endpoints, kiroEndpoint{
+			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "CodeWhisperer",
+		})
+	} else {
+		// Use the runtime.<region>.kiro.dev hostname as the regional
+		// replacement for codewhisperer.*.
+		endpoints = append(endpoints, kiroEndpoint{
+			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "Kiro Runtime",
+		})
+	}
+	endpoints = append(endpoints, kiroEndpoint{
+		URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
 		Origin:    "AI_EDITOR",
 		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
 		Name:      "AmazonQ",
-	},
+	})
+	return endpoints
 }
+
+// kiroRESTBaseForRegion returns the REST base URL for usage / profile
+// queries in a specific region. us-east-1 uses codewhisperer.<region>;
+// other regions fall back to runtime.<region>.kiro.dev because the
+// codewhisperer.* hostname doesn't resolve outside us-east-1.
+func kiroRESTBaseForRegion(region string) string {
+	if region == "" {
+		region = "us-east-1"
+	}
+	if region == "us-east-1" {
+		return "https://codewhisperer.us-east-1.amazonaws.com"
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev", region)
+}
+
+// Streaming-call timeout knobs. We deliberately do NOT set
+// http.Client.Timeout because that is a wall-clock cap covering the entire
+// body read, which kills long thinking-mode streams (or any stream where
+// total elapsed exceeds the cap) with a "Client.Timeout … while reading
+// body" error. Instead:
+//
+//   - responseHeaderTimeout caps connect + headers, so a stalled handshake
+//     can't hang a request indefinitely.
+//   - streamIdleTimeout is enforced by idleTimeoutReader: each Read must
+//     produce data within this window, otherwise the underlying request
+//     context is cancelled. This kills genuinely dead connections without
+//     punishing slow-but-progressing generations.
+const (
+	responseHeaderTimeout = 60 * time.Second
+	streamIdleTimeout     = 5 * time.Minute
+	restRequestTimeout    = 30 * time.Second
+)
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
@@ -70,7 +160,9 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		// No Timeout: long-running streaming responses are governed by
+		// idleTimeoutReader on the body; ResponseHeaderTimeout on the
+		// transport guards the handshake.
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -88,7 +180,7 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   30 * time.Second,
+		Timeout:   restRequestTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(cacheKey, client)
@@ -107,11 +199,12 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -128,13 +221,15 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		// No Timeout: streaming bodies handle their own idle timeout
+		// (idleTimeoutReader). ResponseHeaderTimeout in the transport
+		// keeps stuck handshakes from leaking forever.
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
 
 	restClient := &http.Client{
-		Timeout:   30 * time.Second,
+		Timeout:   restRequestTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroRestHttpStore.Store(restClient)
@@ -249,31 +344,76 @@ type KiroStreamCallback struct {
 
 // ==================== API Call ====================
 
-// getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
+// maxEndpointChain bounds the worst-case number of endpoints CallKiroAPI
+// will sequentially attempt for a single request. With one configured
+// region this is 3 (Kiro IDE / CodeWhisperer / AmazonQ); a multi-region
+// failover chain (KiroAPIRegions) multiplies that by region count. We
+// cap at 12 so a misconfigured 5-region list can't produce a 15-attempt
+// per-request stall — under responseHeaderTimeout=60s, 12 sequential
+// stuck handshakes is already 12 minutes worst-case, which is the
+// outer limit of "client will tolerate" for a single API call.
+const maxEndpointChain = 12
+
+// getSortedEndpoints returns endpoints ordered by user preference, with
+// optional fallback. When config.KiroAPIRegions is non-empty, the chain
+// expands across all listed regions in order: every endpoint in region[0]
+// is tried before any endpoint in region[1]. With auto-fallback off, only
+// the preferred endpoint in the primary region is used. The total chain
+// is capped at maxEndpointChain to prevent a misconfigured multi-region
+// list from producing per-request timeouts that exceed reasonable client
+// tolerance.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
+	regions := config.GetKiroAPIRegions()
+	if len(regions) == 0 {
+		regions = []string{config.GetKiroAPIRegion()}
+	}
 
+	var all []kiroEndpoint
+	for _, region := range regions {
+		regional := kiroEndpointsForRegion(region)
+		all = append(all, sortRegionalEndpoints(regional, preferred, fallback)...)
+		if !fallback {
+			break
+		}
+		if len(all) >= maxEndpointChain {
+			break
+		}
+	}
+	if len(all) > maxEndpointChain {
+		all = all[:maxEndpointChain]
+	}
+	return all
+}
+
+// sortRegionalEndpoints orders one region's endpoints by the preferred
+// service target, then any others. Returns just the preferred entry when
+// fallback is disabled.
+func sortRegionalEndpoints(endpoints []kiroEndpoint, preferred string, fallback bool) []kiroEndpoint {
 	var primary int
 	switch preferred {
 	case "kiro":
 		primary = 0
 	case "codewhisperer":
+		// Position 1 is CodeWhisperer-style (or the regional Kiro Runtime
+		// replacement) regardless of region.
 		primary = 1
 	case "amazonq":
 		primary = 2
 	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		// "auto" — try in declared order.
+		out := make([]kiroEndpoint, len(endpoints))
+		copy(out, endpoints)
+		return out
 	}
-
+	if primary >= len(endpoints) {
+		primary = 0
+	}
 	if !fallback {
-		// No fallback: only use the selected endpoint
-		return []kiroEndpoint{kiroEndpoints[primary]}
+		return []kiroEndpoint{endpoints[primary]}
 	}
-
-	// With fallback: selected first, then others in order
-	result := []kiroEndpoint{kiroEndpoints[primary]}
-	for i, ep := range kiroEndpoints {
+	result := []kiroEndpoint{endpoints[primary]}
+	for i, ep := range endpoints {
 		if i != primary {
 			result = append(result, ep)
 		}
@@ -353,6 +493,15 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
+		// Each endpoint attempt gets its own cancellable context. Cancel is
+		// invoked either from idleTimeoutReader (no body activity for
+		// streamIdleTimeout) or from the deferred cleanup at end of attempt.
+		// Without this, a stuck stream would either hang indefinitely (since
+		// we removed Client.Timeout) or, with the old wall-clock cap, drop
+		// a still-progressing slow stream.
+		reqCtx, reqCancel := context.WithCancel(context.Background())
+		req = req.WithContext(reqCtx)
+
 		host := ""
 		if parsedURL, parseErr := url.Parse(ep.URL); parseErr == nil {
 			host = parsedURL.Host
@@ -372,6 +521,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
+			reqCancel()
 			lastErr = err
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 			continue
@@ -385,6 +535,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			// guards chain-failover latency against a misbehaving upstream.
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
+			reqCancel()
 			// Per-endpoint throttle is logged at INFO so the operator can see
 			// the chain progress without WARN-level noise. We only WARN once
 			// at the end if EVERY endpoint refused.
@@ -400,6 +551,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			// might return a multi-MB HTML error page.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
+			reqCancel()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
@@ -409,8 +561,14 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		// Wrap body in idleTimeoutReader so a stalled stream cancels the
+		// request context, but a slow-but-progressing stream is allowed to
+		// run indefinitely. parseEventStream reads frame-by-frame so any
+		// real progress resets the timer.
+		body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, reqCancel)
+		err = parseEventStream(body, callback)
 		resp.Body.Close()
+		reqCancel()
 		return err
 	}
 

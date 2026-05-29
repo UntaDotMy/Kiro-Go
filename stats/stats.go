@@ -11,6 +11,7 @@ package stats
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,7 +98,92 @@ func Init(path string) error {
 	}
 	db = conn
 	stmts.upsert = upsert
+	if err := mergeLegacyModelRows(conn); err != nil {
+		// Best-effort migration: log via returned error path is overkill;
+		// stats are non-critical. Future records will be canonical anyway.
+		_ = err
+	}
 	return nil
+}
+
+// mergeLegacyModelRows folds rows whose scope_id differs only by the
+// canonicalization rules in CanonicalModelID into a single canonical row.
+// Without this, upgrading users see legacy duplicate model rows in the
+// Analytics tab even after the per-record canonicalization lands.
+//
+// The merge is done inside one transaction so a crash mid-migration leaves
+// the DB unchanged, not partially merged. Idempotent: re-running on an
+// already-canonical DB is a no-op.
+func mergeLegacyModelRows(conn *sql.DB) error {
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT date, scope_id, requests, success, failed, tokens_in, tokens_out, credits, last_at
+                            FROM daily_stats WHERE scope_type = 'model'`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		date      string
+		legacyID  string
+		canonical string
+		requests  int
+		success   int
+		failed    int
+		tokensIn  int
+		tokensOut int
+		credits   float64
+		lastAt    int64
+	}
+	var legacy []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.date, &r.legacyID, &r.requests, &r.success, &r.failed, &r.tokensIn, &r.tokensOut, &r.credits, &r.lastAt); err != nil {
+			rows.Close()
+			return err
+		}
+		r.canonical = CanonicalModelID(r.legacyID)
+		if r.canonical != r.legacyID {
+			legacy = append(legacy, r)
+		}
+	}
+	rows.Close()
+	if len(legacy) == 0 {
+		return tx.Commit()
+	}
+	upsert, err := tx.Prepare(`
+        INSERT INTO daily_stats(date, scope_type, scope_id, requests, success, failed, tokens_in, tokens_out, credits, last_at)
+        VALUES(?, 'model', ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date, scope_type, scope_id) DO UPDATE SET
+            requests   = requests   + excluded.requests,
+            success    = success    + excluded.success,
+            failed     = failed     + excluded.failed,
+            tokens_in  = tokens_in  + excluded.tokens_in,
+            tokens_out = tokens_out + excluded.tokens_out,
+            credits    = credits    + excluded.credits,
+            last_at    = MAX(last_at, excluded.last_at)
+    `)
+	if err != nil {
+		return err
+	}
+	defer upsert.Close()
+	del, err := tx.Prepare(`DELETE FROM daily_stats WHERE scope_type = 'model' AND date = ? AND scope_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer del.Close()
+	for _, r := range legacy {
+		if _, err := upsert.Exec(r.date, r.canonical, r.requests, r.success, r.failed, r.tokensIn, r.tokensOut, r.credits, r.lastAt); err != nil {
+			return err
+		}
+		if _, err := del.Exec(r.date, r.legacyID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Close flushes any prepared statements and closes the DB handle. Used in
@@ -149,11 +235,43 @@ func Record(modelID, keyID string, success bool, tokensIn, tokensOut int, credit
 	}
 	exec("global", "")
 	if modelID != "" {
-		exec("model", modelID)
+		exec("model", CanonicalModelID(modelID))
 	}
 	if keyID != "" {
 		exec("key", keyID)
 	}
+}
+
+// CanonicalModelID normalizes a model id so the same logical model recorded
+// under different spellings (case, dotted vs dashed version, "-thinking"
+// suffix, leading/trailing whitespace) collapses to a single row in the
+// per-model rollup. Without this, a client that sometimes sends
+// "claude-opus-4.7" and sometimes "claude-opus-4-7" produces two distinct
+// rows that the analytics dashboard renders as duplicates.
+//
+// Rules (applied in order):
+//  1. Trim ASCII whitespace.
+//  2. Lowercase.
+//  3. Replace dots with dashes (Claude Code expects dashed ids; Kiro
+//     internally uses dotted — we standardize on dashed for storage).
+//  4. Strip a trailing "-thinking" / "-think" / "-reasoning" suffix so
+//     the same model with and without thinking mode is one row.
+//
+// The transform is idempotent: feeding output through CanonicalModelID
+// again returns the same string. Empty input returns empty output.
+func CanonicalModelID(model string) string {
+	s := strings.ToLower(strings.TrimSpace(model))
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, ".", "-")
+	for _, suffix := range []string{"-thinking", "-think", "-reasoning"} {
+		if strings.HasSuffix(s, suffix) {
+			s = strings.TrimSuffix(s, suffix)
+			break
+		}
+	}
+	return s
 }
 
 // AllTimeTotals returns aggregate Totals across the entire history for a

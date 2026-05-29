@@ -46,12 +46,26 @@ const (
 	// oversized header can't park an account longer than ~5 min. AWS's own
 	// SDK clamps server-supplied retry-after to [computed_backoff,
 	// computed_backoff + 5s] for the same reason.
-	softCooldownBase  = 5 * time.Second
-	softCooldownMax   = 5 * time.Minute
-	retryAfterMin     = 5 * time.Second
-	retryAfterMax     = 5 * time.Minute
-	nonQuotaCooldown  = 60 * time.Second
-	errorCounterDecay = 5 * time.Minute
+	//
+	// retryAfterMin is the floor for synthesized backoff when upstream does
+	// NOT provide a Retry-After. Real upstream hints (which arrive from
+	// AWS's throttling layer with values as small as ~1s during light
+	// throttling) bypass this floor — clamping a server-supplied 1s up to
+	// 5s wasted four free seconds of capacity per recovery.
+	softCooldownBase    = 5 * time.Second
+	softCooldownMax     = 5 * time.Minute
+	retryAfterMin       = 5 * time.Second
+	retryAfterMax       = 5 * time.Minute
+	retryAfterAbsoluteMin = 1 * time.Second
+	nonQuotaCooldown    = 60 * time.Second
+	errorCounterDecay   = 5 * time.Minute
+
+	// quotaExhaustedCooldown is the cooldown applied when the upstream
+	// returns 402 OVERAGE / monthly-quota exhaustion. These are not
+	// recoverable on a per-minute timescale — the quota resets at month
+	// boundary — so we park the account for an hour and let the periodic
+	// RefreshAccountInfo path notice the reset and re-enable.
+	quotaExhaustedCooldown = 1 * time.Hour
 )
 
 // accountSlot is one entry in the SWRR scheduler. The slot is keyed
@@ -233,35 +247,145 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 	return false
 }
 
-var modelRouteAliases = map[string][]string{
-	"claude-opus-4-7":   {"claude-opus-4.7"},
-	"claude-opus-4.7":   {"claude-opus-4-7"},
-	"claude-opus-4-6":   {"claude-opus-4.6"},
-	"claude-opus-4.6":   {"claude-opus-4-6"},
-	"claude-opus-4-5":   {"claude-opus-4.5"},
-	"claude-opus-4.5":   {"claude-opus-4-5"},
-	"claude-sonnet-4-6": {"claude-sonnet-4.6"},
-	"claude-sonnet-4.6": {"claude-sonnet-4-6"},
-	"claude-sonnet-4-5": {"claude-sonnet-4.5"},
-	"claude-sonnet-4.5": {"claude-sonnet-4-5"},
-	"claude-haiku-4-5":  {"claude-haiku-4.5"},
-	"claude-haiku-4.5":  {"claude-haiku-4-5"},
+// strategyResolver returns the active pool selection strategy. Indirection
+// via a package-level variable lets tests override the strategy without
+// having to bring up a full config; production code points it at
+// config.GetPoolStrategy.
+var strategyResolver = func() string { return config.GetPoolStrategy() }
+
+// accountInGroup reports whether the given account belongs to the named
+// group. Empty group is treated as "no restriction" by the caller; this
+// helper assumes group is non-empty and lower-cased. An account with no
+// Groups configured is universal — it participates in every grouped
+// call so existing deployments that don't use grouping keep working
+// without configuration changes.
+func accountInGroup(a config.Account, group string) bool {
+	if len(a.Groups) == 0 {
+		return true
+	}
+	for _, ag := range a.Groups {
+		if strings.EqualFold(strings.TrimSpace(ag), group) {
+			return true
+		}
+	}
+	return false
 }
 
+// SetStrategyResolverForTesting replaces the strategy resolver so unit
+// tests can drive each branch of the picker without going through config.
+// Tests are expected to restore the previous resolver in a defer.
+func SetStrategyResolverForTesting(fn func() string) (restore func()) {
+	prev := strategyResolver
+	strategyResolver = fn
+	return func() { strategyResolver = prev }
+}
+
+// modelLookupKeys returns the set of ids the model whitelist matcher
+// should compare against. The first entry is the input as-is (lowercased
+// + trimmed); the second, when applicable, is the dotted-vs-dashed twin
+// for Claude family ids — Claude Code uses dashed (claude-opus-4-7),
+// Kiro upstream uses dotted (claude-opus-4.7), and they refer to the
+// same model. The transform is purely mechanical: swap "." and "-" in
+// the version-number suffix only, so a future claude-opus-4-8 / 4.8 /
+// 5-0 / 5-1 / etc. works without a code change.
+//
+// Non-Claude ids and ids without a version-number suffix return only
+// the normalized input.
 func modelLookupKeys(modelID string) []string {
 	normalizedModelID := strings.ToLower(strings.TrimSpace(modelID))
 	if normalizedModelID == "" {
 		return nil
 	}
-
 	keys := []string{normalizedModelID}
-	for _, alias := range modelRouteAliases[normalizedModelID] {
-		keys = append(keys, alias)
+	if twin := claudeAliasTwin(normalizedModelID); twin != "" && twin != normalizedModelID {
+		keys = append(keys, twin)
 	}
 	return keys
 }
 
-// GetNextForModel returns the next account that supports the requested model.
+// claudeAliasTwin returns the dotted-or-dashed twin of a Claude family
+// id, or "" if the input doesn't match the family-version shape we know
+// is interchangeable. Recognized families: opus, sonnet, haiku. Pattern:
+// "claude-<family>-<digits><sep><digits>" where sep is "." or "-",
+// each side is 1-2 digits. Anything else (bare family, dated suffix,
+// non-claude id) returns "".
+//
+// Examples:
+//
+//	claude-opus-4-7      -> claude-opus-4.7
+//	claude-opus-4.7      -> claude-opus-4-7
+//	claude-opus-4-8      -> claude-opus-4.8     (works for new minor)
+//	claude-opus-4-10     -> claude-opus-4.10    (works for double-digit minor)
+//	claude-opus-10-2     -> claude-opus-10.2    (works for double-digit major)
+//	claude-3-5-sonnet    -> ""                  (different family shape)
+//	claude-sonnet-4-20250514 -> ""              (dated suffix, 8-digit "minor")
+//	claude-sonnet-4      -> ""                  (no minor — not a twin pair)
+//	gpt-4o               -> ""                  (not a Claude id)
+func claudeAliasTwin(id string) string {
+	const prefix = "claude-"
+	if !strings.HasPrefix(id, prefix) {
+		return ""
+	}
+	rest := id[len(prefix):]
+	for _, fam := range claudeFamilies {
+		famPrefix := fam + "-"
+		if !strings.HasPrefix(rest, famPrefix) {
+			continue
+		}
+		ver := rest[len(famPrefix):]
+		// Find the version separator. We accept either form, but only
+		// when both sides are 1-2 digits — that distinguishes the
+		// version twin (4-7, 4-10, 10-2) from the dated suffix
+		// (4-20250514, 8-digit right side) and from longer variants
+		// we don't have evidence Anthropic uses.
+		sepIdx := -1
+		for i := 0; i < len(ver); i++ {
+			if ver[i] == '.' || ver[i] == '-' {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx < 1 || sepIdx > 2 {
+			return ""
+		}
+		major := ver[:sepIdx]
+		minor := ver[sepIdx+1:]
+		if len(minor) < 1 || len(minor) > 2 {
+			return ""
+		}
+		if !allDigits(major) || !allDigits(minor) {
+			return ""
+		}
+		// Emit the alternate separator. The whole tail after major+sep
+		// must be exactly the minor digits — anything trailing means
+		// this isn't a clean version pair (so we reject below).
+		if sepIdx+1+len(minor) != len(ver) {
+			return ""
+		}
+		var altSep byte
+		if ver[sepIdx] == '.' {
+			altSep = '-'
+		} else {
+			altSep = '.'
+		}
+		return prefix + famPrefix + major + string(altSep) + minor
+	}
+	return ""
+}
+
+var claudeFamilies = []string{"opus", "sonnet", "haiku"}
+
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// GetNextForModel returns the next account that supports the requested
+// model and belongs to the requested group.
 //
 //   - acc == nil, ok == false                 → no account configured at all
 //     (caller should return 503 / "No available accounts").
@@ -271,8 +395,22 @@ func modelLookupKeys(modelID string) []string {
 //   - acc != nil, ok == true                  → caller should proceed; the
 //     account is eligible and not cooling.
 //
-// model may be empty to skip the model-list filter.
+// model may be empty to skip the model-list filter. group may be empty
+// to skip the group filter. When non-empty, group restricts the pool to
+// accounts whose Groups list includes the named group; accounts with
+// empty Groups participate in every group-restricted call (back-compat
+// for deployments that don't use grouping). The group is supplied by the
+// per-API-key configuration: the handler resolves the inbound API key
+// to a group and passes it here.
 func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Duration, bool) {
+	return p.GetNextForModelInGroup(model, "")
+}
+
+// GetNextForModelInGroup is the group-aware variant of GetNextForModel.
+// New callers should use this directly; GetNextForModel is preserved as a
+// thin wrapper so existing call sites that don't yet thread an API-key
+// group don't have to change.
+func (p *AccountPool) GetNextForModelInGroup(model, group string) (*config.Account, time.Duration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -286,15 +424,20 @@ func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Durat
 	// Normalize once before the per-slot walk so accountHasModel doesn't pay
 	// strings.ToLower + TrimSpace per candidate.
 	modelKey := strings.ToLower(strings.TrimSpace(model))
+	groupKey := strings.ToLower(strings.TrimSpace(group))
 
 	// SWRR walk over eligible slots only. We collect indices of slots that
-	// are currently eligible (model match, no cooldown, token not about to
-	// expire) and run SWRR on that subset. Ineligible slots don't accumulate
-	// currentWeight, so they don't bias future picks toward themselves.
+	// are currently eligible (model match, group match, no cooldown, token
+	// not about to expire) and run SWRR on that subset. Ineligible slots
+	// don't accumulate currentWeight, so they don't bias future picks
+	// toward themselves.
 	var eligible []int
 	var soonest time.Time
 	for i := range p.slots {
 		acc := &p.accounts[i]
+		if groupKey != "" && !accountInGroup(*acc, groupKey) {
+			continue
+		}
 		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {
 			continue
 		}
@@ -321,20 +464,56 @@ func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Durat
 		return nil, 0, false
 	}
 
-	// SWRR pick among the eligible subset.
-	totalEligibleWeight := 0
-	for _, i := range eligible {
-		totalEligibleWeight += p.slots[i].effectiveWeight
-	}
-
-	winner := eligible[0]
-	for _, i := range eligible {
-		p.slots[i].currentWeight += p.slots[i].effectiveWeight
-		if p.slots[i].currentWeight > p.slots[winner].currentWeight {
-			winner = i
+	// Strategy dispatch among the eligible subset. The default is SWRR
+	// (smooth weighted round-robin) — see the package comment for why we
+	// prefer it over plain RR for AWS-identity-bound traffic. The other
+	// strategies trade SWRR's interleaving guarantee for either per-account
+	// "freshness" weighting (least-used) or pure jitter (random); both can
+	// help when the pool is heterogeneous (mixed quotas) or when the
+	// operator wants to break a synchronisation that SWRR alone can't.
+	winner := -1
+	switch strategyResolver() {
+	case "least-used":
+		// Pick the eligible account with the lowest RequestCount. When
+		// counts tie, fall back to LastUsed (older = preferred) so we
+		// drain freshly-added accounts before re-hitting the pool's
+		// long-tenured ones. This naturally tilts traffic toward less
+		// burned accounts without needing an explicit weight.
+		bestReq := -1
+		var bestLastUsed int64
+		for _, i := range eligible {
+			rc := p.accounts[i].RequestCount
+			lu := p.accounts[i].LastUsed
+			if winner == -1 || rc < bestReq || (rc == bestReq && lu < bestLastUsed) {
+				winner = i
+				bestReq = rc
+				bestLastUsed = lu
+			}
 		}
+	case "random":
+		// Uniform random pick among eligible — useful as a control or to
+		// break unintended synchronisation.
+		winner = eligible[rand.Intn(len(eligible))]
+	default:
+		// SWRR (smooth weighted round-robin) — original behavior. Each
+		// pick adds the effective weight to every eligible slot's running
+		// counter, picks the slot with the highest counter, then subtracts
+		// the total eligible weight from the winner. With weights
+		// {a:5, b:1, c:1} this produces a,a,b,a,c,a,a instead of bursting
+		// a,a,a,a,a then b then c.
+		totalEligibleWeight := 0
+		for _, i := range eligible {
+			totalEligibleWeight += p.slots[i].effectiveWeight
+		}
+		winner = eligible[0]
+		for _, i := range eligible {
+			p.slots[i].currentWeight += p.slots[i].effectiveWeight
+			if p.slots[i].currentWeight > p.slots[winner].currentWeight {
+				winner = i
+			}
+		}
+		p.slots[winner].currentWeight -= totalEligibleWeight
 	}
-	p.slots[winner].currentWeight -= totalEligibleWeight
 
 	// Return a copy so the caller can't mutate pool state through the pointer.
 	accCopy := p.accounts[winner]
@@ -411,9 +590,13 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 
 	switch {
 	case isQuotaError && retryAfter > 0:
+		// Honor upstream Retry-After down to retryAfterAbsoluteMin (1s).
+		// Earlier revisions clamped to 5s, which threw away free capacity
+		// whenever AWS hinted at a fast recovery. We still cap the upper
+		// bound so a malformed header can't park the account indefinitely.
 		clamped := retryAfter
-		if clamped < retryAfterMin {
-			clamped = retryAfterMin
+		if clamped < retryAfterAbsoluteMin {
+			clamped = retryAfterAbsoluteMin
 		}
 		if clamped > retryAfterMax {
 			clamped = retryAfterMax
@@ -452,6 +635,34 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 	}
 
 	// Bump the persisted ErrorCount so the admin UI reflects reality.
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ErrorCount++
+			break
+		}
+	}
+}
+
+// RecordQuotaExhaustion is RecordError's heavier sibling for monthly /
+// hard-quota exhaustion (HTTP 402 OVERAGE from upstream). The recoverable
+// timescale here is hours-to-days, not seconds, so we apply a long
+// cooldown (1h) so the SWRR walk skips this account until the periodic
+// RefreshAccountInfo path either notices a quota reset or the operator
+// manually intervenes. Callers that already record the same error via
+// RecordError should NOT also call this — the longer cooldown wins.
+func (p *AccountPool) RecordQuotaExhaustion(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cd := p.cooldowns[id]
+	if cd == nil {
+		cd = &cooldownEntry{}
+		p.cooldowns[id] = cd
+	}
+	now := time.Now()
+	cd.lastErrorAt = now
+	cd.until = now.Add(quotaExhaustedCooldown)
+	cd.lastSleep = quotaExhaustedCooldown
+	cd.consecutiveErrs = 0
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
 			p.accounts[i].ErrorCount++
