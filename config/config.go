@@ -60,15 +60,6 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
-	// Groups assigns this Kiro account to one or more named pools. Combined
-	// with the per-API-key Group field (cfg.APIKey.Group), this lets the
-	// operator route specific keys to specific accounts (e.g. a "premium"
-	// API key only routes to accounts whose Groups list contains
-	// "premium"). An account with no groups participates in every group
-	// restriction (back-compat: existing setups without grouping keep
-	// working without changes). Group names are case-insensitive.
-	Groups []string `json:"groups,omitempty"`
-
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
@@ -248,6 +239,16 @@ type Config struct {
 	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
 	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
+
+	// KnownModels is the last-known-good model catalog fetched from the
+	// upstream Kiro ListAvailableModels endpoint, persisted so a restart
+	// serves real model ids immediately instead of falling back to a
+	// hardcoded guess. It is refreshed automatically whenever a live fetch
+	// succeeds (see proxy.refreshModelsCache). The ids are the raw upstream
+	// (dotted) model ids; the /v1/models layer derives the dashed Claude
+	// Code aliases from them. Empty only on a truly fresh install that has
+	// never reached upstream.
+	KnownModels []string `json:"knownModels,omitempty"`
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -271,7 +272,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.9-A4"
+const Version = "1.0.10-A1"
 
 var (
 	cfg     *Config
@@ -1199,6 +1200,69 @@ func UpdateAllowOverUsage(allow bool) error {
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
 	return Save()
+}
+
+// GetKnownModels returns the persisted last-known-good model catalog (raw
+// upstream model ids). Returns a copy so callers can't mutate config state.
+// Empty only on a fresh install that has never reached upstream.
+func GetKnownModels() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || len(cfg.KnownModels) == 0 {
+		return nil
+	}
+	out := make([]string, len(cfg.KnownModels))
+	copy(out, cfg.KnownModels)
+	return out
+}
+
+// SetKnownModels persists the model catalog fetched from upstream so a
+// restart can serve real model ids before the first live fetch completes.
+// The write is skipped (no-op, no disk churn) when the incoming list is
+// empty or identical to what's already stored — refreshModelsCache calls
+// this on every successful fetch, and most fetches return the same set.
+func SetKnownModels(models []string) error {
+	if len(models) == 0 {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return nil
+	}
+	if sameStringSet(cfg.KnownModels, models) {
+		return nil
+	}
+	dedup := make([]string, 0, len(models))
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		key := strings.ToLower(strings.TrimSpace(m))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		dedup = append(dedup, strings.TrimSpace(m))
+	}
+	cfg.KnownModels = dedup
+	return Save()
+}
+
+// sameStringSet reports whether a and b contain the same set of values
+// (order-insensitive, case-insensitive on trimmed values).
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]bool, len(a))
+	for _, s := range a {
+		seen[strings.ToLower(strings.TrimSpace(s))] = true
+	}
+	for _, s := range b {
+		if !seen[strings.ToLower(strings.TrimSpace(s))] {
+			return false
+		}
+	}
+	return true
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".

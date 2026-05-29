@@ -199,8 +199,14 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		MaxIdleConns: 200,
+		// Nearly all traffic targets a single host (q.<region>.kiro.dev or
+		// codewhisperer.<region>.amazonaws.com), so the per-host idle pool is
+		// what actually bounds connection reuse. The Go default of 2 forced a
+		// fresh TLS dial for every concurrent stream beyond the second;
+		// matching it to MaxIdleConns keeps warm keep-alive connections for
+		// the whole concurrent working set instead of churning handshakes.
+		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,

@@ -62,7 +62,6 @@ func maskAPIKeySecret(s string) string {
 // apiCreateAPIKey creates a new key. Body fields:
 //
 //	name:           label
-//	group:          optional Kiro-account group restriction
 //	models:         optional whitelist
 //	dailyReqLimit:  0 = unlimited
 //	dailyTokLimit:  0 = unlimited
@@ -71,7 +70,6 @@ func maskAPIKeySecret(s string) string {
 func (h *Handler) apiCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name           string   `json:"name"`
-		Group          string   `json:"group,omitempty"`
 		Models         []string `json:"models,omitempty"`
 		DailyReqLimit  int      `json:"dailyReqLimit"`
 		DailyTokLimit  int      `json:"dailyTokLimit"`
@@ -83,7 +81,7 @@ func (h *Handler) apiCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-	key, err := config.AddAPIKey(req.Name, req.Models, req.DailyReqLimit, req.DailyTokLimit, req.DailyCredLimit, req.ExpiresAt, req.Group)
+	key, err := config.AddAPIKey(req.Name, req.Models, req.DailyReqLimit, req.DailyTokLimit, req.DailyCredLimit, req.ExpiresAt)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -100,7 +98,6 @@ func (h *Handler) apiUpdateAPIKey(w http.ResponseWriter, r *http.Request, id str
 		Name              *string   `json:"name,omitempty"`
 		Enabled           *bool     `json:"enabled,omitempty"`
 		Models            *[]string `json:"models,omitempty"`
-		Group             *string   `json:"group,omitempty"`
 		ExpiresAt         *int64    `json:"expiresAt,omitempty"`
 		LazyExpirySeconds *int64    `json:"lazyExpirySeconds,omitempty"`
 		ResetPeriod       *string   `json:"resetPeriod,omitempty"`
@@ -120,7 +117,7 @@ func (h *Handler) apiUpdateAPIKey(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	opts := config.UpdateAPIKeyOptions{
-		Name: req.Name, Enabled: req.Enabled, Models: req.Models, Group: req.Group,
+		Name: req.Name, Enabled: req.Enabled, Models: req.Models,
 		ExpiresAt: req.ExpiresAt, LazyExpirySeconds: req.LazyExpirySeconds,
 		ResetPeriod: req.ResetPeriod, ResetTZ: req.ResetTZ,
 		DailyReqLimit: req.DailyReqLimit, DailyTokLimit: req.DailyTokLimit, DailyCredLimit: req.DailyCredLimit,

@@ -466,3 +466,49 @@ func TestSWRRSkipsCoolingAccount(t *testing.T) {
 		}
 	}
 }
+
+// TestGetNextForModelExcludingSkipsTriedAccounts pins the failover contract:
+// an account in the exclude set is skipped so the dispatcher rotates to a
+// healthy peer after a retryable upstream failure.
+func TestGetNextForModelExcludingSkipsTriedAccounts(t *testing.T) {
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
+
+	// Exclude "a" (as if it just failed): every pick must return "b".
+	exclude := map[string]bool{"a": true}
+	for i := 0; i < 5; i++ {
+		acc, _, ok := p.GetNextForModelExcluding("", exclude)
+		if !ok || acc == nil {
+			t.Fatalf("iteration %d: expected a pick from the remaining account", i)
+		}
+		if acc.ID != "b" {
+			t.Fatalf("excluded account 'a' was picked (got %s)", acc.ID)
+		}
+	}
+}
+
+// TestGetNextForModelExcludingAllExhausted verifies that when every account
+// has been tried (all excluded), the picker reports no eligible account so
+// the dispatcher stops failing over and surfaces the last error.
+func TestGetNextForModelExcludingAllExhausted(t *testing.T) {
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
+
+	exclude := map[string]bool{"a": true, "b": true}
+	if acc, _, ok := p.GetNextForModelExcluding("", exclude); ok || acc != nil {
+		t.Fatalf("expected no pick when all accounts excluded, got %v", acc)
+	}
+}
+
+// TestGetNextForModelNilExcludeBehavesLikeBefore ensures the nil exclude
+// (first attempt) path is unchanged from the original single-pick behavior.
+func TestGetNextForModelNilExcludeBehavesLikeBefore(t *testing.T) {
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "only"}})
+
+	acc, _, ok := p.GetNextForModelExcluding("", nil)
+	if !ok || acc == nil || acc.ID != "only" {
+		t.Fatalf("nil exclude should pick the single eligible account, got %v ok=%v", acc, ok)
+	}
+}
+

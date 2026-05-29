@@ -128,6 +128,24 @@ func NewForTesting() *AccountPool {
 	}
 }
 
+// SetAccountsForTesting populates the pool's account list + SWRR slots
+// directly (mirroring what Reload does from config), so tests in OTHER
+// packages — e.g. proxy's failover dispatcher — can build a pool with known
+// accounts without a config round-trip. Not for production use.
+func (p *AccountPool) SetAccountsForTesting(accounts []config.Account) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.accounts = accounts
+	p.slots = make([]*accountSlot, 0, len(accounts))
+	for _, a := range accounts {
+		w := computeEffectiveWeight(a)
+		if w <= 0 {
+			continue
+		}
+		p.slots = append(p.slots, &accountSlot{effectiveWeight: w})
+	}
+}
+
 // Reload rebuilds the account list and SWRR slots from configuration.
 // Cooldown state and model lists are preserved for accounts that still exist.
 func (p *AccountPool) Reload() {
@@ -253,24 +271,6 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 // config.GetPoolStrategy.
 var strategyResolver = func() string { return config.GetPoolStrategy() }
 
-// accountInGroup reports whether the given account belongs to the named
-// group. Empty group is treated as "no restriction" by the caller; this
-// helper assumes group is non-empty and lower-cased. An account with no
-// Groups configured is universal — it participates in every grouped
-// call so existing deployments that don't use grouping keep working
-// without configuration changes.
-func accountInGroup(a config.Account, group string) bool {
-	if len(a.Groups) == 0 {
-		return true
-	}
-	for _, ag := range a.Groups {
-		if strings.EqualFold(strings.TrimSpace(ag), group) {
-			return true
-		}
-	}
-	return false
-}
-
 // SetStrategyResolverForTesting replaces the strategy resolver so unit
 // tests can drive each branch of the picker without going through config.
 // Tests are expected to restore the previous resolver in a defer.
@@ -385,7 +385,7 @@ func allDigits(s string) bool {
 }
 
 // GetNextForModel returns the next account that supports the requested
-// model and belongs to the requested group.
+// model.
 //
 //   - acc == nil, ok == false                 → no account configured at all
 //     (caller should return 503 / "No available accounts").
@@ -395,22 +395,25 @@ func allDigits(s string) bool {
 //   - acc != nil, ok == true                  → caller should proceed; the
 //     account is eligible and not cooling.
 //
-// model may be empty to skip the model-list filter. group may be empty
-// to skip the group filter. When non-empty, group restricts the pool to
-// accounts whose Groups list includes the named group; accounts with
-// empty Groups participate in every group-restricted call (back-compat
-// for deployments that don't use grouping). The group is supplied by the
-// per-API-key configuration: the handler resolves the inbound API key
-// to a group and passes it here.
+// model may be empty to skip the model-list filter.
 func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Duration, bool) {
-	return p.GetNextForModelInGroup(model, "")
+	return p.GetNextForModelExcluding(model, nil)
 }
 
-// GetNextForModelInGroup is the group-aware variant of GetNextForModel.
-// New callers should use this directly; GetNextForModel is preserved as a
-// thin wrapper so existing call sites that don't yet thread an API-key
-// group don't have to change.
-func (p *AccountPool) GetNextForModelInGroup(model, group string) (*config.Account, time.Duration, bool) {
+// GetNextForModelExcluding is the failover-aware variant of GetNextForModel.
+// The exclude set holds account IDs the caller has already tried and failed
+// on this request, so the picker skips them and returns the next healthy
+// account. Pass nil (or an empty map) for the first pick. This lets the
+// request handler rotate to a peer account when an upstream call returns a
+// retryable error instead of surfacing a 5xx while healthy accounts exist.
+func (p *AccountPool) GetNextForModelExcluding(model string, exclude map[string]bool) (*config.Account, time.Duration, bool) {
+	// Resolve the strategy BEFORE taking the pool lock. strategyResolver ->
+	// config.GetPoolStrategy acquires the config lock; doing it under p.mu
+	// nested two locks on every pick (a contention + lock-ordering hazard on
+	// the request hot path). The strategy rarely changes, so a one-tick-stale
+	// read is harmless.
+	strategy := strategyResolver()
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -424,10 +427,9 @@ func (p *AccountPool) GetNextForModelInGroup(model, group string) (*config.Accou
 	// Normalize once before the per-slot walk so accountHasModel doesn't pay
 	// strings.ToLower + TrimSpace per candidate.
 	modelKey := strings.ToLower(strings.TrimSpace(model))
-	groupKey := strings.ToLower(strings.TrimSpace(group))
 
 	// SWRR walk over eligible slots only. We collect indices of slots that
-	// are currently eligible (model match, group match, no cooldown, token
+	// are currently eligible (model match, not excluded, no cooldown, token
 	// not about to expire) and run SWRR on that subset. Ineligible slots
 	// don't accumulate currentWeight, so they don't bias future picks
 	// toward themselves.
@@ -435,7 +437,7 @@ func (p *AccountPool) GetNextForModelInGroup(model, group string) (*config.Accou
 	var soonest time.Time
 	for i := range p.slots {
 		acc := &p.accounts[i]
-		if groupKey != "" && !accountInGroup(*acc, groupKey) {
+		if exclude != nil && exclude[acc.ID] {
 			continue
 		}
 		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {
@@ -472,7 +474,7 @@ func (p *AccountPool) GetNextForModelInGroup(model, group string) (*config.Accou
 	// help when the pool is heterogeneous (mixed quotas) or when the
 	// operator wants to break a synchronisation that SWRR alone can't.
 	winner := -1
-	switch strategyResolver() {
+	switch strategy {
 	case "least-used":
 		// Pick the eligible account with the lowest RequestCount. When
 		// counts tie, fall back to LastUsed (older = preferred) so we

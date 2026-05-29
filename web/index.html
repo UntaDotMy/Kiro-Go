@@ -1033,6 +1033,17 @@
             border-color: var(--success);
         }
 
+        .btn-warning {
+            background: var(--surface);
+            color: var(--warning);
+            border: 1px solid #fed7aa;
+        }
+
+        .btn-warning:hover {
+            background: #fffbeb;
+            border-color: var(--warning);
+        }
+
         .btn:focus-visible {
             outline: 2px solid var(--brand);
             outline-offset: 2px;
@@ -1745,6 +1756,9 @@
                 'accounts.copyJSONSuccess': 'JSON 已复制到剪贴板',
                 'accounts.trialDays': '天后到期',
                 'accounts.overage': '超额调用',
+                'accounts.overageOn': '超额:开',
+                'accounts.overageOff': '超额:关',
+                'accounts.overageToggleHint': '一键开关：额度用尽后是否继续使用该账号',
                 'time.expired': '已过期',
                 'time.minutes': '分钟',
                 'time.hours': '小时',
@@ -2120,6 +2134,9 @@
                 'accounts.copyJSON': 'Copy JSON',
                 'accounts.copyJSONSuccess': 'JSON copied to clipboard',
                 'accounts.overage': 'Overage',
+                'accounts.overageOn': 'Overage: On',
+                'accounts.overageOff': 'Overage: Off',
+                'accounts.overageToggleHint': 'One-click: keep using this account after its quota is exhausted',
                 'accounts.mainQuota': 'Main Quota',
                 'accounts.trialQuota': 'Trial Quota',
                 'accounts.trial': 'Trial',
@@ -2763,6 +2780,7 @@
                     '<button class="btn btn-sm btn-icon btn-secondary" onclick="copyAccountJSON(\'' + a.id + '\', this)" title="' + t('accounts.copyJSON') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>' +
                     (a.banStatus && a.banStatus !== 'ACTIVE' ? '' :
                         '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>') +
+                    '<button class="btn btn-sm ' + (a.allowOverage ? 'btn-warning' : 'btn-secondary') + '" onclick="toggleOverage(\'' + a.id + '\',' + !a.allowOverage + ')" title="' + t('accounts.overageToggleHint') + '">' + (a.allowOverage ? t('accounts.overageOn') : t('accounts.overageOff')) + '</button>' +
                     '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff">' + t('accounts.test') + '</button>' +
                     '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
                     '</div>' +
@@ -2906,10 +2924,6 @@
                 '<input type="text" id="proxyURLInput" value="' + (a.proxyURL || '') + '" placeholder="socks5://host:port" style="flex:1">' +
                 '<button class="btn btn-sm btn-primary" onclick="saveProxyURL(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div><p style="color:#64748b;font-size:12px;margin-top:4px">' + t('detail.proxyHint') + '</p></div>' +
-                '<div class="detail-section"><h4>Groups</h4><div class="machine-id-row">' +
-                '<input type="text" id="groupsInput" value="' + escapeHTML((a.groups || []).join(', ')) + '" placeholder="premium, experimental" style="flex:1">' +
-                '<button class="btn btn-sm btn-primary" onclick="saveAccountGroups(\'' + id + '\')">' + t('detail.save') + '</button>' +
-                '</div><p style="color:#64748b;font-size:12px;margin-top:4px">Comma-separated group names. Empty = participates in every model. Combined with the Model Group Routing rules in Settings to send specific models to specific accounts.</p></div>' +
                 '<div class="detail-section"><h4>' + t('detail.subscription') + '</h4><div class="detail-grid">' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.subscriptionType') + '</div><div class="detail-value">' + (a.subscriptionTitle || a.subscriptionType || '-') + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.tokenExpiry') + '</div><div class="detail-value">' + (a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') + '</div></div>' +
@@ -3001,21 +3015,6 @@
                 const d = await res.json();
                 if (d.success) { alert(t('detail.saved')); loadAccounts(); } else { alert(t('detail.saveFailed') + ': ' + d.error); }
             } catch (e) { alert(t('detail.saveFailed')); }
-        }
-        async function saveAccountGroups(id) {
-            const raw = (document.getElementById('groupsInput').value || '').trim();
-            // Comma-split; server lowercases + dedupes, so we just need to
-            // chunk and trim here.
-            const groups = raw === '' ? [] : raw.split(',').map(s => s.trim()).filter(s => s.length > 0);
-            try {
-                const res = await fetch('/admin/api/accounts/' + id, {
-                    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                    body: JSON.stringify({ groups })
-                });
-                const d = await res.json();
-                if (d.success) { alert(t('common.saved') || 'Saved'); loadAccounts(); }
-                else alert((t('common.saveFailed') || 'Save failed') + ': ' + (d.error || ''));
-            } catch (e) { alert('Save failed: ' + e.message); }
         }
         async function saveProxyURL(id) {
             const proxyURL = document.getElementById('proxyURLInput').value.trim();
@@ -3292,9 +3291,8 @@
                 // Basic
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.basic')) +
                 '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="' + prefix + 'KeyName" value="' + escape(v('name', '')) + '" placeholder="my-app"></div>' +
-                '<div class="form-group"><label>Account Group</label><input type="text" id="' + prefix + 'KeyGroup" value="' + escape(v('group', '')) + '" placeholder="premium (optional)"><small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Restricts this API key to Kiro accounts that include this group name in their Groups field. Leave empty to use all accounts. Set per-account groups in the Accounts tab.</small></div>' +
                 '<div class="form-group"><label>Allowed Models</label>' +
-                '<div id="' + prefix + 'KeyModelsChecks" data-current="' + escape((Array.isArray(v(\'models\', [])) ? v(\'models\', []) : []).join(\',\')) + '" style="border:1px solid #e5e7eb;border-radius:6px;padding:8px;background:#fff;max-height:180px;overflow-y:auto;font-size:12px">Loading models…</div>' +
+                '<div id="' + prefix + 'KeyModelsChecks" data-current="' + escape((Array.isArray(v('models', [])) ? v('models', []) : []).join(',')) + '" style="border:1px solid #e5e7eb;border-radius:6px;padding:8px;background:#fff;max-height:180px;overflow-y:auto;font-size:12px">Loading models…</div>' +
                 '<input type="text" id="' + prefix + 'KeyModelsExtra" value="" placeholder="extra ids not in the list, comma-separated (rare)" style="margin-top:6px;font-size:12px">' +
                 '<small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Tick the models this key may invoke. Default (none ticked) = all models allowed. Dotted/dashed forms (claude-opus-4.7 ↔ claude-opus-4-7) match interchangeably; calls to disallowed models are rejected before any upstream account is touched, and /v1/models returns only the allowed entries when this key is used. The extra-ids field is for models not yet in the catalog (e.g. preview ids).</small>' +
                 '</div>' +
@@ -3463,7 +3461,6 @@
             }
             return {
                 name: document.getElementById(prefix + 'KeyName').value.trim(),
-                group: document.getElementById(prefix + 'KeyGroup').value.trim(),
                 models,
                 resetPeriod: periodVal,
                 resetTZ: tzVal,
@@ -3830,6 +3827,23 @@
                 method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
                 body: JSON.stringify({ enabled })
             });
+            loadAccounts();
+        }
+        // toggleOverage flips a single account's AllowOverage flag in one click.
+        // When on, the account keeps serving after its quota is exhausted
+        // (at OverageWeight frequency). Optimistically updates the local row
+        // so the button repaints instantly, then reloads to reflect the
+        // server's canonical state.
+        async function toggleOverage(id, allow) {
+            const acc = accountsData.find(a => a.id === id);
+            if (acc) acc.allowOverage = allow;
+            renderAccounts();
+            try {
+                await fetch('/admin/api/accounts/' + id, {
+                    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ allowOverage: allow })
+                });
+            } catch (e) { /* fall through to reload */ }
             loadAccounts();
         }
         async function deleteAccount(id) {

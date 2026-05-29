@@ -305,6 +305,19 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		dashboardHub:    newDashboardHub(),
 	}
+	// Seed the in-memory model cache from the persisted last-known-good
+	// catalog so /v1/models serves real ids immediately after a restart,
+	// before the first live upstream fetch completes. The background
+	// refresh (backgroundRefresh -> refreshModelsCache) overwrites this
+	// with fresh data within ~10s of boot.
+	if known := config.GetKnownModels(); len(known) > 0 {
+		seeded := make([]ModelInfo, 0, len(known))
+		for _, id := range known {
+			seeded = append(seeded, ModelInfo{ModelId: id})
+		}
+		h.cachedModels = seeded
+		h.modelsCacheTime = time.Now().Unix()
+	}
 	// 启动后台刷新
 	safeGo("backgroundRefresh", h.backgroundRefresh)
 	// 启动后台统计保存 (每30秒保存一次)
@@ -559,18 +572,6 @@ func matchedAPIKey(r *http.Request) *config.APIKey {
 func matchedAPIKeyID(r *http.Request) string {
 	if k, ok := r.Context().Value(apiKeyCtxKey{}).(*config.APIKey); ok && k != nil {
 		return k.ID
-	}
-	return ""
-}
-
-// apiKeyGroup returns the Group field of the API key that authenticated
-// this request, or "" if no key is set or the key has no group. The pool
-// uses this to restrict eligible accounts; "" means no restriction.
-// Matches matchedAPIKeyID's nil-tolerant shape so unauthenticated paths
-// (legacy single-key, no key) just see no group restriction.
-func apiKeyGroup(r *http.Request) string {
-	if k, ok := r.Context().Value(apiKeyCtxKey{}).(*config.APIKey); ok && k != nil {
-		return k.Group
 	}
 	return ""
 }
@@ -842,10 +843,39 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	// Used only when the per-account model cache is empty (initial boot,
-	// before any account fetches its model list). Mirror the dedup rules
-	// applied to the live path: dashed Anthropic id + dotted Kiro id, no
-	// dated suffix, no -thinking variant.
+	// Used only when the in-memory per-account model cache is empty (e.g. a
+	// /v1/models hit during the very first cold start, before any live fetch
+	// or persisted catalog seed). Prefer the persisted last-known-good
+	// catalog so we emit the real ids the upstream actually offers; only if
+	// nothing has ever been fetched do we fall to the minimal bootstrap
+	// pairs below. For every id we emit both the canonical dashed Anthropic
+	// form (what Claude Code's picker recognizes) and the dotted Kiro alias.
+	out := make([]map[string]interface{}, 0, 8)
+	seen := make(map[string]bool, 16)
+	emit := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, buildModelInfo(id, "anthropic", true))
+	}
+
+	if known := config.GetKnownModels(); len(known) > 0 {
+		for _, raw := range known {
+			// Dashed canonical form first (Claude Code picker), then the
+			// raw upstream id as an alias. canonicalAnthropicModelID maps
+			// dotted -> dashed mechanically, so future minors just work.
+			emit(kiroModelToAnthropicID(raw))
+			emit(strings.ToLower(strings.TrimSpace(raw)))
+		}
+		_ = thinkingSuffix // suffix variants are no longer emitted
+		return out
+	}
+
+	// Minimal bootstrap — only reached on a truly fresh install that has
+	// never reached upstream. Mirrors the live path's dedup rules: dashed
+	// Anthropic id + dotted Kiro id, no dated suffix, no -thinking variant.
 	pairs := []struct {
 		dashed string
 		dotted string
@@ -856,15 +886,6 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
 		{"claude-opus-4-5", "claude-opus-4.5"},
 		{"claude-sonnet-4", ""},
-	}
-	out := make([]map[string]interface{}, 0, len(pairs)*2)
-	seen := make(map[string]bool, len(pairs)*2)
-	emit := func(id string) {
-		if id == "" || seen[id] {
-			return
-		}
-		seen[id] = true
-		out = append(out, buildModelInfo(id, "anthropic", true))
 	}
 	for _, p := range pairs {
 		emit(p.dashed)
@@ -1151,6 +1172,17 @@ func (h *Handler) refreshModelsCache() {
 		h.modelsCacheTime = time.Now().Unix()
 		h.modelsCacheMu.Unlock()
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
+
+		// Persist the catalog as last-known-good so a restart serves real
+		// model ids immediately instead of the hardcoded bootstrap list.
+		// Best-effort: a write failure is logged but doesn't affect serving.
+		ids := make([]string, 0, len(aggregated))
+		for _, m := range aggregated {
+			ids = append(ids, m.ModelId)
+		}
+		if err := config.SetKnownModels(ids); err != nil {
+			logger.Warnf("[ModelsCache] Failed to persist known models: %v", err)
+		}
 	}
 }
 
@@ -1407,37 +1439,19 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// twice in this handler and three times in the OpenAI variant.
 	thinkingCfg := config.GetThinkingConfig()
 
-	// 获取账号（按模型过滤，优先选支持该模型的账号）
 	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	account, retryAfter, ok := h.pool.GetNextForModelInGroup(actualModel, apiKeyGroup(r))
-	if !ok {
-		if retryAfter > 0 {
-			setRetryAfter(w, retryAfter)
-			h.sendClaudeError(w, 429, "rate_limit_error", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
-			return
-		}
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
-	}
-
-	// 检查并刷新 token
-	if err := h.ensureValidToken(account); err != nil {
-		h.sendClaudeError(w, 503, "api_error", "Token refresh failed: "+err.Error())
-		return
-	}
 
 	// 解析模型和 thinking 模式
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	_ = actualModel // mapping happens inside ClaudeToKiro; keep req.Model as the
-	// original id (e.g. "claude-opus-4-7" or a dated alias the client still
-	// has cached) so the response echoes the exact id the client sent.
+	_, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	// mapping happens inside ClaudeToKiro; keep req.Model as the original id
+	// (e.g. "claude-opus-4-7" or a dated alias the client still has cached)
+	// so the response echoes the exact id the client sent.
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
-	cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
-	// 转换请求
+	// 转换请求（与账号无关，可在多账号故障转移之间复用）
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// Extract the matched APIKey (if any) so the success path can debit
@@ -1448,24 +1462,56 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		matchedKeyID = k.ID
 	}
 
-	// Stream or non-stream
-	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
-	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
+	// Run the upstream call with multi-account failover. The worker is
+	// invoked once per attempt with a freshly-selected account; a retryable
+	// pre-commit failure rotates to a peer (see runWithFailover).
+	worker := func(account *config.Account) (bool, error) {
+		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		// CallKiroAPI mutates payload.ProfileArn to the account's own ARN;
+		// reset it so each attempt resolves the ARN for ITS account, not the
+		// previous failed one.
+		kiroPayload.ProfileArn = ""
+		if req.Stream {
+			return h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
+		}
+		return h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
 	}
+
+	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, worker)
+	if committed {
+		return // worker already wrote the full response (or a mid-stream error)
+	}
+	if err == nil {
+		// No account available at all.
+		if retryAfter > 0 {
+			setRetryAfter(w, retryAfter)
+			h.sendClaudeError(w, 429, "rate_limit_error", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+			return
+		}
+		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		return
+	}
+	// Every attempted account failed pre-commit. Surface the most useful
+	// status: 429 + Retry-After when throttled, else the upstream error.
+	if retryAfter > 0 {
+		setRetryAfter(w, retryAfter)
+		h.sendClaudeError(w, 429, "rate_limit_error", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+		return
+	}
+	h.sendClaudeError(w, 503, "api_error", err.Error())
 }
 
-// handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
+// handleClaudeStream Claude 流式响应. Returns (committed, err). It defers the
+// message_start frame until the first upstream byte arrives so that a
+// pre-commit failure (auth/429/connection error before any content) returns
+// (false, err) and lets the dispatcher fail over to another account without
+// the client ever seeing a partial stream. Once any frame is flushed,
+// committed=true and a later error is surfaced inline as an SSE error event.
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) (bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
-		return
+		return true, nil
 	}
 
 	// 获取 thinking 输出格式配置
@@ -1484,6 +1530,34 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	activeBlockType := ""
 	startInputTokens := estimatedInputTokens
 
+	// committed flips to true the moment we write the first byte to the
+	// client (message_start). Before that, the dispatcher may fail over.
+	committed := false
+	// commit writes the SSE response headers + message_start exactly once,
+	// on the first upstream signal. Idempotent.
+	commit := func() {
+		if committed {
+			return
+		}
+		committed = true
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":            msgID,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []interface{}{},
+				"model":         canonicalAnthropicModelID(model),
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
+			},
+		})
+	}
+
 	closeActiveBlock := func() {
 		if activeBlockIndex < 0 {
 			return
@@ -1500,6 +1574,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		if activeBlockType == blockType {
 			return
 		}
+		commit() // ensure message_start precedes any content frame
 		closeActiveBlock()
 
 		idx := nextContentIndex
@@ -1622,21 +1697,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	// 上游修复（例如截断 bug 的 15-rune 收尾）只改一处会导致漂移。
 	processor := newThinkingProcessor(thinking, sendText, allowReasoningSource, allowTagSource)
 
-	// 发送 message_start
-	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id":            msgID,
-			"type":          "message",
-			"role":          "assistant",
-			"content":       []interface{}{},
-			"model":         canonicalAnthropicModelID(model),
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
-		},
-	})
-
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
 			if text == "" {
@@ -1650,6 +1710,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			processor.Process(text, isThinking)
 		},
 		OnToolUse: func(tu KiroToolUse) {
+			commit() // ensure message_start precedes the tool_use block
 			// 先刷新缓冲区
 			processor.Finalize()
 			rawContentBuilder.WriteString(tu.Name)
@@ -1707,13 +1768,27 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
+		if !committed {
+			// Nothing reached the client yet — let the dispatcher fail over.
+			// Cool this account now; the dispatcher counts the global failure
+			// once all attempts are exhausted.
+			h.recordAttemptError(err, account.ID)
+			return false, err
+		}
+		// Already streaming — we can't fail over. Record the failure (this
+		// committed request failed mid-stream) and surface it inline as an
+		// SSE error event so the client sees it.
 		h.handleUpstreamError(err, account.ID, model, apiKeyID)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
 		})
-		return
+		return true, nil
 	}
+
+	// Success. Ensure message_start was sent even when upstream produced zero
+	// content blocks (rare, but the client still needs a well-formed stream).
+	commit()
 
 	// 刷新剩余缓冲区
 	processor.Finalize()
@@ -1757,6 +1832,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 		"type": "message_stop",
 	})
+	return true, nil
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1848,15 +1924,19 @@ func (h *Handler) recordSuccess(model, apiKeyID string, inputTokens, outputToken
 	// One-line success trace at INFO so operators can verify the counters
 	// chain end-to-end (model -> tokens -> credits -> SQLite). Set
 	// LOG_LEVEL=warn in production if this is too noisy; the data is also
-	// available via /admin/api/status and the Analytics tab.
-	logger.Infof("[Stats] model=%s key=%s in=%d out=%d credits=%.4f total_req=%d total_tok=%d total_cred=%.2f",
-		model,
-		apiKeyIDForLog(apiKeyID),
-		inputTokens, outputTokens, credits,
-		atomic.LoadInt64(&h.totalRequests),
-		atomic.LoadInt64(&h.totalTokens),
-		h.getCredits(),
-	)
+	// available via /admin/api/status and the Analytics tab. Gated on level
+	// so the hot path skips the getCredits() RLock + arg formatting when the
+	// operator runs above INFO.
+	if logger.GetLevel() <= logger.LevelInfo {
+		logger.Infof("[Stats] model=%s key=%s in=%d out=%d credits=%.4f total_req=%d total_tok=%d total_cred=%.2f",
+			model,
+			apiKeyIDForLog(apiKeyID),
+			inputTokens, outputTokens, credits,
+			atomic.LoadInt64(&h.totalRequests),
+			atomic.LoadInt64(&h.totalTokens),
+			h.getCredits(),
+		)
+	}
 	// Realtime push to subscribed dashboards. Best-effort, non-blocking;
 	// see broadcastDashboardUpdate for the slow-consumer policy.
 	h.broadcastDashboardUpdate()
@@ -1890,8 +1970,11 @@ func (h *Handler) checkOverageError(err error, accountID string) {
 	}
 }
 
-// handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) {
+// handleClaudeNonStream Claude 非流式响应. Returns (committed, err): committed
+// is true once the response has been written to the client. On a pre-commit
+// upstream failure it returns (false, err) so the dispatcher can fail over
+// to another account; the dispatcher (not this function) records the error.
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) (bool, error) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
@@ -1916,6 +1999,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
+			// Pool cooldown bookkeeping happens here; the dispatcher handles
+			// stats + overage via handleUpstreamError on the returned error.
 			h.recordPoolError(account.ID, err)
 		},
 		OnCredits: func(c float64) {
@@ -1929,9 +2014,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.handleUpstreamError(err, account.ID, model, apiKeyID)
-		h.sendClaudeError(w, 500, "api_error", err.Error())
-		return
+		// Nothing written to the client yet — let the dispatcher fail over.
+		// Cool this account (+ overage flip) now; the dispatcher records the
+		// single global failed-request count once all attempts are exhausted.
+		h.recordAttemptError(err, account.ID)
+		return false, err
 	}
 
 	// 合并 thinking 内容（如果有 reasoningContentEvent 的内容）
@@ -1991,6 +2078,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
+	return true, nil
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -2036,26 +2124,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// Snapshot thinking config once (see handleClaudeMessages for rationale).
 	thinkingCfg := config.GetThinkingConfig()
 
-	actualModel, _ := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	account, retryAfter, ok := h.pool.GetNextForModelInGroup(actualModel, apiKeyGroup(r))
-	if !ok {
-		if retryAfter > 0 {
-			setRetryAfter(w, retryAfter)
-			h.sendOpenAIError(w, 429, "rate_limit_exceeded", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
-			return
-		}
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
-	}
-
-	if err := h.ensureValidToken(account); err != nil {
-		h.sendOpenAIError(w, 503, "server_error", "Token refresh failed")
-		return
-	}
-
-	// 解析模型和 thinking 模式
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	_ = actualModel // OpenAIToKiro maps the model internally for the Kiro upstream call;
+	// OpenAIToKiro maps the model internally for the Kiro upstream call;
 	// keep req.Model as the original id so the response echoes what the client sent.
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
@@ -2066,23 +2136,42 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		matchedKeyID = k.ID
 	}
 
-	if req.Stream {
-		h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
-	} else {
-		h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+	worker := func(account *config.Account) (bool, error) {
+		kiroPayload.ProfileArn = "" // re-resolve per attempt account
+		if req.Stream {
+			return h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+		}
+		return h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
 	}
+
+	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, worker)
+	if committed {
+		return
+	}
+	if err == nil {
+		if retryAfter > 0 {
+			setRetryAfter(w, retryAfter)
+			h.sendOpenAIError(w, 429, "rate_limit_exceeded", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+			return
+		}
+		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		return
+	}
+	if retryAfter > 0 {
+		setRetryAfter(w, retryAfter)
+		h.sendOpenAIError(w, 429, "rate_limit_exceeded", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
+		return
+	}
+	h.sendOpenAIError(w, 503, "server_error", err.Error())
 }
 
-// handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
+// handleOpenAIStream OpenAI 流式响应. Returns (committed, err): defers the
+// first chunk so a pre-commit failure can fail over to another account.
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
-		return
+		return true, nil
 	}
 
 	// 获取 thinking 输出格式配置
@@ -2101,6 +2190,22 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	var rawContentBuilder strings.Builder
 	var rawReasoningBuilder strings.Builder
 	var upstreamStopReason string
+
+	// committed flips true on the first chunk written to the client. emit is
+	// the single choke point for streaming bytes: it sets the SSE headers +
+	// committed on first use, then writes & flushes one data frame. Before
+	// the first emit, a failure can be retried on a peer account.
+	committed := false
+	emit := func(data []byte) {
+		if !committed {
+			committed = true
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+		}
+		writeOpenAIDataFrame(w, data)
+		flusher.Flush()
+	}
 
 	// Thinking 标签解析状态由 thinkingTextProcessor 内部管理。
 
@@ -2202,8 +2307,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			}
 		}
 		data, _ := json.Marshal(chunk)
-		writeOpenAIDataFrame(w, data)
-		flusher.Flush()
+		emit(data)
 	}
 
 	// 处理文本，解析 <thinking> 标签
@@ -2258,8 +2362,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			}
 			toolCallIndex++
 			data, _ := json.Marshal(chunk)
-			writeOpenAIDataFrame(w, data)
-			flusher.Flush()
+			emit(data)
 		},
 		OnComplete: func(inTok, outTok int) {
 			inputTokens = inTok
@@ -2279,8 +2382,18 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
+		if !committed {
+			// Nothing reached the client — let the dispatcher fail over.
+			h.recordAttemptError(err, account.ID)
+			return false, err
+		}
+		// Mid-stream failure on a committed response: record it and end the
+		// (partial) stream with [DONE]. The OpenAI streaming wire format has
+		// no error frame, so the client sees a truncated response.
 		h.handleUpstreamError(err, account.ID, model, apiKeyID)
-		return
+		w.Write(openAIDoneFrame)
+		flusher.Flush()
+		return true, nil
 	}
 
 	// 刷新剩余缓冲区
@@ -2333,13 +2446,16 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 	data, _ := json.Marshal(chunk)
-	writeOpenAIDataFrame(w, data)
+	// Ensure headers are committed even for an empty-content success.
+	emit(data)
 	w.Write(openAIDoneFrame)
 	flusher.Flush()
+	return true, nil
 }
 
-// handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+// handleOpenAINonStream OpenAI 非流式响应. Returns (committed, err); on a
+// pre-commit upstream failure returns (false, err) for dispatcher failover.
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
 	var content string
 	var reasoningContent string
 	var toolUses []KiroToolUse
@@ -2368,9 +2484,10 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 
 	err := CallKiroAPI(account, payload, callback)
 	if err != nil {
-		h.handleUpstreamError(err, account.ID, model, apiKeyID)
-		h.sendOpenAIError(w, 500, "server_error", err.Error())
-		return
+		// Nothing written yet — cool this account and let the dispatcher
+		// fail over (it records the single global failure on giving up).
+		h.recordAttemptError(err, account.ID)
+		return false, err
 	}
 
 	// 解析 content 中的 <thinking> 标签
@@ -2400,6 +2517,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
+	return true, nil
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
@@ -2634,7 +2752,6 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"allowOverage":      a.AllowOverage,
 			"overageWeight":     a.OverageWeight,
 			"proxyURL":          a.ProxyURL,
-			"groups":            a.Groups,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -2752,27 +2869,6 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
-	}
-	if v, ok := updates["groups"].([]interface{}); ok {
-		// JSON arrays decode to []interface{}; coerce to a clean []string,
-		// dropping non-strings, empties, and duplicates. Lowercase so the
-		// pool's accountInGroup compare (EqualFold-based) is consistent
-		// regardless of casing chosen in the UI.
-		seen := map[string]bool{}
-		groups := make([]string, 0, len(v))
-		for _, raw := range v {
-			s, ok := raw.(string)
-			if !ok {
-				continue
-			}
-			s = strings.ToLower(strings.TrimSpace(s))
-			if s == "" || seen[s] {
-				continue
-			}
-			seen[s] = true
-			groups = append(groups, s)
-		}
-		existing.Groups = groups
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {

@@ -47,7 +47,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
 	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
 
-	account, retryAfter, ok := h.pool.GetNextForModelInGroup(mappedModel, apiKeyGroup(r))
+	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
 	if !ok {
 		if retryAfter > 0 {
 			setRetryAfter(w, retryAfter)
@@ -76,6 +76,12 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		includeReasoning = false
 	}
 
+	// The Responses path keeps its original single-account behavior for
+	// account selection above (token refresh, skeleton emission). Failover
+	// across accounts is handled by the Claude/OpenAI chat endpoints, which
+	// carry the bulk of Claude Code / SDK traffic; the Responses (Codex)
+	// path emits a response.created skeleton up front, so a mid-flight
+	// switch would require replaying that handshake. We keep it simple here.
 	if req.Stream {
 		h.handleResponsesStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
 	} else {
