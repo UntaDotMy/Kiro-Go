@@ -152,32 +152,86 @@ func hourBucket(tz string) string {
 	return time.Now().In(resolveResetTZ(tz)).Format("2006010215")
 }
 
-var apiKeyModelAliases = map[string][]string{
-	"claude-opus-4-7":   {"claude-opus-4.7"},
-	"claude-opus-4.7":   {"claude-opus-4-7"},
-	"claude-opus-4-6":   {"claude-opus-4.6"},
-	"claude-opus-4.6":   {"claude-opus-4-6"},
-	"claude-opus-4-5":   {"claude-opus-4.5"},
-	"claude-opus-4.5":   {"claude-opus-4-5"},
-	"claude-sonnet-4-6": {"claude-sonnet-4.6"},
-	"claude-sonnet-4.6": {"claude-sonnet-4-6"},
-	"claude-sonnet-4-5": {"claude-sonnet-4.5"},
-	"claude-sonnet-4.5": {"claude-sonnet-4-5"},
-	"claude-haiku-4-5":  {"claude-haiku-4.5"},
-	"claude-haiku-4.5":  {"claude-haiku-4-5"},
-}
-
+// modelWhitelistCandidates returns the set of ids the per-key model
+// allowlist should compare against. Mirrors pool.modelLookupKeys: the
+// first entry is the input as-is (lowercased + trimmed), the second is
+// the dotted-vs-dashed twin for Claude family ids — Claude Code uses
+// dashed (claude-opus-4-7), Kiro upstream uses dotted (claude-opus-4.7),
+// they refer to the same model. The transform is purely mechanical so
+// future Claude minor versions (4-8 / 4.8 / 5-0 / etc.) work without a
+// code change.
 func modelWhitelistCandidates(model string) []string {
 	normalizedModel := strings.ToLower(strings.TrimSpace(model))
 	if normalizedModel == "" {
 		return nil
 	}
-
 	candidates := []string{normalizedModel}
-	for _, alias := range apiKeyModelAliases[normalizedModel] {
-		candidates = append(candidates, alias)
+	if twin := claudeAliasTwin(normalizedModel); twin != "" && twin != normalizedModel {
+		candidates = append(candidates, twin)
 	}
 	return candidates
+}
+
+// claudeAliasTwin returns the dotted-or-dashed twin of a Claude family
+// id, or "" if the input doesn't match the family-version shape we know
+// is interchangeable. Mirrors pool.claudeAliasTwin so allowlist and
+// router stay in lockstep — keep these two implementations identical
+// when adding families or relaxing the version pattern.
+//
+// Pattern: "claude-<family>-<digits><sep><digits>" where family ∈ {opus,
+// sonnet, haiku}, sep is "." or "-", each side is 1-2 digits. Anything
+// else (bare family, dated suffix, non-claude id) returns "".
+func claudeAliasTwin(id string) string {
+	const prefix = "claude-"
+	if !strings.HasPrefix(id, prefix) {
+		return ""
+	}
+	rest := id[len(prefix):]
+	for _, fam := range []string{"opus", "sonnet", "haiku"} {
+		famPrefix := fam + "-"
+		if !strings.HasPrefix(rest, famPrefix) {
+			continue
+		}
+		ver := rest[len(famPrefix):]
+		sepIdx := -1
+		for i := 0; i < len(ver); i++ {
+			if ver[i] == '.' || ver[i] == '-' {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx < 1 || sepIdx > 2 {
+			return ""
+		}
+		major := ver[:sepIdx]
+		minor := ver[sepIdx+1:]
+		if len(minor) < 1 || len(minor) > 2 {
+			return ""
+		}
+		if !apikeyAllDigits(major) || !apikeyAllDigits(minor) {
+			return ""
+		}
+		if sepIdx+1+len(minor) != len(ver) {
+			return ""
+		}
+		var altSep byte
+		if ver[sepIdx] == '.' {
+			altSep = '-'
+		} else {
+			altSep = '.'
+		}
+		return prefix + famPrefix + major + string(altSep) + minor
+	}
+	return ""
+}
+
+func apikeyAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 func modelIsAllowedByWhitelist(allowedModels []string, model string) bool {

@@ -280,32 +280,108 @@ func SetStrategyResolverForTesting(fn func() string) (restore func()) {
 	return func() { strategyResolver = prev }
 }
 
-var modelRouteAliases = map[string][]string{
-	"claude-opus-4-7":   {"claude-opus-4.7"},
-	"claude-opus-4.7":   {"claude-opus-4-7"},
-	"claude-opus-4-6":   {"claude-opus-4.6"},
-	"claude-opus-4.6":   {"claude-opus-4-6"},
-	"claude-opus-4-5":   {"claude-opus-4.5"},
-	"claude-opus-4.5":   {"claude-opus-4-5"},
-	"claude-sonnet-4-6": {"claude-sonnet-4.6"},
-	"claude-sonnet-4.6": {"claude-sonnet-4-6"},
-	"claude-sonnet-4-5": {"claude-sonnet-4.5"},
-	"claude-sonnet-4.5": {"claude-sonnet-4-5"},
-	"claude-haiku-4-5":  {"claude-haiku-4.5"},
-	"claude-haiku-4.5":  {"claude-haiku-4-5"},
-}
-
+// modelLookupKeys returns the set of ids the model whitelist matcher
+// should compare against. The first entry is the input as-is (lowercased
+// + trimmed); the second, when applicable, is the dotted-vs-dashed twin
+// for Claude family ids — Claude Code uses dashed (claude-opus-4-7),
+// Kiro upstream uses dotted (claude-opus-4.7), and they refer to the
+// same model. The transform is purely mechanical: swap "." and "-" in
+// the version-number suffix only, so a future claude-opus-4-8 / 4.8 /
+// 5-0 / 5-1 / etc. works without a code change.
+//
+// Non-Claude ids and ids without a version-number suffix return only
+// the normalized input.
 func modelLookupKeys(modelID string) []string {
 	normalizedModelID := strings.ToLower(strings.TrimSpace(modelID))
 	if normalizedModelID == "" {
 		return nil
 	}
-
 	keys := []string{normalizedModelID}
-	for _, alias := range modelRouteAliases[normalizedModelID] {
-		keys = append(keys, alias)
+	if twin := claudeAliasTwin(normalizedModelID); twin != "" && twin != normalizedModelID {
+		keys = append(keys, twin)
 	}
 	return keys
+}
+
+// claudeAliasTwin returns the dotted-or-dashed twin of a Claude family
+// id, or "" if the input doesn't match the family-version shape we know
+// is interchangeable. Recognized families: opus, sonnet, haiku. Pattern:
+// "claude-<family>-<digits><sep><digits>" where sep is "." or "-",
+// each side is 1-2 digits. Anything else (bare family, dated suffix,
+// non-claude id) returns "".
+//
+// Examples:
+//
+//	claude-opus-4-7      -> claude-opus-4.7
+//	claude-opus-4.7      -> claude-opus-4-7
+//	claude-opus-4-8      -> claude-opus-4.8     (works for new minor)
+//	claude-opus-4-10     -> claude-opus-4.10    (works for double-digit minor)
+//	claude-opus-10-2     -> claude-opus-10.2    (works for double-digit major)
+//	claude-3-5-sonnet    -> ""                  (different family shape)
+//	claude-sonnet-4-20250514 -> ""              (dated suffix, 8-digit "minor")
+//	claude-sonnet-4      -> ""                  (no minor — not a twin pair)
+//	gpt-4o               -> ""                  (not a Claude id)
+func claudeAliasTwin(id string) string {
+	const prefix = "claude-"
+	if !strings.HasPrefix(id, prefix) {
+		return ""
+	}
+	rest := id[len(prefix):]
+	for _, fam := range claudeFamilies {
+		famPrefix := fam + "-"
+		if !strings.HasPrefix(rest, famPrefix) {
+			continue
+		}
+		ver := rest[len(famPrefix):]
+		// Find the version separator. We accept either form, but only
+		// when both sides are 1-2 digits — that distinguishes the
+		// version twin (4-7, 4-10, 10-2) from the dated suffix
+		// (4-20250514, 8-digit right side) and from longer variants
+		// we don't have evidence Anthropic uses.
+		sepIdx := -1
+		for i := 0; i < len(ver); i++ {
+			if ver[i] == '.' || ver[i] == '-' {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx < 1 || sepIdx > 2 {
+			return ""
+		}
+		major := ver[:sepIdx]
+		minor := ver[sepIdx+1:]
+		if len(minor) < 1 || len(minor) > 2 {
+			return ""
+		}
+		if !allDigits(major) || !allDigits(minor) {
+			return ""
+		}
+		// Emit the alternate separator. The whole tail after major+sep
+		// must be exactly the minor digits — anything trailing means
+		// this isn't a clean version pair (so we reject below).
+		if sepIdx+1+len(minor) != len(ver) {
+			return ""
+		}
+		var altSep byte
+		if ver[sepIdx] == '.' {
+			altSep = '-'
+		} else {
+			altSep = '.'
+		}
+		return prefix + famPrefix + major + string(altSep) + minor
+	}
+	return ""
+}
+
+var claudeFamilies = []string{"opus", "sonnet", "haiku"}
+
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // GetNextForModel returns the next account that supports the requested

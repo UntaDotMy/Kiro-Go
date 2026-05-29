@@ -875,30 +875,17 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 }
 
 // kiroModelToAnthropicID converts Kiro's internal dotted model id (e.g.
-// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic dashed
-// form Claude Code recognizes in its model picker. Dated suffixes (e.g.
-// "-20251101") are intentionally omitted: Claude Code resolves the family
-// from the dashed form alone, and emitting both creates duplicate picker
-// entries that map to the same upstream model.
+// "claude-opus-4.7", "claude-sonnet-4.5") to the canonical Anthropic
+// dashed form Claude Code recognizes in its model picker. Dated suffixes
+// (e.g. "-20251101") are intentionally NOT stripped: the input from
+// Kiro's ListAvailableModels is the family id, never the dated form.
+//
+// The transformation is purely mechanical (every "." -> "-") which makes
+// it forwards-compatible: a future claude-opus-4.8 / 4.9 / 5.0 just works
+// without a code change. We delegate to canonicalAnthropicModelID so the
+// request response shape and this listing path share one definition.
 func kiroModelToAnthropicID(kiroID string) string {
-	switch strings.ToLower(strings.TrimSpace(kiroID)) {
-	case "claude-opus-4.7":
-		return "claude-opus-4-7"
-	case "claude-opus-4.6":
-		return "claude-opus-4-6"
-	case "claude-opus-4.5":
-		return "claude-opus-4-5"
-	case "claude-sonnet-4.6":
-		return "claude-sonnet-4-6"
-	case "claude-sonnet-4.5":
-		return "claude-sonnet-4-5"
-	case "claude-sonnet-4":
-		return "claude-sonnet-4"
-	case "claude-haiku-4.5":
-		return "claude-haiku-4-5"
-	}
-	// Already in dashed form, or unknown — return as-is.
-	return kiroID
+	return canonicalAnthropicModelID(strings.ToLower(strings.TrimSpace(kiroID)))
 }
 
 func modelSupportsImage(inputTypes []string) bool {
