@@ -5,6 +5,30 @@ import (
 	"math"
 )
 
+// resolveInputTokens applies the token-count precedence used across every
+// response finalization path (most → least accurate):
+//
+//  1. upstream: the exact input_tokens reported in the Kiro event stream.
+//  2. contextDerived: contextUsagePercentage × context window — the model's
+//     own accounting, but coarse (rounded to a percentage).
+//  3. estimated: our local char-heuristic estimate, a last resort.
+//
+// CLIs (Claude Code, opencode, Cline, Codex) trust the usage we return
+// verbatim, so an exact upstream count must never be overwritten by the
+// coarser fallbacks.
+func resolveInputTokens(upstream, contextDerived, estimated int) int {
+	if upstream > 0 {
+		return upstream
+	}
+	if contextDerived > 0 {
+		return contextDerived
+	}
+	if estimated > 0 {
+		return estimated
+	}
+	return 0
+}
+
 func estimateApproxTokens(text string) int {
 	if text == "" {
 		return 0

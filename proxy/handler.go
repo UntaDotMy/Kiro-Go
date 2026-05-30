@@ -1794,11 +1794,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	processor.Finalize()
 	closeActiveBlock()
 
-	if realInputTokens > 0 {
-		inputTokens = realInputTokens
-	} else if inputTokens <= 0 {
-		inputTokens = estimatedInputTokens
-	}
+	// Token precedence (most → least accurate): the exact upstream count from
+	// the event stream wins; if upstream sent none, fall back to the model's
+	// own contextUsagePercentage × window (coarse, rounded to a percentage);
+	// only estimate locally as a last resort.
+	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	thinkingOutput := rawThinkingBuilder.String()
 	if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1807,7 +1807,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	if !thinking {
 		thinkingOutput = ""
 	}
-	outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+	if outputTokens <= 0 {
+		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+	}
 
 	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
@@ -2032,12 +2034,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		rawThinkingContent = ""
 	}
 
-	if realInputTokens > 0 {
-		inputTokens = realInputTokens
-	} else if inputTokens <= 0 {
-		inputTokens = estimatedInputTokens
+	// Token precedence (most → least accurate): the exact upstream count from
+	// the event stream wins; if upstream sent none, fall back to the model's
+	// own contextUsagePercentage × window (coarse, rounded to a percentage);
+	// only estimate locally as a last resort.
+	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
+	if outputTokens <= 0 {
+		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 	}
-	outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
@@ -2399,11 +2403,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	// 刷新剩余缓冲区
 	processor.Finalize()
 
-	if realInputTokens > 0 {
-		inputTokens = realInputTokens
-	} else if inputTokens <= 0 {
-		inputTokens = estimatedInputTokens
-	}
+	// Token precedence (most → least accurate): the exact upstream count from
+	// the event stream wins; if upstream sent none, fall back to the model's
+	// own contextUsagePercentage × window (coarse, rounded to a percentage);
+	// only estimate locally as a last resort.
+	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	reasoningOutput := rawReasoningBuilder.String()
 	if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -2412,10 +2416,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	if !thinking {
 		reasoningOutput = ""
 	}
-	outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
-	for _, tc := range toolCalls {
-		outputTokens += estimateApproxTokens(tc.Function.Name)
-		outputTokens += estimateApproxTokens(tc.Function.Arguments)
+	if outputTokens <= 0 {
+		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+		for _, tc := range toolCalls {
+			outputTokens += estimateApproxTokens(tc.Function.Name)
+			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+		}
 	}
 
 	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
@@ -2498,12 +2504,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		reasoningContent = ""
 	}
 
-	if realInputTokens > 0 {
-		inputTokens = realInputTokens
-	} else if inputTokens <= 0 {
-		inputTokens = estimatedInputTokens
+	// Token precedence (most → least accurate): the exact upstream count from
+	// the event stream wins; if upstream sent none, fall back to the model's
+	// own contextUsagePercentage × window (coarse, rounded to a percentage);
+	// only estimate locally as a last resort.
+	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
+	if outputTokens <= 0 {
+		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 	}
-	outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.pool.RecordSuccess(account.ID)
