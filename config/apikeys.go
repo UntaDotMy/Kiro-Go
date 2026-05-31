@@ -474,8 +474,12 @@ func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
 		if k.LifetimeReqLimit > 0 && k.TotalRequests+1 > k.LifetimeReqLimit {
 			return true, "lifetime request limit reached"
 		}
-		// Token / credit limits checked again on commit with real values; here
-		// we only verify the current totals haven't already crossed the line.
+		// Token / credit limits: token & credit amounts per request are only
+		// known after the response completes, so the pre-flight gate can't
+		// predict the next request's size. Instead we reject once the recorded
+		// totals have crossed the line (ConsumeAPIKey records actual usage,
+		// including the request that crossed it). This is the gate that enforces
+		// periodic token/credit caps — ConsumeAPIKey only records, never blocks.
 		if k.DailyTokLimit > 0 && k.DailyTokens >= k.DailyTokLimit {
 			return true, "periodic token limit reached"
 		}
@@ -494,20 +498,27 @@ func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
 	return false, ""
 }
 
-// ConsumeAPIKey records request usage against a key's counters and lifetime
-// totals. Order of checks (any failure rejects without consuming):
+// ConsumeAPIKey records the usage of a request that has ALREADY completed and
+// been delivered to the client. Because the response is already on the wire
+// (streaming can't be un-sent), this function cannot gate the current request —
+// blocking is the pre-flight gate's job (CheckAPIKeyLimit). Its responsibilities
+// are therefore:
 //
-//  1. Key disabled               → reject
-//  2. Absolute expiry passed     → reject (also auto-disables)
-//  3. Lazy expiry triggered      → reject (also auto-disables)
-//  4. Model not in whitelist     → reject
-//  5. Per-minute rate limit hit  → reject
-//  6. Per-hour rate limit hit    → reject
-//  7. Periodic limit reached     → reject
-//  8. Lifetime limit reached     → reject (also auto-disables)
+//  1. ALWAYS record actual usage (requests, tokens, credits) against the minute/
+//     hour/periodic/lifetime counters, after rolling over any expired bucket.
+//     This is critical: token & credit amounts are unknown until the response
+//     finishes, so if we skipped recording whenever a request crossed the limit
+//     (the old behavior), the counter would freeze just below the threshold and
+//     the periodic token/credit cap would NEVER trip on the next pre-flight —
+//     i.e. the key would serve forever. We must record the crossing so the next
+//     CheckAPIKeyLimit sees DailyTokens >= limit and rejects.
+//  2. Auto-disable the key when a HARD cap is reached: absolute/lazy expiry and
+//     lifetime request/token/credit limits. (Periodic caps are NOT permanent —
+//     they reset on the period boundary and are enforced purely by the
+//     pre-flight gate, so we do not disable on them.)
 //
-// On success: increments all counters, updates LastUsedAt + FirstUsedAt,
-// persists.
+// The (rejected, reason) return is advisory (used for logging) since callers
+// already committed the response; recording + auto-disable are the real effects.
 func ConsumeAPIKey(id string, tokens int, credits float64, model string) (rejected bool, reason string) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -516,28 +527,10 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 			continue
 		}
 		k := &cfg.APIKeys[i]
-
 		now := time.Now().Unix()
-		if !k.Enabled {
-			return true, "key disabled"
-		}
-		// Absolute expiry.
-		if k.ExpiresAt > 0 && now > k.ExpiresAt {
-			k.Enabled = false
-			_ = Save()
-			return true, "key expired"
-		}
-		// Lazy expiry: countdown from FirstUsedAt.
-		if k.LazyExpirySeconds > 0 && k.FirstUsedAt > 0 && now > k.FirstUsedAt+k.LazyExpirySeconds {
-			k.Enabled = false
-			_ = Save()
-			return true, "key expired (lazy)"
-		}
-		// Model whitelist.
-		if model != "" && !modelIsAllowedByWhitelist(k.Models, model) {
-			return true, "model '" + model + "' not allowed for this key"
-		}
-		// Reset minute / hour buckets if rolled over.
+
+		// Roll over minute / hour / periodic buckets BEFORE recording so usage
+		// lands in the current window.
 		curMin := minuteBucket(k.ResetTZ)
 		if k.minuteBucketKey != curMin {
 			k.minuteBucketKey = curMin
@@ -548,15 +541,6 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 			k.hourBucketKey = curHour
 			k.HourRequests = 0
 		}
-		// Per-minute rate limit (requests only).
-		if k.MinuteReqLimit > 0 && k.MinuteRequests+1 > k.MinuteReqLimit {
-			return true, "per-minute rate limit reached"
-		}
-		// Per-hour rate limit.
-		if k.HourReqLimit > 0 && k.HourRequests+1 > k.HourReqLimit {
-			return true, "per-hour rate limit reached"
-		}
-		// Periodic counters reset.
 		bucket := periodBucketKey(k.ResetPeriod, k.ResetTZ)
 		if k.CountersDate != bucket {
 			k.CountersDate = bucket
@@ -564,33 +548,8 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 			k.DailyTokens = 0
 			k.DailyCredits = 0
 		}
-		// Periodic limits.
-		if k.DailyReqLimit > 0 && k.DailyRequests+1 > k.DailyReqLimit {
-			return true, "periodic request limit reached"
-		}
-		if k.DailyTokLimit > 0 && k.DailyTokens+tokens > k.DailyTokLimit {
-			return true, "periodic token limit reached"
-		}
-		if k.DailyCredLimit > 0 && k.DailyCredits+credits > k.DailyCredLimit {
-			return true, "periodic credit limit reached"
-		}
-		// Lifetime limits — these auto-disable the key when reached.
-		if k.LifetimeReqLimit > 0 && k.TotalRequests+1 > k.LifetimeReqLimit {
-			k.Enabled = false
-			_ = Save()
-			return true, "lifetime request limit reached (key disabled)"
-		}
-		if k.LifetimeTokLimit > 0 && k.TotalTokens+tokens > k.LifetimeTokLimit {
-			k.Enabled = false
-			_ = Save()
-			return true, "lifetime token limit reached (key disabled)"
-		}
-		if k.LifetimeCredLimit > 0 && k.TotalCredits+credits > k.LifetimeCredLimit {
-			k.Enabled = false
-			_ = Save()
-			return true, "lifetime credit limit reached (key disabled)"
-		}
-		// All checks passed; commit.
+
+		// Record actual usage unconditionally (the request happened).
 		k.MinuteRequests++
 		k.HourRequests++
 		k.DailyRequests++
@@ -603,8 +562,49 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 		if k.FirstUsedAt == 0 {
 			k.FirstUsedAt = now
 		}
+
+		// Evaluate caps for reporting + hard-cap auto-disable.
+		rejected, reason = false, ""
+
+		// Expiry → disable.
+		if k.ExpiresAt > 0 && now > k.ExpiresAt {
+			k.Enabled = false
+			rejected, reason = true, "key expired"
+		} else if k.LazyExpirySeconds > 0 && k.FirstUsedAt > 0 && now > k.FirstUsedAt+k.LazyExpirySeconds {
+			k.Enabled = false
+			rejected, reason = true, "key expired (lazy)"
+		}
+
+		// Lifetime caps → disable (permanent until an operator intervenes).
+		if k.LifetimeReqLimit > 0 && k.TotalRequests >= k.LifetimeReqLimit {
+			k.Enabled = false
+			rejected, reason = true, "lifetime request limit reached (key disabled)"
+		}
+		if k.LifetimeTokLimit > 0 && k.TotalTokens >= k.LifetimeTokLimit {
+			k.Enabled = false
+			rejected, reason = true, "lifetime token limit reached (key disabled)"
+		}
+		if k.LifetimeCredLimit > 0 && k.TotalCredits >= k.LifetimeCredLimit {
+			k.Enabled = false
+			rejected, reason = true, "lifetime credit limit reached (key disabled)"
+		}
+
+		// Periodic caps reached → report only. The NEXT request is blocked by
+		// CheckAPIKeyLimit (DailyX >= limit); the period rollover re-enables
+		// organically. Never disable the key for a periodic cap.
+		if !rejected {
+			switch {
+			case k.DailyReqLimit > 0 && k.DailyRequests >= k.DailyReqLimit:
+				rejected, reason = true, "periodic request limit reached"
+			case k.DailyTokLimit > 0 && k.DailyTokens >= k.DailyTokLimit:
+				rejected, reason = true, "periodic token limit reached"
+			case k.DailyCredLimit > 0 && k.DailyCredits >= k.DailyCredLimit:
+				rejected, reason = true, "periodic credit limit reached"
+			}
+		}
+
 		_ = Save()
-		return false, ""
+		return rejected, reason
 	}
 	return false, ""
 }

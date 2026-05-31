@@ -511,9 +511,7 @@ type apiKeyCtxKey struct{}
 // when the request is authorised, false otherwise. When RequireApiKey is off
 // or no keys are configured, returns true unconditionally.
 func (h *Handler) validateApiKey(r *http.Request) bool {
-	if !config.IsApiKeyRequired() {
-		return true
-	}
+	required := config.IsApiKeyRequired()
 
 	authHeader := r.Header.Get("Authorization")
 	apiKeyHeader := r.Header.Get("X-Api-Key")
@@ -530,6 +528,12 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 	// so we no longer need a separate legacy fast-path. Going through the
 	// multi-key loop ensures the matched key gets stashed in the request
 	// context for per-key statistics tracking.)
+	//
+	// We attempt this match even when RequireApiKey is OFF: if the caller
+	// presented a recognized key, we still stash it so per-key features
+	// (model whitelist, quotas, stats) take effect. Auth being optional only
+	// means an UNrecognized/absent key is still allowed through — it does not
+	// mean a presented key's restrictions should be ignored.
 	keys := config.GetAPIKeys()
 	for i := range keys {
 		k := keys[i]
@@ -539,13 +543,19 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		if k.ExpiresAt > 0 && time.Now().Unix() > k.ExpiresAt {
 			continue
 		}
-		if subtle.ConstantTimeCompare([]byte(providedKey), []byte(k.Key)) == 1 {
-			// Stash the matched key on the request context so the success
-			// path can debit per-key counters.
+		if providedKey != "" && subtle.ConstantTimeCompare([]byte(providedKey), []byte(k.Key)) == 1 {
+			// Stash the matched key on the request context so downstream
+			// handlers can debit per-key counters and filter by whitelist.
 			ctx := context.WithValue(r.Context(), apiKeyCtxKey{}, &k)
 			*r = *r.WithContext(ctx)
 			return true
 		}
+	}
+
+	// No key matched. When auth is not required, allow the request through
+	// (anonymous / legacy-permissive). When it IS required, reject.
+	if !required {
+		return true
 	}
 
 	// Fall back to "no keys configured at all" -> permissive. Catches the
@@ -664,6 +674,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleResponses(w, r)
 	case path == "/v1/models" || path == "/models":
+		// Validate the API key here (like the other /v1/* routes) so the
+		// matched key lands in the request context. handleModels reads it via
+		// matchedAPIKey to filter the response down to the key's allowed
+		// models — without this call the context is empty and the per-key
+		// whitelist filter is silently skipped, leaking the full catalog.
+		if !h.validateApiKey(r) {
+			h.sendOpenAIError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
