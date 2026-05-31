@@ -197,6 +197,18 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// WebSearchEnabled turns on proxy-side emulation of Anthropic's hosted
+	// web_search tool (and Claude Code's WebSearch). When enabled, an inbound
+	// web_search server tool is serviced by calling Kiro's own native MCP
+	// web_search endpoint (https://q.<region>.amazonaws.com/mcp) with the
+	// account's existing token, and the results are reshaped into native
+	// web_search_tool_result blocks. ON by default (matching jwadow/kiro-gateway
+	// and aliom-v/KiroGate, where this is the verified default): a nil pointer
+	// means "use the default (on)"; set it explicitly to false to opt out. The
+	// upstream MCP endpoint is not guaranteed on every account tier/region; a
+	// failed call falls back to dropping the tool so a request never breaks.
+	WebSearchEnabled *bool `json:"webSearchEnabled,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -272,7 +284,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A2"
+const Version = "1.0.10-A3"
 
 var (
 	cfg     *Config
@@ -1163,6 +1175,28 @@ func UpdatePoolStrategy(strategy string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PoolStrategy = strings.TrimSpace(strategy)
+	return Save()
+}
+
+// GetWebSearchEnabled reports whether proxy-side web_search emulation is on.
+// Default TRUE: a nil pointer (fresh/unconfigured install, or an upgrade whose
+// config predates this field) means "use the default", which is on — matching
+// the verified default in jwadow/kiro-gateway and aliom-v/KiroGate. Only an
+// explicit false opts out.
+func GetWebSearchEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.WebSearchEnabled == nil {
+		return true
+	}
+	return *cfg.WebSearchEnabled
+}
+
+// UpdateWebSearchEnabled persists the web-search emulation toggle.
+func UpdateWebSearchEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.WebSearchEnabled = &enabled
 	return Save()
 }
 

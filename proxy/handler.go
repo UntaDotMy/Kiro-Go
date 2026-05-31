@@ -1443,6 +1443,23 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	_, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+
+	matchedKeyID := ""
+	if k := matchedAPIKey(r); k != nil {
+		matchedKeyID = k.ID
+	}
+
+	// Web-search agentic loop: only when the feature is enabled AND the request
+	// actually carries a web_search tool. This path runs the search via Kiro's
+	// native MCP endpoint and answers with native citation blocks. Every other
+	// request falls through to the original, unchanged handler path below.
+	if config.GetWebSearchEnabled() {
+		if _, ok := findClaudeWebSearchTool(req.Tools); ok {
+			h.handleClaudeWebSearch(w, &req, req.Model, matchedKeyID, thinking)
+			return
+		}
+	}
+
 	// mapping happens inside ClaudeToKiro; keep req.Model as the original id
 	// (e.g. "claude-opus-4-7" or a dated alias the client still has cached)
 	// so the response echoes the exact id the client sent.
@@ -1454,13 +1471,8 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 转换请求（与账号无关，可在多账号故障转移之间复用）
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
-	// Extract the matched APIKey (if any) so the success path can debit
-	// per-key counters; matchedKeyID is "" when validateApiKey accepted via
-	// the legacy single-key path or no auth required.
-	matchedKeyID := ""
-	if k := matchedAPIKey(r); k != nil {
-		matchedKeyID = k.ID
-	}
+	// matchedKeyID was resolved above (before the web-search branch) and is
+	// reused here for the per-key success debit on the normal path.
 
 	// Run the upstream call with multi-account failover. The worker is
 	// invoked once per attempt with a freshly-selected account; a retryable
@@ -2719,6 +2731,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiExportAccounts(w, r)
 	case path == "/import" && r.Method == "POST":
 		h.apiImportAccounts(w, r)
+	case path == "/websearch/probe" && r.Method == "POST":
+		h.apiProbeWebSearch(w, r)
 	default:
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Not Found"})
@@ -3432,11 +3446,95 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":           config.GetApiKey(),
+		"requireApiKey":    config.IsApiKeyRequired(),
+		"port":             config.GetPort(),
+		"host":             config.GetHost(),
+		"allowOverUsage":   config.GetAllowOverUsage(),
+		"webSearchEnabled": config.GetWebSearchEnabled(),
+	})
+}
+
+// apiProbeWebSearch is a diagnostic that runs ONE native Kiro /mcp web_search
+// against a chosen account and returns the raw outcome. It exists because the
+// upstream MCP endpoint is opaque and not guaranteed on every account tier or
+// region — this lets an operator confirm web search actually works for their
+// accounts before enabling the feature, and surfaces the exact failure when it
+// doesn't. Admin-authenticated (same gate as all /admin/api/*).
+//
+// Body: {"accountId":"<id>","query":"<text>"}. If accountId is omitted, the
+// first enabled account is used.
+func (h *Handler) apiProbeWebSearch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccountID string `json:"accountId"`
+		Query     string `json:"query"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		req.Query = "what is the current date"
+	}
+
+	// Resolve the account: explicit id, else first enabled account.
+	var account *config.Account
+	if strings.TrimSpace(req.AccountID) != "" {
+		account = h.pool.GetByID(req.AccountID)
+		if account == nil {
+			w.WriteHeader(404)
+			json.NewEncoder(w).Encode(map[string]string{"error": "account not found"})
+			return
+		}
+	} else {
+		for _, a := range config.GetAccounts() {
+			if a.Enabled && a.AccessToken != "" {
+				acc := a
+				account = &acc
+				break
+			}
+		}
+		if account == nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no enabled account available"})
+			return
+		}
+	}
+
+	// Make sure the token is fresh so a probe failure reflects the endpoint,
+	// not an expired token.
+	if err := h.ensureValidToken(account); err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":    false,
+			"stage": "token_refresh",
+			"error": err.Error(),
+		})
+		return
+	}
+
+	results, err := performKiroWebSearch(r.Context(), account, req.Query)
+	logWebSearch(req.Query, len(results), err)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":          false,
+			"stage":       "mcp_call",
+			"error":       err.Error(),
+			"accountId":   account.ID,
+			"region":      config.GetKiroAPIRegion(),
+			"hint":        "If this is a 404/400, the /mcp web_search endpoint may not be enabled for this account tier or region.",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":        true,
+		"accountId": account.ID,
+		"region":    config.GetKiroAPIRegion(),
+		"query":     req.Query,
+		"count":     len(results),
+		"results":   results,
 	})
 }
 
@@ -3489,11 +3587,12 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// the others. Pre-A17 used a non-pointer struct, so saving "just the
 	// password" silently set RequireApiKey=false and ApiKey="".
 	var req struct {
-		ApiKey          *string `json:"apiKey,omitempty"`
-		RequireApiKey   *bool   `json:"requireApiKey,omitempty"`
-		Password        *string `json:"password,omitempty"`
-		CurrentPassword *string `json:"currentPassword,omitempty"`
-		AllowOverUsage  *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey           *string `json:"apiKey,omitempty"`
+		RequireApiKey    *bool   `json:"requireApiKey,omitempty"`
+		Password         *string `json:"password,omitempty"`
+		CurrentPassword  *string `json:"currentPassword,omitempty"`
+		AllowOverUsage   *bool   `json:"allowOverUsage,omitempty"`
+		WebSearchEnabled *bool   `json:"webSearchEnabled,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3522,6 +3621,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// 更新超额使用设置
 	if req.AllowOverUsage != nil {
 		if err := config.UpdateAllowOverUsage(*req.AllowOverUsage); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// Web-search emulation toggle (opt-in; default off).
+	if req.WebSearchEnabled != nil {
+		if err := config.UpdateWebSearchEnabled(*req.WebSearchEnabled); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

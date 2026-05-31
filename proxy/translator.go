@@ -1132,7 +1132,22 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
+	webSearchOn := config.GetWebSearchEnabled()
 	for _, tool := range tools {
+		// Web search is special: when the feature is on we expose it to the
+		// upstream model as a CALLABLE function tool (so the model can decide to
+		// search), and the proxy executes the search itself via Kiro's native
+		// MCP endpoint — see the web-search agentic loop. When off, it's dropped
+		// like any other unsupported hosted tool. Checked before isAnthropicServerTool
+		// because the hosted web_search spec also carries a Type.
+		if isWebSearchTool(tool) {
+			if webSearchOn {
+				result = append(result, webSearchToolSpec())
+			} else {
+				logger.Debugf("[Tools] Dropping web_search (feature disabled)")
+			}
+			continue
+		}
 		if isAnthropicServerTool(tool) {
 			logger.Debugf("[Tools] Dropping Anthropic server tool type=%s name=%s — not supported by Kiro upstream", tool.Type, tool.Name)
 			continue

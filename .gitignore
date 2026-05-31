@@ -19,3 +19,7 @@ data/
 # Go workspace
 go.work
 go.work.sum
+
+# Local research / scratch artifacts (cloned competitor repos, analysis output)
+kiro2api/
+research/

@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"kiro-go/config"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -566,11 +568,57 @@ func TestClaudeToKiroDropsAnthropicServerTools(t *testing.T) {
 		t.Fatalf("expected UserInputMessageContext to carry the tool catalog")
 	}
 	tools := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools
+	// Web search defaults ON, so web_search is forwarded as a CALLABLE function
+	// tool (the proxy executes it via Kiro's native MCP endpoint). The other
+	// hosted server tools (code_execution, computer, text_editor, bash) are
+	// still dropped — Kiro can't run them. Plus the custom user tool survives.
+	// Expected: web_search + lookupUser = 2.
+	if len(tools) != 2 {
+		t.Fatalf("expected 2 tools (web_search forwarded + custom user tool; other hosted tools stripped), got %d: %#v", len(tools), tools)
+	}
+	names := map[string]bool{}
+	for _, tw := range tools {
+		names[tw.ToolSpecification.Name] = true
+	}
+	if !names["web_search"] {
+		t.Fatalf("expected web_search to be forwarded as a callable tool (web search default-on), got %#v", tools)
+	}
+	if !names["lookupUser"] {
+		t.Fatalf("expected the user-defined tool to survive, got %#v", tools)
+	}
+}
+
+// TestClaudeToKiroDropsWebSearchWhenDisabled verifies that when web search is
+// explicitly turned off, the web_search tool is dropped like any other hosted
+// server tool (the pre-feature behavior). Requires an initialized config so
+// GetWebSearchEnabled reads the explicit false rather than the default-on nil.
+func TestClaudeToKiroDropsWebSearchWhenDisabled(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgPath); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	if err := config.UpdateWebSearchEnabled(false); err != nil {
+		t.Fatalf("disable web search: %v", err)
+	}
+	t.Cleanup(func() { _ = config.UpdateWebSearchEnabled(true) })
+
+	req := &ClaudeRequest{
+		Model:     "claude-sonnet-4.5",
+		MaxTokens: 1024,
+		Tools: []ClaudeTool{
+			{Type: "web_search_20250305", Name: "web_search"},
+			{Name: "lookup_user", Description: "Lookup a user by id",
+				InputSchema: map[string]interface{}{"type": "object"}},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	payload := ClaudeToKiro(req, false)
+	tools := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools
 	if len(tools) != 1 {
-		t.Fatalf("expected exactly 1 tool forwarded (server tools stripped), got %d: %#v", len(tools), tools)
+		t.Fatalf("expected only the custom tool (web_search dropped when disabled), got %d: %#v", len(tools), tools)
 	}
 	if tools[0].ToolSpecification.Name != "lookupUser" {
-		t.Fatalf("expected the user-defined tool to survive, got name=%q", tools[0].ToolSpecification.Name)
+		t.Fatalf("expected lookupUser, got %q", tools[0].ToolSpecification.Name)
 	}
 }
 
