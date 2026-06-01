@@ -130,7 +130,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.handleUpstreamError(err, account.ID, model, apiKeyID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
 		h.sendResponsesError(w, 500, "server_error", err.Error())
 		return
 	}
@@ -154,7 +154,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
@@ -500,7 +500,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	}
 
 	if err := CallKiroAPI(account, payload, callback); err != nil {
-		h.handleUpstreamError(err, account.ID, model, apiKeyID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
 		// Emit failure events Codex understands.
 		h.sendResponsesEvent(w, flusher, "response.failed", map[string]interface{}{
 			"type":            "response.failed",
@@ -534,7 +534,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 

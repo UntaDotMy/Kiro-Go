@@ -231,7 +231,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
-		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID)
+		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID, kiroPayload.ResolvedEffort)
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
 			"sequence_number": nextSeq(),
@@ -250,7 +250,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(req.Model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(req.Model, apiKeyID, kiroPayload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model) }
 

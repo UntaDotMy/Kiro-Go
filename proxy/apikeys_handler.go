@@ -144,13 +144,17 @@ func (h *Handler) apiDeleteAPIKey(w http.ResponseWriter, r *http.Request, id str
 }
 
 // apiGetModelStats returns the persisted per-model totals (lifetime). Each
-// entry includes lastUsed so the dashboard can render "last seen" timestamps.
-// Backed by the SQLite stats table — survives restarts.
+// entry includes lastUsed so the dashboard can render "last seen" timestamps,
+// plus an "effort" breakdown: per reasoning-effort level (low/medium/high/
+// xhigh/max/default), the requests / tokens / credits driven at that level.
+// The per-effort entries sum to the model's own totals. Backed by the SQLite
+// stats table — survives restarts.
 func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
 	byModel, _ := stats.ByModel()
+	byEffort, _ := stats.ByModelEffort()
 	out := make(map[string]map[string]interface{}, len(byModel))
 	for model, t := range byModel {
-		out[model] = map[string]interface{}{
+		entry := map[string]interface{}{
 			"requests": t.Requests,
 			"success":  t.Success,
 			"failed":   t.Failed,
@@ -158,6 +162,18 @@ func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
 			"credits":  t.Credits,
 			"lastUsed": t.LastAt,
 		}
+		if levels := byEffort[model]; len(levels) > 0 {
+			effort := make(map[string]map[string]interface{}, len(levels))
+			for level, et := range levels {
+				effort[level] = map[string]interface{}{
+					"requests": et.Requests,
+					"tokens":   et.TokensIn + et.TokensOut,
+					"credits":  et.Credits,
+				}
+			}
+			entry["effort"] = effort
+		}
+		out[model] = entry
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
 }

@@ -21,8 +21,8 @@ import (
 const schema = `
 CREATE TABLE IF NOT EXISTS daily_stats (
     date        TEXT NOT NULL,                 -- YYYY-MM-DD UTC
-    scope_type  TEXT NOT NULL,                 -- 'global' | 'model' | 'key'
-    scope_id    TEXT NOT NULL DEFAULT '',      -- '' for global
+    scope_type  TEXT NOT NULL,                 -- 'global' | 'model' | 'key' | 'model_effort'
+    scope_id    TEXT NOT NULL DEFAULT '',      -- '' for global; '<model>\x1f<effort>' for model_effort
     requests    INTEGER NOT NULL DEFAULT 0,
     success     INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
@@ -35,15 +35,28 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 CREATE INDEX IF NOT EXISTS idx_daily_scope ON daily_stats(scope_type, scope_id);
 `
 
+// effortScopeSep separates the model id from the effort level inside a
+// 'model_effort' scope_id. ASCII Unit Separator (0x1f) is used because it
+// cannot appear in a canonical model id (lowercase + dashes) or an effort
+// level (low/medium/high/xhigh/max/default), so the two halves are always
+// recoverable by a single split.
+const effortScopeSep = "\x1f"
+
+// EffortBucketDefault is the effort label used for requests that carried no
+// graded reasoning-effort value (Claude requests, models without native effort
+// support, or any request where effort was unset). Bucketing these under a
+// stable label keeps the per-effort breakdown summing to the model total.
+const EffortBucketDefault = "default"
+
 // Totals aggregates a (scope_type, scope_id) over a date range.
 type Totals struct {
-	Requests   int     `json:"requests"`
-	Success    int     `json:"success"`
-	Failed     int     `json:"failed"`
-	TokensIn   int     `json:"tokensIn"`
-	TokensOut  int     `json:"tokensOut"`
-	Credits    float64 `json:"credits"`
-	LastAt     int64   `json:"lastAt"`
+	Requests  int     `json:"requests"`
+	Success   int     `json:"success"`
+	Failed    int     `json:"failed"`
+	TokensIn  int     `json:"tokensIn"`
+	TokensOut int     `json:"tokensOut"`
+	Credits   float64 `json:"credits"`
+	LastAt    int64   `json:"lastAt"`
 }
 
 // DailyEntry is one row in a per-day history series.
@@ -202,11 +215,15 @@ func Close() error {
 	return err
 }
 
-// Record inserts one row per scope (global / model / key). Failures
-// (success=false) still count as a request for visibility but contribute 0
-// tokens and 0 credits. modelID and keyID may be empty; empty values skip
-// that scope.
-func Record(modelID, keyID string, success bool, tokensIn, tokensOut int, credits float64) {
+// Record inserts one row per scope (global / model / key / model_effort).
+// Failures (success=false) still count as a request for visibility but
+// contribute 0 tokens and 0 credits. modelID and keyID may be empty; empty
+// values skip that scope. effort is the resolved reasoning-effort level for
+// this request (low/medium/high/xhigh/max) or "" — empty/whitespace is
+// bucketed under EffortBucketDefault so the per-effort breakdown always sums
+// to the per-model total. The model_effort scope is only written when a model
+// id is present.
+func Record(modelID, keyID, effort string, success bool, tokensIn, tokensOut int, credits float64) {
 	dbMu.RLock()
 	defer dbMu.RUnlock()
 	if db == nil {
@@ -235,11 +252,25 @@ func Record(modelID, keyID string, success bool, tokensIn, tokensOut int, credit
 	}
 	exec("global", "")
 	if modelID != "" {
-		exec("model", CanonicalModelID(modelID))
+		canonical := CanonicalModelID(modelID)
+		exec("model", canonical)
+		exec("model_effort", canonical+effortScopeSep+CanonicalEffort(effort))
 	}
 	if keyID != "" {
 		exec("key", keyID)
 	}
+}
+
+// CanonicalEffort normalizes a reasoning-effort label for storage: trimmed and
+// lowercased, with empty/unknown collapsed to EffortBucketDefault. This is the
+// storage-layer counterpart to the proxy's effort normalization — it does not
+// validate the level against any model, it only ensures a stable bucket key.
+func CanonicalEffort(effort string) string {
+	s := strings.ToLower(strings.TrimSpace(effort))
+	if s == "" {
+		return EffortBucketDefault
+	}
+	return s
 }
 
 // CanonicalModelID normalizes a model id so the same logical model recorded
@@ -310,6 +341,64 @@ func ByModel() (map[string]Totals, error) {
 // ByKey returns a map[keyID]Totals across the entire history.
 func ByKey() (map[string]Totals, error) {
 	return groupBy("key")
+}
+
+// ByModelEffort returns the per-effort-level breakdown for every model across
+// the entire history: map[canonicalModelID]map[effortLevel]Totals. The effort
+// level is one of low/medium/high/xhigh/max or EffortBucketDefault. Used by the
+// Analytics tab to show how much each model was driven at each reasoning
+// effort, and the token cost of each level. The per-effort Totals for a model
+// sum to that model's ByModel() Totals.
+func ByModelEffort() (map[string]map[string]Totals, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
+	if db == nil {
+		return nil, errors.New("stats db not initialized")
+	}
+	rows, err := db.Query(`
+        SELECT
+            scope_id,
+            COALESCE(SUM(requests),  0),
+            COALESCE(SUM(success),   0),
+            COALESCE(SUM(failed),    0),
+            COALESCE(SUM(tokens_in), 0),
+            COALESCE(SUM(tokens_out),0),
+            COALESCE(SUM(credits),   0),
+            COALESCE(MAX(last_at),   0)
+        FROM daily_stats WHERE scope_type = 'model_effort' GROUP BY scope_id
+    `)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]map[string]Totals)
+	for rows.Next() {
+		var id string
+		var t Totals
+		if err := rows.Scan(&id, &t.Requests, &t.Success, &t.Failed, &t.TokensIn, &t.TokensOut, &t.Credits, &t.LastAt); err != nil {
+			return nil, err
+		}
+		model, effort, ok := splitEffortScopeID(id)
+		if !ok {
+			continue // legacy/malformed row without separator — skip
+		}
+		if out[model] == nil {
+			out[model] = make(map[string]Totals)
+		}
+		out[model][effort] = t
+	}
+	return out, rows.Err()
+}
+
+// splitEffortScopeID recovers (model, effort) from a 'model_effort' scope_id.
+// Returns ok=false when the separator is absent (a row written before the
+// effort breakdown existed, or a malformed id).
+func splitEffortScopeID(scopeID string) (model, effort string, ok bool) {
+	i := strings.Index(scopeID, effortScopeSep)
+	if i < 0 {
+		return "", "", false
+	}
+	return scopeID[:i], scopeID[i+len(effortScopeSep):], true
 }
 
 func groupBy(scopeType string) (map[string]Totals, error) {

@@ -45,7 +45,7 @@ type streamWorker func(account *config.Account) (committed bool, err error)
 //   - retryAfter: when every attempt was throttled, the soonest upstream hint
 //     so the caller can emit a real Retry-After with its 429.
 //   - err: the last upstream error when no attempt committed; nil on success.
-func (h *Handler) runWithFailover(model, apiKeyID string, worker streamWorker) (committed bool, retryAfter time.Duration, err error) {
+func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamWorker) (committed bool, retryAfter time.Duration, err error) {
 	tried := make(map[string]bool, maxFailoverAttempts)
 	var lastErr error
 	var lastRetryAfter time.Duration
@@ -54,7 +54,7 @@ func (h *Handler) runWithFailover(model, apiKeyID string, worker streamWorker) (
 	// the request as a whole, when we're about to give up without committing.
 	recordTerminal := func() {
 		if lastErr != nil {
-			h.recordFailure(model, apiKeyID)
+			h.recordFailure(model, apiKeyID, effort)
 		}
 	}
 

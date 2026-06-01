@@ -109,7 +109,7 @@ func TestRunWithFailoverRotatesOnRetryableError(t *testing.T) {
 		return true, nil
 	}
 
-	committed, _, err := h.runWithFailover("claude-sonnet-4.5", "key-1", worker)
+	committed, _, err := h.runWithFailover("claude-sonnet-4.5", "key-1", "", worker)
 	if !committed || err != nil {
 		t.Fatalf("expected committed success after failover, got committed=%v err=%v", committed, err)
 	}
@@ -134,7 +134,7 @@ func TestRunWithFailoverCountsSingleFailure(t *testing.T) {
 		return false, err
 	}
 
-	committed, retryAfter, err := h.runWithFailover("claude-sonnet-4.5", "key-1", worker)
+	committed, retryAfter, err := h.runWithFailover("claude-sonnet-4.5", "key-1", "", worker)
 	if committed {
 		t.Fatal("expected no commit when all accounts fail")
 	}
@@ -163,7 +163,7 @@ func TestRunWithFailoverStopsOnTerminalError(t *testing.T) {
 		return false, err
 	}
 
-	committed, _, err := h.runWithFailover("claude-sonnet-4.5", "key-1", worker)
+	committed, _, err := h.runWithFailover("claude-sonnet-4.5", "key-1", "", worker)
 	if committed || err == nil {
 		t.Fatalf("expected terminal failure, got committed=%v err=%v", committed, err)
 	}

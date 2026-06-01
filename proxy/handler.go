@@ -1457,6 +1457,9 @@ func (h *Handler) applyReasoningEffort(payload *KiroPayload, rawEffort string) s
 		// Merge without clobbering any other passthrough keys already set.
 		payload.AdditionalModelRequestFields["output_config"] = fields["output_config"]
 	}
+	// Stash the resolved level so recordSuccess can attribute per-effort
+	// analytics without threading it through every handler signature.
+	payload.ResolvedEffort = level
 	logger.Debugf("[Effort] Forwarding native reasoning effort %q for model %s (requested %q, supported %v)", level, modelID, rawEffort, levels)
 	return level
 }
@@ -1621,7 +1624,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
 	}
 
-	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, worker)
+	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
 	if committed {
 		return // worker already wrote the full response (or a mid-stream error)
 	}
@@ -1922,7 +1925,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		// Already streaming — we can't fail over. Record the failure (this
 		// committed request failed mid-stream) and surface it inline as an
 		// SSE error event so the client sees it.
-		h.handleUpstreamError(err, account.ID, model, apiKeyID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1961,7 +1964,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2065,12 +2068,12 @@ func (h *Handler) addCredits(credits float64) {
 // global tick. accountID is optional (passed by the success-path callers
 // that have it). Also records to the persistent SQLite stats so per-day
 // rollups survive restarts.
-func (h *Handler) recordSuccess(model, apiKeyID string, inputTokens, outputTokens int, credits float64) {
+func (h *Handler) recordSuccess(model, apiKeyID, effort string, inputTokens, outputTokens int, credits float64) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
-	stats.Record(model, apiKeyID, true, inputTokens, outputTokens, credits)
+	stats.Record(model, apiKeyID, effort, true, inputTokens, outputTokens, credits)
 	// One-line success trace at INFO so operators can verify the counters
 	// chain end-to-end (model -> tokens -> credits -> SQLite). Set
 	// LOG_LEVEL=warn in production if this is too noisy; the data is also
@@ -2101,10 +2104,10 @@ func apiKeyIDForLog(id string) string {
 	return id
 }
 
-func (h *Handler) recordFailure(model, apiKeyID string) {
+func (h *Handler) recordFailure(model, apiKeyID, effort string) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
-	stats.Record(model, apiKeyID, false, 0, 0, 0)
+	stats.Record(model, apiKeyID, effort, false, 0, 0, 0)
 	h.broadcastDashboardUpdate()
 }
 
@@ -2197,7 +2200,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2312,7 +2315,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
 	}
 
-	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, worker)
+	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
 	if committed {
 		return
 	}
@@ -2558,7 +2561,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		// Mid-stream failure on a committed response: record it and end the
 		// (partial) stream with [DONE]. The OpenAI streaming wire format has
 		// no error frame, so the client sees a truncated response.
-		h.handleUpstreamError(err, account.ID, model, apiKeyID)
+		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
 		w.Write(openAIDoneFrame)
 		flusher.Flush()
 		return true, nil
@@ -2594,7 +2597,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2687,7 +2690,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)

@@ -1715,11 +1715,13 @@
                 'apikeys.totalCred': '累计 Credits',
                 'apikeys.lastUsed': '最近使用',
                 'analytics.byModel': '按模型统计',
-                'analytics.byModelHint': '展示每个模型的累计请求数、Tokens 与 Credits（持久化保存）。',
+                'analytics.byModelHint': '展示每个模型的累计请求数、Tokens 与 Credits，并按推理强度（effort）拆分（持久化保存）。',
                 'analytics.byKey': '按密钥统计',
                 'analytics.byKeyHint': '展示各 API 密钥的累计使用情况（持久化保存）。',
                 'analytics.empty': '暂无数据，开始使用代理后会显示',
                 'analytics.noKeys': '暂无密钥使用记录',
+                'analytics.effortLabel': '推理强度：',
+                'analytics.effortDefault': '默认',
                 'common.create': '创建',
                 'common.edit': '编辑',
                 'common.delete': '删除',
@@ -2099,11 +2101,13 @@
                 'apikeys.totalCred': 'Lifetime Cred',
                 'apikeys.lastUsed': 'Last used',
                 'analytics.byModel': 'Usage by model',
-                'analytics.byModelHint': 'Lifetime requests, tokens and credits per model (persisted across restarts).',
+                'analytics.byModelHint': 'Lifetime requests, tokens and credits per model, broken down by reasoning effort (persisted across restarts).',
                 'analytics.byKey': 'Usage by key',
                 'analytics.byKeyHint': 'Lifetime per-key usage (persisted across restarts).',
                 'analytics.empty': 'No data yet — show up after the first request',
                 'analytics.noKeys': 'No keys have served requests yet',
+                'analytics.effortLabel': 'Effort:',
+                'analytics.effortDefault': 'default',
                 'common.create': 'Create',
                 'common.edit': 'Edit',
                 'common.delete': 'Delete',
@@ -3570,8 +3574,36 @@
                     '<span style="color:#64748b;font-variant-numeric:tabular-nums">' + (s.requests || 0) + ' req · ' + formatNum(s.tokens || 0) + ' tok · ' + (s.credits || 0).toFixed(2) + ' cr</span>' +
                     '</div>' +
                     '<div class="usage-bar"><div class="usage-fill" style="width:' + pct + '%"></div></div>' +
+                    renderEffortBreakdown(s.effort) +
                     '</div>';
             }).join('');
+        }
+        // renderEffortBreakdown renders the per-reasoning-effort split for one
+        // model as a row of compact chips (one per level). Levels are ordered
+        // low -> max with "default" (no graded effort) last. Returns '' when
+        // the only bucket is "default" — there's nothing interesting to show if
+        // the model was never driven at a graded effort.
+        function renderEffortBreakdown(effort) {
+            if (!effort) return '';
+            const order = { low: 1, medium: 2, high: 3, xhigh: 4, max: 5, default: 99 };
+            const levels = Object.keys(effort).sort((a, b) => (order[a] || 50) - (order[b] || 50));
+            const graded = levels.filter(l => l !== 'default' && (effort[l].requests || 0) > 0);
+            if (graded.length === 0) return '';
+            const chips = levels.filter(l => (effort[l].requests || 0) > 0).map(l => {
+                const e = effort[l];
+                const isDefault = l === 'default';
+                const label = isDefault ? t('analytics.effortDefault') : l;
+                const bg = isDefault ? '#1e293b' : '#0e2a47';
+                const fg = isDefault ? '#94a3b8' : '#7dd3fc';
+                return '<span title="' + (e.requests || 0) + ' req · ' + formatNum(e.tokens || 0) + ' tok · ' + (e.credits || 0).toFixed(2) + ' cr" ' +
+                    'style="display:inline-flex;gap:6px;align-items:center;background:' + bg + ';color:' + fg + ';border-radius:6px;padding:2px 8px;font-size:11px;font-variant-numeric:tabular-nums">' +
+                    '<b style="font-weight:600;text-transform:uppercase;letter-spacing:.3px">' + label + '</b>' +
+                    '<span style="color:#64748b">' + (e.requests || 0) + ' req · ' + formatNum(e.tokens || 0) + ' tok</span>' +
+                    '</span>';
+            }).join('');
+            return '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">' +
+                '<span style="font-size:11px;color:#475569;align-self:center">' + t('analytics.effortLabel') + '</span>' + chips +
+                '</div>';
         }
         function renderKeyStats() {
             const container = document.getElementById('keyStatsList');

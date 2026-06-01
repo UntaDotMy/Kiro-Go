@@ -279,6 +279,14 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// ResolvedEffort is the reasoning-effort level actually forwarded upstream
+	// for this request ("" when none — Claude path, unsupported model, or unset
+	// request). Set by Handler.applyReasoningEffort and read back at
+	// recordSuccess time so per-effort analytics can be attributed without
+	// threading the level through every handler signature. Not serialized to
+	// the Kiro API request body.
+	ResolvedEffort string `json:"-"`
 }
 
 type KiroUserInputMessage struct {

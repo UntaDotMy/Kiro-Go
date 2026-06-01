@@ -86,7 +86,7 @@ func TestHandleUpstreamErrorIsNoOpOnNil(t *testing.T) {
 	beforeTotal := atomic.LoadInt64(&h.totalRequests)
 	beforeFailed := atomic.LoadInt64(&h.failedRequests)
 
-	h.handleUpstreamError(nil, "acct-1", "claude-sonnet-4.5", "key-1")
+	h.handleUpstreamError(nil, "acct-1", "claude-sonnet-4.5", "key-1", "")
 
 	if got := atomic.LoadInt64(&h.totalRequests); got != beforeTotal {
 		t.Fatalf("nil err must not bump totalRequests, was %d → %d", beforeTotal, got)
@@ -109,7 +109,7 @@ func TestHandleUpstreamErrorBumpsCountersAndCooldown(t *testing.T) {
 	beforeFailed := atomic.LoadInt64(&h.failedRequests)
 
 	qe := &QuotaError{Endpoints: []string{"Kiro IDE"}, RetryAfter: 30 * time.Second}
-	h.handleUpstreamError(qe, id, "claude-sonnet-4.5", "key-x")
+	h.handleUpstreamError(qe, id, "claude-sonnet-4.5", "key-x", "")
 
 	if got := atomic.LoadInt64(&h.totalRequests); got != beforeTotal+1 {
 		t.Fatalf("expected totalRequests to bump by 1, was %d → %d", beforeTotal, got)
@@ -132,7 +132,7 @@ func TestHandleUpstreamErrorTreatsNonQuotaAsTransient(t *testing.T) {
 	h := &Handler{pool: pool.NewForTesting()}
 	id := "test-acct-transient-" + fmt.Sprintf("%d", time.Now().UnixNano())
 
-	h.handleUpstreamError(errors.New("HTTP 500: internal server error"), id, "claude-sonnet-4.5", "key-y")
+	h.handleUpstreamError(errors.New("HTTP 500: internal server error"), id, "claude-sonnet-4.5", "key-y", "")
 
 	if d := h.pool.CooldownRemaining(id); d != 0 {
 		t.Fatalf("first non-quota error should not cool down, got %s", d)

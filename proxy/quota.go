@@ -51,11 +51,13 @@ func (h *Handler) recordPoolError(accountID string, err error) {
 // global failed-request counter exactly once. For an intermediate failover
 // attempt that may be retried on another account, use recordAttemptError
 // (cooldown + overage only) so one client request isn't counted as N failures.
-func (h *Handler) handleUpstreamError(err error, accountID, model, apiKeyID string) {
+// effort is the resolved reasoning-effort level for the request ("" when none)
+// so the per-model-effort failure bucket matches the success accounting.
+func (h *Handler) handleUpstreamError(err error, accountID, model, apiKeyID, effort string) {
 	if err == nil {
 		return
 	}
-	h.recordFailure(model, apiKeyID)
+	h.recordFailure(model, apiKeyID, effort)
 	h.recordPoolError(accountID, err)
 	h.checkOverageError(err, accountID)
 }
