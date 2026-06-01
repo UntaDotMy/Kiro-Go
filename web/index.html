@@ -4208,6 +4208,40 @@
         let dashboardPollFallback = null;
         function applyStatusSnapshot(d) {
             try { renderStatusFromObject(d); } catch (e) { /* defensive */ }
+            // Merge per-account live counters into accountsData so the account
+            // cards (credits / tokens / requests / quota) update in realtime
+            // without the operator hitting refresh. The push carries only the
+            // live-changing fields; we patch them onto the existing rows and
+            // re-render. Structural fields (email, weight, proxy, etc.) come
+            // from the full loadAccounts() fetch and are left untouched.
+            try { mergeAccountStats(d.accountStats); } catch (e) { /* defensive */ }
+        }
+        function mergeAccountStats(stats) {
+            if (!Array.isArray(stats) || !Array.isArray(accountsData) || accountsData.length === 0) return;
+            const byId = {};
+            for (const s of stats) byId[s.id] = s;
+            let changed = false;
+            for (const a of accountsData) {
+                const s = byId[a.id];
+                if (!s) continue;
+                // Patch only the live counters/quota the cards render.
+                const fields = ['enabled','banStatus','expiresAt','hasToken',
+                    'usageCurrent','usageLimit','usagePercent',
+                    'trialUsageCurrent','trialUsageLimit','trialUsagePercent',
+                    'requestCount','errorCount','totalTokens','totalCredits',
+                    'lastUsed','lastRefresh'];
+                for (const f of fields) {
+                    if (s[f] !== undefined && a[f] !== s[f]) { a[f] = s[f]; changed = true; }
+                }
+            }
+            // Only re-render if something actually moved, and not while a modal
+            // is open (re-rendering the list under an open detail/add modal
+            // would be wasteful; the modal reads its own copy of the row).
+            const detailModal = document.getElementById('detailModal');
+            const addModal = document.getElementById('addModal');
+            const modalOpen = (detailModal && detailModal.classList.contains('active')) ||
+                              (addModal && addModal.classList.contains('active'));
+            if (changed && !modalOpen) renderAccounts();
         }
         function renderStatusFromObject(d) {
             document.getElementById('statAccounts').textContent = d.accounts || 0;

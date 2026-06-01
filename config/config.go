@@ -209,6 +209,13 @@ type Config struct {
 	// failed call falls back to dropping the tool so a request never breaks.
 	WebSearchEnabled *bool `json:"webSearchEnabled,omitempty"`
 
+	// GlobalRateLimitPerMinute caps the proxy's TOTAL inbound request rate
+	// across all API keys (token-bucket). 0 = disabled (default), which leaves
+	// behavior unchanged — only the existing per-key limits and per-account
+	// cooldowns apply. A positive value engages a global backstop that returns
+	// 429 + Retry-After when the steady rate is exceeded.
+	GlobalRateLimitPerMinute int `json:"globalRateLimitPerMinute,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -284,7 +291,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A4"
+const Version = "1.0.10-A5"
 
 var (
 	cfg     *Config
@@ -1197,6 +1204,32 @@ func UpdateWebSearchEnabled(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.WebSearchEnabled = &enabled
+	return Save()
+}
+
+// GetGlobalRateLimitPerMinute returns the proxy-wide request cap per minute.
+// 0 means disabled (default).
+func GetGlobalRateLimitPerMinute() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return 0
+	}
+	if cfg.GlobalRateLimitPerMinute < 0 {
+		return 0
+	}
+	return cfg.GlobalRateLimitPerMinute
+}
+
+// UpdateGlobalRateLimitPerMinute persists the global rate-limit setting.
+// A value <= 0 disables the limiter.
+func UpdateGlobalRateLimitPerMinute(perMinute int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if perMinute < 0 {
+		perMinute = 0
+	}
+	cfg.GlobalRateLimitPerMinute = perMinute
 	return Save()
 }
 

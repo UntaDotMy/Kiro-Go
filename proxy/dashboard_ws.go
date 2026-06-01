@@ -218,6 +218,19 @@ func (h *Handler) dashboardSnapshot() []byte {
 	var activeQuotaTotal, activeQuotaUsed float64
 	var activeTokens int
 	var activeRequests int
+
+	// Per-account live counters, keyed by id, so the dashboard can update each
+	// account card's credits / tokens / requests in realtime instead of waiting
+	// for the operator to hit refresh. We merge config (quota/subscription) with
+	// the pool's runtime stats (request/error/token/credit counters), mirroring
+	// what apiGetAccounts returns but limited to the fields the cards display
+	// live. Keeping it small keeps every broadcast cheap (this runs on every
+	// recordSuccess).
+	poolStats := make(map[string]config.Account)
+	for _, a := range h.pool.GetAllAccounts() {
+		poolStats[a.ID] = a
+	}
+	accountList := make([]map[string]interface{}, 0)
 	for _, a := range config.GetAccounts() {
 		if a.UsageLimit > 0 {
 			quotaTotal += a.UsageLimit
@@ -235,6 +248,26 @@ func (h *Handler) dashboardSnapshot() []byte {
 			activeTokens += a.TotalTokens
 			activeRequests += a.RequestCount
 		}
+		st := poolStats[a.ID]
+		accountList = append(accountList, map[string]interface{}{
+			"id":                a.ID,
+			"enabled":           a.Enabled,
+			"banStatus":         a.BanStatus,
+			"expiresAt":         a.ExpiresAt,
+			"hasToken":          a.AccessToken != "",
+			"usageCurrent":      a.UsageCurrent,
+			"usageLimit":        a.UsageLimit,
+			"usagePercent":      a.UsagePercent,
+			"trialUsageCurrent": a.TrialUsageCurrent,
+			"trialUsageLimit":   a.TrialUsageLimit,
+			"trialUsagePercent": a.TrialUsagePercent,
+			"requestCount":      st.RequestCount,
+			"errorCount":        st.ErrorCount,
+			"totalTokens":       st.TotalTokens,
+			"totalCredits":      st.TotalCredits,
+			"lastUsed":          st.LastUsed,
+			"lastRefresh":       a.LastRefresh,
+		})
 	}
 	payload := map[string]interface{}{
 		"type":             "status",
@@ -251,6 +284,7 @@ func (h *Handler) dashboardSnapshot() []byte {
 		"activeQuotaUsed":  activeQuotaUsed,
 		"activeTokens":     activeTokens,
 		"activeRequests":   activeRequests,
+		"accountStats":     accountList,
 		"uptime":           time.Now().Unix() - h.startTime,
 	}
 	b, err := json.Marshal(payload)

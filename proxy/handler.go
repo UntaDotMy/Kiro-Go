@@ -23,6 +23,18 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// backgroundTokenRefreshSkewSeconds is the proactive refresh window used by the
+// periodic background sweep. It MUST exceed the background tick interval (5 min)
+// or an idle account's token can expire in the gap between ticks: the on-request
+// path uses the tighter tokenRefreshSkewSeconds (120s), but an account that
+// serves no requests relies entirely on the sweep. With a 5-min tick and a
+// 120s window, a token expiring 3 min after a tick is missed, and by the next
+// tick it's already dead. We refresh anything expiring within 11 min so every
+// token is renewed at least one full tick before it can lapse. The on-request
+// fast path keeps the tighter 120s window so active accounts don't refresh more
+// than necessary.
+const backgroundTokenRefreshSkewSeconds int64 = 11 * 60
+
 // refreshFanoutConcurrency caps the number of in-flight upstream calls when
 // fan-outing background refreshes (token + RefreshAccountInfo, model list)
 // across accounts. Sequential refresh extended the stale-token window to
@@ -74,6 +86,10 @@ type Handler struct {
 	// dashboards (see proxy/dashboard_ws.go). Initialized in NewHandler;
 	// nil-safe because broadcastDashboardUpdate guards against nil.
 	dashboardHub *dashboardHub
+	// globalRL is an opt-in global token-bucket rate limiter (disabled until
+	// config.GlobalRateLimitPerMinute > 0). Backstops the per-key limits with a
+	// single proxy-wide request cap. See proxy/global_ratelimit.go.
+	globalRL globalRateLimiter
 }
 
 type thinkingStreamSource int
@@ -187,10 +203,12 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 // routes reasoning content through the response builder.
 //
 // When the client explicitly sent thinking.type="enabled" with a
-// budget_tokens value, log a debug line noting that the budget is dropped
-// (Kiro upstream doesn't accept budget_tokens or reasoning_effort —
-// kirodotdev/Kiro #8576, #8577) but otherwise leave the config untouched so
-// validation still applies.
+// budget_tokens value, log a debug line noting that the budget is dropped.
+// Kiro's native thinking knob (additionalModelRequestFields.thinking) accepts
+// only {type: adaptive|disabled} — there is no budget_tokens on the wire, so a
+// requested budget can't be honored. (Reasoning EFFORT, by contrast, IS a
+// native wire field — output_config.effort — and is forwarded separately for
+// models that advertise support; see reasoning_effort.go.)
 func applyAdaptiveThinkingDefault(req *ClaudeRequest) {
 	if req == nil {
 		return
@@ -207,7 +225,7 @@ func applyAdaptiveThinkingDefault(req *ClaudeRequest) {
 
 	kind := strings.ToLower(strings.TrimSpace(req.Thinking.Type))
 	if kind == "enabled" && req.Thinking.BudgetTokens > 0 {
-		logger.Debugf("[Thinking] Client requested thinking.type=enabled with budget_tokens=%d for %s; Kiro upstream does not accept budget_tokens — adaptive thinking will be applied (budget dropped). See kirodotdev/Kiro#8576, #8577.", req.Thinking.BudgetTokens, req.Model)
+		logger.Debugf("[Thinking] Client requested thinking.type=enabled with budget_tokens=%d for %s; Kiro's native thinking field accepts only {type: adaptive|disabled} (no budget_tokens), so adaptive thinking is applied and the budget is dropped.", req.Thinking.BudgetTokens, req.Model)
 	}
 }
 
@@ -305,6 +323,8 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		dashboardHub:    newDashboardHub(),
 	}
+	// Configure the opt-in global rate limiter from persisted config (0 = off).
+	h.globalRL.Configure(config.GetGlobalRateLimitPerMinute())
 	// Seed the in-memory model cache from the persisted last-known-good
 	// catalog so /v1/models serves real ids immediately after a restart,
 	// before the first live upstream fetch completes. The background
@@ -462,7 +482,11 @@ func (h *Handler) refreshAllAccounts() {
 			}()
 
 			// 检查 token 是否需要刷新
-			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+			// Use the wider background skew (not the on-request 120s) so an idle
+			// account that serves no traffic still gets its token renewed a full
+			// tick before expiry. Otherwise a token expiring between two 5-min
+			// ticks would lapse and the next request would 401 before failover.
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-backgroundTokenRefreshSkewSeconds {
 				newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
 				if err != nil {
 					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
@@ -609,6 +633,29 @@ func (h *Handler) enforceAPIKeyLimit(w http.ResponseWriter, r *http.Request, mod
 	return true
 }
 
+// enforceGlobalRateLimit applies the opt-in proxy-wide token-bucket limiter
+// before any per-key check or upstream call. Returns true when the request was
+// rejected (429 + Retry-After already written). The `format` selects the error
+// envelope so each API surface gets its native shape. When the limiter is
+// disabled (default) this is a cheap no-op that returns false.
+func (h *Handler) enforceGlobalRateLimit(w http.ResponseWriter, format string) bool {
+	allowed, retryAfter := h.globalRL.allow()
+	if allowed {
+		return false
+	}
+	setRetryAfter(w, retryAfter)
+	msg := "Global rate limit reached; retry after " + strconv.Itoa(retryAfterSeconds(retryAfter)) + "s"
+	switch format {
+	case "claude":
+		h.sendClaudeError(w, 429, "rate_limit_error", msg)
+	case "responses":
+		h.sendResponsesError(w, 429, "rate_limit_exceeded", msg)
+	default: // openai
+		h.sendOpenAIError(w, 429, "rate_limit_error", msg)
+	}
+	return true
+}
+
 // ServeHTTP 路由分发
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -646,6 +693,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
 			return
 		}
+		if h.enforceGlobalRateLimit(w, "claude") {
+			return
+		}
 		h.handleClaudeMessages(w, r)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		if !h.validateApiKey(r) {
@@ -656,6 +706,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/v1/chat/completions" || path == "/chat/completions":
 		if !h.validateApiKey(r) {
 			h.sendOpenAIError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
+		if h.enforceGlobalRateLimit(w, "openai") {
 			return
 		}
 		h.handleOpenAIChat(w, r)
@@ -670,6 +723,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if !h.validateApiKey(r) {
 			h.sendResponsesError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
+		if h.enforceGlobalRateLimit(w, "responses") {
 			return
 		}
 		h.handleResponses(w, r)
@@ -829,12 +885,12 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	}
 
 	// We intentionally do NOT emit "<id>-thinking" variants here. The thinking
-	// suffix is a response-side parsing flag only — the outbound Kiro payload
-	// is unchanged whether the suffix is present or not (Kiro upstream rejects
-	// reasoning_effort / budget_tokens; see kirodotdev/Kiro #8576, #8577 and
-	// the `_ = thinking` no-ops in translator.go). Listing the suffixed
+	// suffix is a response-side parsing flag only. Listing the suffixed
 	// variants in /v1/models doubled the picker entries for every model
-	// without changing behavior, so they're dropped.
+	// without changing behavior, so they're dropped. (Reasoning effort is
+	// forwarded natively per-model via output_config.effort when the client
+	// sends reasoning_effort / reasoning.effort — see reasoning_effort.go —
+	// and does not need a separate model id.)
 	//
 	// Per Kiro model we emit two ids:
 	//   1. the canonical dashed Anthropic form (e.g. "claude-opus-4-7") — what
@@ -1344,8 +1400,65 @@ func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
 	if base.TokenLimits == nil {
 		base.TokenLimits = extra.TokenLimits
 	}
+	if base.AdditionalModelRequestFieldsSchema == nil {
+		base.AdditionalModelRequestFieldsSchema = extra.AdditionalModelRequestFieldsSchema
+	}
 	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
 	return base
+}
+
+// effortLevelsForModel returns the reasoning-effort levels the given (mapped,
+// upstream) model id accepts, read from the cached ListAvailableModels schema.
+// Returns nil when the model is unknown to the cache or declares no effort
+// field — callers then skip native effort and rely on the thinking on/off path.
+func (h *Handler) effortLevelsForModel(modelID string) []string {
+	key := strings.ToLower(strings.TrimSpace(modelID))
+	if key == "" {
+		return nil
+	}
+	h.modelsCacheMu.RLock()
+	defer h.modelsCacheMu.RUnlock()
+	for i := range h.cachedModels {
+		if strings.ToLower(strings.TrimSpace(h.cachedModels[i].ModelId)) == key {
+			return modelEffortLevels(h.cachedModels[i].AdditionalModelRequestFieldsSchema)
+		}
+	}
+	return nil
+}
+
+// applyReasoningEffort forwards a graded reasoning-effort value to the Kiro
+// upstream NATIVELY when the resolved model supports it, by populating
+// payload.AdditionalModelRequestFields with {"output_config":{"effort":LEVEL}}.
+//
+// It is gated on the model's own advertised schema (effortLevelsForModel): the
+// requested level is clamped DOWN to the nearest supported level, and the field
+// is omitted entirely for models that don't support effort or for unset/
+// "minimal" requests (those are handled by the thinking on/off path instead).
+// This is safe against the upstream's HTTP 400 "model does not support
+// additional fields" validation because we never send a level the model didn't
+// declare. Returns the level actually attached ("" if none) for logging/echo.
+func (h *Handler) applyReasoningEffort(payload *KiroPayload, rawEffort string) string {
+	if payload == nil {
+		return ""
+	}
+	modelID := payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
+	levels := h.effortLevelsForModel(modelID)
+	level, ok := resolveModelEffort(rawEffort, levels)
+	if !ok {
+		return ""
+	}
+	fields := buildEffortRequestFields(level)
+	if fields == nil {
+		return ""
+	}
+	if payload.AdditionalModelRequestFields == nil {
+		payload.AdditionalModelRequestFields = fields
+	} else {
+		// Merge without clobbering any other passthrough keys already set.
+		payload.AdditionalModelRequestFields["output_config"] = fields["output_config"]
+	}
+	logger.Debugf("[Effort] Forwarding native reasoning effort %q for model %s (requested %q, supported %v)", level, modelID, rawEffort, levels)
+	return level
 }
 
 func mergeStringLists(base []string, extra []string) []string {
@@ -1842,9 +1955,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 	}
 
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	// Update per-account pool counters BEFORE recordSuccess so the realtime
+	// dashboard broadcast (fired inside recordSuccess) already reflects this
+	// request's credits/tokens for the account card — otherwise the per-account
+	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2074,9 +2191,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 	}
 
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	// Update per-account pool counters BEFORE recordSuccess so the realtime
+	// dashboard broadcast (fired inside recordSuccess) already reflects this
+	// request's credits/tokens for the account card — otherwise the per-account
+	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2160,11 +2281,23 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	// Fold the OpenAI reasoning_effort knob into the thinking decision: an
+	// explicit "minimal" turns reasoning off, low/medium/high/max turns it on,
+	// and an unset value leaves the suffix-derived decision untouched. We map to
+	// thinking on/off (not a graded upstream field) because the Kiro backend
+	// rejects an explicit reasoning_effort payload — see reasoning_effort.go.
+	thinking = resolveThinkingWithEffort(thinking, req.ReasoningEffort)
 	// OpenAIToKiro maps the model internally for the Kiro upstream call;
 	// keep req.Model as the original id so the response echoes what the client sent.
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
+
+	// Forward graded reasoning effort natively when the resolved model supports
+	// it (output_config.effort). Gated on the model's advertised schema; a
+	// no-op for models without effort support, where the thinking on/off
+	// mapping above already applied.
+	h.applyReasoningEffort(kiroPayload, req.ReasoningEffort)
 
 	matchedKeyID := ""
 	if k := matchedAPIKey(r); k != nil {
@@ -2455,9 +2588,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		}
 	}
 
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	// Update per-account pool counters BEFORE recordSuccess so the realtime
+	// dashboard broadcast (fired inside recordSuccess) already reflects this
+	// request's credits/tokens for the account card — otherwise the per-account
+	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2544,9 +2681,13 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 	}
 
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	// Update per-account pool counters BEFORE recordSuccess so the realtime
+	// dashboard broadcast (fired inside recordSuccess) already reflects this
+	// request's credits/tokens for the account card — otherwise the per-account
+	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -3465,12 +3606,13 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":           config.GetApiKey(),
-		"requireApiKey":    config.IsApiKeyRequired(),
-		"port":             config.GetPort(),
-		"host":             config.GetHost(),
-		"allowOverUsage":   config.GetAllowOverUsage(),
-		"webSearchEnabled": config.GetWebSearchEnabled(),
+		"apiKey":                   config.GetApiKey(),
+		"requireApiKey":            config.IsApiKeyRequired(),
+		"port":                     config.GetPort(),
+		"host":                     config.GetHost(),
+		"allowOverUsage":           config.GetAllowOverUsage(),
+		"webSearchEnabled":         config.GetWebSearchEnabled(),
+		"globalRateLimitPerMinute": config.GetGlobalRateLimitPerMinute(),
 	})
 }
 
@@ -3606,12 +3748,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// the others. Pre-A17 used a non-pointer struct, so saving "just the
 	// password" silently set RequireApiKey=false and ApiKey="".
 	var req struct {
-		ApiKey           *string `json:"apiKey,omitempty"`
-		RequireApiKey    *bool   `json:"requireApiKey,omitempty"`
-		Password         *string `json:"password,omitempty"`
-		CurrentPassword  *string `json:"currentPassword,omitempty"`
-		AllowOverUsage   *bool   `json:"allowOverUsage,omitempty"`
-		WebSearchEnabled *bool   `json:"webSearchEnabled,omitempty"`
+		ApiKey                   *string `json:"apiKey,omitempty"`
+		RequireApiKey            *bool   `json:"requireApiKey,omitempty"`
+		Password                 *string `json:"password,omitempty"`
+		CurrentPassword          *string `json:"currentPassword,omitempty"`
+		AllowOverUsage           *bool   `json:"allowOverUsage,omitempty"`
+		WebSearchEnabled         *bool   `json:"webSearchEnabled,omitempty"`
+		GlobalRateLimitPerMinute *int    `json:"globalRateLimitPerMinute,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3653,6 +3796,17 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+	}
+
+	// Global rate limit (opt-in; 0 = off). Persist then reconfigure the live
+	// limiter so the change takes effect immediately without a restart.
+	if req.GlobalRateLimitPerMinute != nil {
+		if err := config.UpdateGlobalRateLimitPerMinute(*req.GlobalRateLimitPerMinute); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.globalRL.Configure(config.GetGlobalRateLimitPerMinute())
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

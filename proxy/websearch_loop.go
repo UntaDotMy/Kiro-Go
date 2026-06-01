@@ -93,9 +93,11 @@ func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (
 
 		out.inputTokens = resolveInputTokens(out.inputTokens, realInputTokens, 0)
 		// Success bookkeeping for this round (each round is a real upstream call).
-		h.recordSuccess(model, apiKeyID, out.inputTokens, out.outputTokens, out.credits)
+		// Pool counters before recordSuccess so the realtime dashboard push
+		// reflects this request's per-account credits/tokens (see handler.go).
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, out.inputTokens+out.outputTokens, out.credits)
+		h.recordSuccess(model, apiKeyID, out.inputTokens, out.outputTokens, out.credits)
 		h.triggerAccountRefresh(account.ID)
 		if apiKeyID != "" {
 			_, _ = config.ConsumeAPIKey(apiKeyID, out.inputTokens+out.outputTokens, out.credits, model)

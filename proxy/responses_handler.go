@@ -45,7 +45,13 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// Pick the upstream account by the mapped model id.
 	thinkingCfg := config.GetThinkingConfig()
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
-	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
+	// Fold reasoning.effort into the thinking decision via the shared resolver
+	// (minimal -> off, low/medium/high/max -> on, unset -> keep suffix default).
+	effort := ""
+	if req.Reasoning != nil {
+		effort = req.Reasoning.Effort
+	}
+	thinking := resolveThinkingWithEffort(suffixThinking, effort)
 
 	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
 	if !ok {
@@ -68,6 +74,12 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	kiroPayload := ClaudeToKiro(claudeReq, thinking)
+
+	// Forward graded reasoning.effort natively when the resolved model supports
+	// it (output_config.effort), clamped to the model's advertised levels. No-op
+	// for models without effort support; the thinking on/off mapping above
+	// already covers those.
+	h.applyReasoningEffort(kiroPayload, effort)
 
 	// Decide whether to surface reasoning summary back to the client. Codex
 	// asks for one via reasoning.summary != "none".
@@ -138,9 +150,11 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 	}
 	outputTokens = estimateClaudeOutputTokens(finalContent, reasoning, toolUses)
 
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	// Pool counters before recordSuccess so the realtime dashboard push
+	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 
@@ -516,9 +530,11 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 	}
 	outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
 
-	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
+	// Pool counters before recordSuccess so the realtime dashboard push
+	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model) }
 

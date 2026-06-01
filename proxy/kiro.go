@@ -258,6 +258,22 @@ type KiroPayload struct {
 	ProfileArn      string           `json:"profileArn,omitempty"`
 	InferenceConfig *InferenceConfig `json:"inferenceConfig,omitempty"`
 
+	// AdditionalModelRequestFields is the Bedrock-style passthrough the Kiro
+	// CLI 2.5 uses to carry per-model knobs that aren't first-class request
+	// fields — most notably reasoning effort:
+	//
+	//   {"output_config": {"effort": "high"}}
+	//
+	// It is a TOP-LEVEL sibling of conversationState / profileArn in
+	// GenerateAssistantResponseInput (verified against kiro-cli 2.5.0's own
+	// request serializer and a live generateAssistantResponse body capture).
+	// Each model advertises which keys/values it accepts via its
+	// ModelInfo.AdditionalModelRequestFieldsSchema; sending a value a model
+	// doesn't declare yields HTTP 400 ("model does not support additional
+	// fields"), so callers MUST gate on the per-model schema before populating
+	// this. Empty map -> omitted entirely (safe default).
+	AdditionalModelRequestFields map[string]interface{} `json:"additionalModelRequestFields,omitempty"`
+
 	// ToolNameMap maps sanitized tool names (sent to Kiro) back to the
 	// original names supplied by the client. Used to restore original names
 	// in tool_use responses so the client can match them to its tool registry.

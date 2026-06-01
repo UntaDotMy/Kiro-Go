@@ -128,7 +128,13 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	claudeReq := ResponsesToClaudeRequest(&req)
 	thinkingCfg := config.GetThinkingConfig()
 	mappedModel, suffixThinking := ParseModelAndThinking(claudeReq.Model, thinkingCfg.Suffix)
-	thinking := suffixThinking || (req.Reasoning != nil && req.Reasoning.Effort != "" && !strings.EqualFold(req.Reasoning.Effort, "minimal"))
+	// Fold reasoning.effort into the thinking decision via the shared resolver
+	// (minimal -> off, low/medium/high/max -> on, unset -> keep suffix default).
+	effort := ""
+	if req.Reasoning != nil {
+		effort = req.Reasoning.Effort
+	}
+	thinking := resolveThinkingWithEffort(suffixThinking, effort)
 
 	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
 	if !ok {
@@ -157,6 +163,10 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		estimatedInputTokens = 1
 	}
 	kiroPayload := ClaudeToKiro(claudeReq, thinking)
+
+	// Forward graded reasoning.effort natively when the resolved model supports
+	// it; no-op otherwise (thinking on/off already applied above).
+	h.applyReasoningEffort(kiroPayload, effort)
 
 	includeReasoning := true
 	if req.Reasoning != nil && strings.EqualFold(strings.TrimSpace(req.Reasoning.Summary), "none") {
@@ -236,9 +246,11 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	if outputTokens <= 0 {
 		outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
 	}
-	h.recordSuccess(req.Model, apiKeyID, inputTokens, outputTokens, credits)
+	// Pool counters before recordSuccess so the realtime dashboard push
+	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+	h.recordSuccess(req.Model, apiKeyID, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model) }
 

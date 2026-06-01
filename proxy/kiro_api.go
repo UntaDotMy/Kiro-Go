@@ -429,4 +429,15 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+
+	// AdditionalModelRequestFieldsSchema is the JSON-Schema fragment the
+	// upstream ListAvailableModels endpoint returns to describe which
+	// Bedrock-style passthrough fields this model accepts (see
+	// KiroPayload.AdditionalModelRequestFields). For reasoning-capable models
+	// it carries an "output_config.effort" enum (e.g.
+	// ["low","medium","high","xhigh","max"] on Opus 4.6+, ["low","medium",
+	// "high","max"] on Sonnet); models without reasoning support omit it.
+	// We parse it into supported effort levels (see modelEffortLevels) so the
+	// proxy only forwards an effort value the model actually declares.
+	AdditionalModelRequestFieldsSchema map[string]interface{} `json:"additionalModelRequestFieldsSchema,omitempty"`
 }

@@ -363,8 +363,7 @@ func TestBuildAnthropicModelsResponseDedupedNoThinkingVariants(t *testing.T) {
 
 	// We emit only the dashed Anthropic id and the dotted Kiro alias. No
 	// dated suffix, no -thinking variant — the suffix is response-side only,
-	// and Kiro upstream rejects reasoning_effort / budget_tokens, so listing
-	// the suffixed forms doubled the picker entries without changing
+	// so listing the suffixed forms doubled the picker entries without changing
 	// behavior. See buildAnthropicModelsResponse for the full rationale.
 	if len(models) != 2 {
 		t.Fatalf("expected dashed + dotted alias only, got %d", len(models))

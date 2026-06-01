@@ -184,9 +184,11 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 // the Claude family that supports adaptive / extended thinking. The Kiro
 // upstream uses adaptive thinking by default for these families; setting
 // thinking.type="adaptive" on the inbound request makes Claude Code's
-// /model panel display the "thinking" indicator without us forwarding any
-// budget knob (Kiro upstream doesn't accept budget_tokens or
-// reasoning_effort — see kirodotdev/Kiro #8576, #8577).
+// /model panel display the "thinking" indicator without us forwarding a
+// budget knob (Kiro's native thinking field accepts only {type:
+// adaptive|disabled}; there is no budget_tokens on the wire). Reasoning effort
+// is a separate native field (output_config.effort) handled in
+// reasoning_effort.go.
 func modelSupportsAdaptiveThinking(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	if m == "" {
@@ -1377,6 +1379,11 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	// ReasoningEffort is the OpenAI Chat Completions reasoning knob
+	// ("minimal"|"low"|"medium"|"high"). We fold it into the thinking decision
+	// (see reasoning_effort.go) rather than forwarding it upstream, since the
+	// Kiro backend rejects an explicit reasoning_effort field.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIMessage struct {
