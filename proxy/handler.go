@@ -3164,11 +3164,11 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// apiBatchAccounts 批量操作账号（启用/禁用/刷新）
+// apiBatchAccounts 批量操作账号（启用/禁用/刷新/删除/超额开关）
 func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IDs    []string `json:"ids"`
-		Action string   `json:"action"` // "enable", "disable", "refresh"
+		Action string   `json:"action"` // "enable", "disable", "refresh", "delete", "overage-on", "overage-off"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3267,6 +3267,64 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			"success":   true,
 			"refreshed": successCount,
 			"failed":    failCount,
+		})
+
+	case "overage-on", "overage-off":
+		allow := req.Action == "overage-on"
+		idSet := make(map[string]bool, len(req.IDs))
+		for _, id := range req.IDs {
+			idSet[id] = true
+		}
+		updated := 0
+		for _, a := range config.GetAccounts() {
+			if !idSet[a.ID] {
+				continue
+			}
+			a.AllowOverage = allow
+			if err := config.UpdateAccount(a.ID, a); err != nil {
+				logger.Warnf("[Batch] overage update failed for %s: %v", a.ID, err)
+				continue
+			}
+			updated++
+		}
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": updated})
+
+	case "delete":
+		idSet := make(map[string]bool, len(req.IDs))
+		for _, id := range req.IDs {
+			idSet[id] = true
+		}
+		// Snapshot which requested IDs actually exist. config.DeleteAccount is
+		// idempotent (returns nil for an unknown id), so we can't rely on its
+		// error to tell deleted-from-missing apart — pre-check existence here.
+		exists := make(map[string]bool, len(idSet))
+		for _, a := range config.GetAccounts() {
+			if idSet[a.ID] {
+				exists[a.ID] = true
+			}
+		}
+		deleted := 0
+		failed := 0
+		for id := range idSet {
+			if !exists[id] {
+				failed++ // requested id no longer present
+				continue
+			}
+			if err := config.DeleteAccount(id); err != nil {
+				logger.Warnf("[Batch] delete failed for %s: %v", id, err)
+				failed++
+				continue
+			}
+			deleted++
+		}
+		if deleted > 0 {
+			h.pool.Reload()
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": failed == 0,
+			"deleted": deleted,
+			"failed":  failed,
 		})
 
 	default:
