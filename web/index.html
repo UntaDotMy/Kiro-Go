@@ -1353,10 +1353,10 @@
                         <button class="btn btn-primary btn-sm" onclick="showModal('add')" data-i18n="accounts.add"></button>
                     </div>
                 </div>
-                <div id="accountsToolbar" style="display:flex;gap:8px;align-items:center;padding:0 20px 12px">
+                <div id="accountsToolbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:0 20px 12px">
                     <label style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none;flex-shrink:0"><input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll(this.checked)" style="width:15px;height:15px;cursor:pointer"> <span style="font-size:13px;color:#374151" data-i18n="batch.selectAll"></span></label>
                     <div style="height:16px;width:1px;background:#e2e8f0;flex-shrink:0"></div>
-                    <div id="batchBar" style="display:none;align-items:center;gap:6px;flex-shrink:0">
+                    <div id="batchBar" style="display:none;align-items:center;gap:6px;flex-wrap:wrap">
                         <span id="batchCount" style="font-size:12px;color:#7c3aed;font-weight:600;white-space:nowrap"></span>
                         <button class="btn btn-sm btn-primary" onclick="batchAction('enable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.enable"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('disable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.disable"></button>
@@ -1367,9 +1367,9 @@
                         <button class="btn btn-sm btn-danger" onclick="batchAction('delete')" style="padding:3px 10px;font-size:12px" data-i18n="batch.delete"></button>
                         <div style="height:16px;width:1px;background:#e2e8f0;flex-shrink:0"></div>
                     </div>
-                    <div style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0">
-                        <input type="text" id="filterSearch" oninput="onFilterChange()" style="width:260px;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:14px;outline:none" data-i18n-placeholder="filter.search">
-                        <select id="filterStatusSelect" onchange="onFilterChange()" style="padding:4px 6px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;background:#fff;cursor:pointer">
+                    <div style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0;flex-wrap:wrap">
+                        <input type="text" id="filterSearch" oninput="onFilterChange()" style="flex:1;min-width:160px;max-width:260px;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:14px;outline:none" data-i18n-placeholder="filter.search">
+                        <select id="filterStatusSelect" onchange="onFilterChange()" style="padding:8px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;background:#fff;cursor:pointer;flex-shrink:0">
                             <option value="all" data-i18n="filter.all"></option>
                             <option value="enabled" data-i18n="filter.enabled"></option>
                             <option value="disabled" data-i18n="filter.disabled"></option>
