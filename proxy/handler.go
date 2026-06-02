@@ -1680,13 +1680,27 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	// committed flips to true the moment we write the first byte to the
 	// client (message_start). Before that, the dispatcher may fail over.
 	committed := false
+
+	// writeMu serializes every byte written to the client. Without it the
+	// heartbeat goroutine (below) and the upstream-driven callbacks would race
+	// on the ResponseWriter. All SSE frames — content and pings — go through
+	// emit/commit so the lock is the single choke point.
+	var writeMu sync.Mutex
+	emit := func(event string, data interface{}) {
+		writeMu.Lock()
+		h.sendSSE(w, flusher, event, data)
+		writeMu.Unlock()
+	}
 	// commit writes the SSE response headers + message_start exactly once,
-	// on the first upstream signal. Idempotent.
+	// on the first upstream signal. Idempotent. committed is flipped only
+	// AFTER message_start is on the wire (all under writeMu), so a concurrent
+	// heartbeat tick can never emit a ping before message_start.
 	commit := func() {
+		writeMu.Lock()
+		defer writeMu.Unlock()
 		if committed {
 			return
 		}
-		committed = true
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -1703,13 +1717,34 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
 			},
 		})
+		committed = true
 	}
+
+	// Downstream heartbeat: once committed, emit an Anthropic `ping` event every
+	// streamHeartbeatInterval while the upstream is silent. This is what keeps
+	// Claude Code from treating a legitimately quiet generation (a long thinking
+	// pause, a slow tool gap) as a dead connection and aborting it client-side.
+	// Pings are harmless anywhere in an Anthropic stream. The returned stop is
+	// called before the terminal frames are written so no ping can follow
+	// message_stop. The tick writes under writeMu and only after commit, so it
+	// can never interleave a half-written frame or precede message_start.
+	stopHB := startSSEHeartbeat(streamHeartbeatInterval, func() {
+		writeMu.Lock()
+		if committed {
+			// Roll the write deadline forward so a healthy long stream is never
+			// cut by the server's static WriteTimeout, then emit the keepalive.
+			rollWriteDeadline(w)
+			h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
+		}
+		writeMu.Unlock()
+	})
+	defer stopHB()
 
 	closeActiveBlock := func() {
 		if activeBlockIndex < 0 {
 			return
 		}
-		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+		emit("content_block_stop", map[string]interface{}{
 			"type":  "content_block_stop",
 			"index": activeBlockIndex,
 		})
@@ -1728,7 +1763,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		nextContentIndex++
 
 		if blockType == "thinking" {
-			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+			emit("content_block_start", map[string]interface{}{
 				"type":  "content_block_start",
 				"index": idx,
 				"content_block": map[string]string{
@@ -1737,7 +1772,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				},
 			})
 		} else {
-			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+			emit("content_block_start", map[string]interface{}{
 				"type":  "content_block_start",
 				"index": idx,
 				"content_block": map[string]string{
@@ -1763,7 +1798,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				return
 			}
 			startContentBlock("text")
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+			emit("content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
 				"index": activeBlockIndex,
 				"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1790,7 +1825,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				return
 			}
 			startContentBlock("text")
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+			emit("content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
 				"index": activeBlockIndex,
 				"delta": map[string]string{"type": "text_delta", "text": outputText},
@@ -1800,7 +1835,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				return
 			}
 			startContentBlock("text")
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+			emit("content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
 				"index": activeBlockIndex,
 				"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1827,7 +1862,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			}
 			if text != "" {
 				startContentBlock("thinking")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				emit("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "thinking_delta", "thinking": text},
@@ -1871,7 +1906,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			idx := nextContentIndex
 			nextContentIndex++
 
-			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+			emit("content_block_start", map[string]interface{}{
 				"type":  "content_block_start",
 				"index": idx,
 				"content_block": map[string]interface{}{
@@ -1883,7 +1918,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			})
 
 			inputJSON, _ := json.Marshal(tu.Input)
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+			emit("content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
 				"index": idx,
 				"delta": map[string]interface{}{
@@ -1892,7 +1927,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 				},
 			})
 
-			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			emit("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": idx,
 			})
@@ -1914,6 +1949,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	err := CallKiroAPI(account, payload, callback)
+	// Upstream is done (or failed). Stop the heartbeat BEFORE writing any
+	// terminal/error frame so a ping can never land after message_stop.
+	stopHB()
 	if err != nil {
 		if !committed {
 			// Nothing reached the client yet — let the dispatcher fail over.
@@ -1926,7 +1964,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		// committed request failed mid-stream) and surface it inline as an
 		// SSE error event so the client sees it.
 		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
-		h.sendSSE(w, flusher, "error", map[string]interface{}{
+		emit("error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
 		})
@@ -1974,7 +2012,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	// 发送 message_delta
 	stopReason := resolveAnthropicStopReason(upstreamStopReason, len(toolUses) > 0)
 
-	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+	emit("message_delta", map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
 			"stop_reason": stopReason,
@@ -1982,10 +2020,62 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 	})
 
-	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+	emit("message_stop", map[string]interface{}{
 		"type": "message_stop",
 	})
 	return true, nil
+}
+
+// streamWriteDeadlineWindow is how far ahead the streaming write deadline is
+// pushed on each heartbeat tick. It must exceed streamHeartbeatInterval (so a
+// healthy stream's deadline is always refreshed before it lapses) yet stay
+// finite (so a genuinely stuck downstream write to a dead client eventually
+// fails instead of blocking a goroutine + upstream slot forever). This replaces
+// the server's fixed 30-minute WriteTimeout for streaming responses: Go sets
+// that deadline once at response start and never extends it on Flush, so
+// without this a healthy generation running past 30 minutes would be cut
+// mid-work.
+const streamWriteDeadlineWindow = 2 * time.Minute
+
+// rollWriteDeadline pushes the response write deadline forward by
+// streamWriteDeadlineWindow. Best-effort: if the ResponseWriter doesn't support
+// deadlines (rare; httptest recorders, some middlewares) the error is ignored
+// and the server's static WriteTimeout remains in force.
+func rollWriteDeadline(w http.ResponseWriter) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(streamWriteDeadlineWindow))
+}
+
+// startSSEHeartbeat starts a goroutine that calls tick every interval until the
+// returned stop func is invoked. stop blocks until the goroutine has exited, so
+// callers can rely on no further ticks running once stop returns — that join is
+// what guarantees a heartbeat ping can never be written after the terminal SSE
+// frames. stop is idempotent. A non-positive interval disables the heartbeat
+// entirely (stop is then a no-op).
+func startSSEHeartbeat(interval time.Duration, tick func()) func() {
+	if interval <= 0 {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() { close(stop) })
+		<-done
+	}
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {

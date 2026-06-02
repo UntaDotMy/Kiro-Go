@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -273,5 +274,70 @@ func TestMCPQHostForRegion(t *testing.T) {
 		if got := mcpQHostForRegion(region); got != want {
 			t.Fatalf("mcpQHostForRegion(%q) = %q, want %q", region, got, want)
 		}
+	}
+}
+
+// TestParseMCPWebSearchResponse_NumericPublishedDate is the regression guard for
+// the live failure: Kiro's /mcp returns publishedDate as a NUMBER (a year, or
+// an epoch timestamp), which the strict string decoder rejected with "cannot
+// unmarshal number into Go struct field ...publishedDate of type string",
+// making every web search look unavailable. The lenient decoder must coerce it.
+func TestParseMCPWebSearchResponse_NumericPublishedDate(t *testing.T) {
+	// publishedDate as a bare year and as an epoch timestamp, plus a normal
+	// string — all in one payload, exactly the kind of mix the upstream sends.
+	inner := `{"results":[` +
+		`{"title":"Year","url":"https://y","snippet":"s","publishedDate":2026},` +
+		`{"title":"Epoch","url":"https://e","snippet":"s","publishedDate":1733000000},` +
+		`{"title":"Str","url":"https://s","snippet":"s","publishedDate":"2026-01-01"}` +
+		`]}`
+	escaped := strings.ReplaceAll(inner, `"`, `\"`)
+	raw := []byte(`{"jsonrpc":"2.0","id":"1","result":{"content":[{"type":"text","text":"` + escaped + `"}]}}`)
+
+	results, err := parseMCPWebSearchResponse(raw)
+	if err != nil {
+		t.Fatalf("numeric publishedDate must not fail the parse, got: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	if results[0].PublishedDate != "2026" {
+		t.Fatalf("year number should coerce to \"2026\", got %q", results[0].PublishedDate)
+	}
+	if results[1].PublishedDate != "1733000000" {
+		t.Fatalf("epoch number should coerce without scientific notation, got %q", results[1].PublishedDate)
+	}
+	if results[2].PublishedDate != "2026-01-01" {
+		t.Fatalf("string date should pass through unchanged, got %q", results[2].PublishedDate)
+	}
+	// The actual hit data must survive intact.
+	if results[0].Title != "Year" || results[0].URL != "https://y" {
+		t.Fatalf("result 0 fields mangled: %+v", results[0])
+	}
+}
+
+// TestWebSearchResultUnmarshalCoercesScalars pins the scalar-coercion contract
+// directly on the type so future field additions keep the same leniency.
+func TestWebSearchResultUnmarshalCoercesScalars(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want WebSearchResult
+	}{
+		{"numeric date", `{"title":"A","url":"u","publishedDate":2025}`, WebSearchResult{Title: "A", URL: "u", PublishedDate: "2025"}},
+		{"string date", `{"title":"A","url":"u","publishedDate":"yesterday"}`, WebSearchResult{Title: "A", URL: "u", PublishedDate: "yesterday"}},
+		{"null date", `{"title":"A","url":"u","publishedDate":null}`, WebSearchResult{Title: "A", URL: "u", PublishedDate: ""}},
+		{"missing date", `{"title":"A","url":"u"}`, WebSearchResult{Title: "A", URL: "u", PublishedDate: ""}},
+		{"numeric title coerced", `{"title":123,"url":"u"}`, WebSearchResult{Title: "123", URL: "u"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got WebSearchResult
+			if err := json.Unmarshal([]byte(tc.raw), &got); err != nil {
+				t.Fatalf("unmarshal %s: %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }
