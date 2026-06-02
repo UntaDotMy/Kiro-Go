@@ -10,6 +10,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/net/http2"
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
@@ -137,6 +139,42 @@ const (
 	responseHeaderTimeout = 60 * time.Second
 	streamIdleTimeout     = 5 * time.Minute
 	restRequestTimeout    = 30 * time.Second
+
+	// HTTP/2 active health-check knobs for the upstream connection to AWS.
+	//
+	// Root cause of "context deadline exceeded … while reading body" mid-stream
+	// disconnects: Go's HTTP/2 transport never probes an idle connection on its
+	// own. During a long thinking-mode gap (or any quiet stretch) a middlebox —
+	// AWS ALB/NLB idle reaper, NAT rebind, outbound-proxy drop, wifi handoff —
+	// can silently drop the keep-alive connection without a FIN/RST ever
+	// reaching us. The blocked resp.Body.Read() then hangs until
+	// streamIdleTimeout (5m) cancels the request, surfacing the cancellation as
+	// a client-visible API error in the middle of a turn.
+	//
+	// With ReadIdleTimeout set, the transport sends an HTTP/2 PING after this
+	// much silence on a connection. That does double duty: the PING traffic
+	// keeps middleboxes from treating the connection as idle (prevention), and a
+	// missing PING ACK within PingTimeout tears the connection down with a
+	// concrete error in ~30s instead of 5 minutes (fast detection). A
+	// healthy-but-slow stream is unaffected — PINGs are answered, reads keep
+	// returning data, and idleTimeoutReader's 5m budget is never approached.
+	h2ReadIdleTimeout = 15 * time.Second
+	h2PingTimeout     = 15 * time.Second
+
+	// tcpKeepAliveInterval is the OS-level TCP keep-alive probe interval on the
+	// upstream dialer. It is the dead-connection detection floor for BOTH
+	// transports, and the only active liveness probing on the proxied path
+	// (where HTTP/2 PINGs are unavailable). Kept in the same ballpark as the h2
+	// ping budget so detection latency is comparable across both paths.
+	tcpKeepAliveInterval = 15 * time.Second
+
+	// streamHeartbeatInterval is how often the downstream streaming handlers
+	// emit an SSE keepalive (an Anthropic `ping` event) to the client while the
+	// upstream is silent. The real Anthropic API sends pings during long
+	// operations for exactly this reason; without them a healthy-but-quiet
+	// generation (a multi-minute thinking pause, a slow tool gap) looks like a
+	// dead connection to the client's own idle timer and gets aborted.
+	streamHeartbeatInterval = 15 * time.Second
 )
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
@@ -211,6 +249,17 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: responseHeaderTimeout,
+		// OS-level TCP keep-alive on the dialer. This is the floor of
+		// dead-connection detection and, crucially, the ONLY active probing on
+		// the proxied path where HTTP/2 PINGs are unavailable (h2 is disabled
+		// for forward proxies below). The kernel sends keep-alive probes on an
+		// otherwise-silent socket; a middlebox that has dropped the connection
+		// answers with a RST, surfacing a concrete read error instead of a
+		// multi-minute hang. On the direct path this layers under the h2 PINGs.
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: tcpKeepAliveInterval,
+		}).DialContext,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -221,7 +270,40 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 	} else {
 		t.Proxy = http.ProxyFromEnvironment
 	}
+
+	// Enable HTTP/2 active PING health-checks on the direct (non-proxied)
+	// transport. ForceAttemptHTTP2 lets net/http build an INTERNAL http2
+	// transport we can't otherwise reach, so its ReadIdleTimeout defaults to 0
+	// (disabled) and a silently-dropped connection is never detected until the
+	// 5-minute idleTimeoutReader fires. http2.ConfigureTransports surfaces that
+	// internal transport so we can turn on PINGs. See the h2*Timeout constants
+	// for the full rationale. Proxied connections speak HTTP/1.1 (h2 disabled
+	// above) and rely on the DialContext TCP keep-alive instead, so we skip the
+	// h2 wiring there.
+	if t.ForceAttemptHTTP2 {
+		if _, err := enableHTTP2Pings(t); err != nil {
+			logger.Warnf("[KiroAPI] HTTP/2 ping health-check setup failed (continuing without active keepalive): %v", err)
+		}
+	}
 	return t
+}
+
+// enableHTTP2Pings turns on active HTTP/2 PING health-checking for an
+// http.Transport that will negotiate h2. It must be called exactly once per
+// transport before first use (http2.ConfigureTransports errors if h2 is
+// already configured). Returns the configured *http2.Transport (for tests to
+// assert the timeouts) and any setup error. Split out from buildKiroTransport
+// so the ping wiring is unit-testable in isolation.
+func enableHTTP2Pings(t *http.Transport) (*http2.Transport, error) {
+	h2, err := http2.ConfigureTransports(t)
+	if err != nil {
+		return nil, err
+	}
+	if h2 != nil {
+		h2.ReadIdleTimeout = h2ReadIdleTimeout
+		h2.PingTimeout = h2PingTimeout
+	}
+	return h2, nil
 }
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.

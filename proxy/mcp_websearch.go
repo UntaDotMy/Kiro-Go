@@ -9,6 +9,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +55,59 @@ type WebSearchResult struct {
 	URL           string `json:"url"`
 	Snippet       string `json:"snippet"`
 	PublishedDate string `json:"publishedDate,omitempty"`
+}
+
+// UnmarshalJSON decodes a single search hit leniently. Kiro's /mcp web_search
+// payload is loosely typed: in practice `publishedDate` arrives sometimes as a
+// string ("2026-01-01") and sometimes as a NUMBER (a year like 2026, or an
+// epoch timestamp). Go's default decoder rejects the whole payload on that one
+// type mismatch with "cannot unmarshal number into Go struct field
+// ...publishedDate of type string" — which the agentic loop then reports to the
+// model as "web search is currently unavailable", so a perfectly good search
+// looks broken. We decode the scalar fields through json.RawMessage and coerce
+// each to a string so a string-or-number value never kills the parse.
+func (r *WebSearchResult) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		Title         json.RawMessage `json:"title"`
+		URL           json.RawMessage `json:"url"`
+		Snippet       json.RawMessage `json:"snippet"`
+		PublishedDate json.RawMessage `json:"publishedDate"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	r.Title = jsonScalarToString(aux.Title)
+	r.URL = jsonScalarToString(aux.URL)
+	r.Snippet = jsonScalarToString(aux.Snippet)
+	r.PublishedDate = jsonScalarToString(aux.PublishedDate)
+	return nil
+}
+
+// jsonScalarToString coerces a JSON scalar (string, number, bool, or null) to a
+// string. Strings are unquoted/unescaped; integral numbers render without a
+// decimal point or scientific notation (so an epoch like 1733000000 stays
+// "1733000000", not "1.733e+09"); null/empty becomes "". Non-scalar inputs
+// (object/array) fall back to the raw literal so we never panic.
+func jsonScalarToString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			return s
+		}
+		return ""
+	}
+	var num json.Number
+	if err := json.Unmarshal(raw, &num); err == nil {
+		if i, err := num.Int64(); err == nil {
+			return strconv.FormatInt(i, 10)
+		}
+		return num.String()
+	}
+	return strings.Trim(string(raw), `"`)
 }
 
 // mcpQHostForRegion returns the JSON-RPC MCP base for a region. Unlike the REST
