@@ -1360,8 +1360,11 @@
                         <span id="batchCount" style="font-size:12px;color:#7c3aed;font-weight:600;white-space:nowrap"></span>
                         <button class="btn btn-sm btn-primary" onclick="batchAction('enable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.enable"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('disable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.disable"></button>
+                        <button class="btn btn-sm btn-warning" onclick="batchAction('overage-on')" style="padding:3px 10px;font-size:12px" data-i18n="batch.overageOn"></button>
+                        <button class="btn btn-sm btn-secondary" onclick="batchAction('overage-off')" style="padding:3px 10px;font-size:12px" data-i18n="batch.overageOff"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('refresh')" style="padding:3px 10px;font-size:12px" data-i18n="batch.refresh"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchRefreshModels()" style="padding:3px 10px;font-size:12px" data-i18n="batch.refreshModels"></button>
+                        <button class="btn btn-sm btn-danger" onclick="batchAction('delete')" style="padding:3px 10px;font-size:12px" data-i18n="batch.delete"></button>
                         <div style="height:16px;width:1px;background:#e2e8f0;flex-shrink:0"></div>
                     </div>
                     <div style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0">
@@ -1985,12 +1988,19 @@
                 'privacy.tooltip': '开启后邮箱将脱敏显示',
                 'batch.enable': '批量启用',
                 'batch.disable': '批量禁用',
+                'batch.overageOn': '批量开启超额',
+                'batch.overageOff': '批量关闭超额',
+                'batch.delete': '批量删除',
                 'batch.refresh': '批量刷新',
                 'batch.refreshModels': '批量刷新模型',
                 'batch.selected': '已选 {0} 个',
                 'batch.selectAll': '全选',
                 'batch.confirmEnable': '确定批量启用 {0} 个账号？',
                 'batch.confirmDisable': '确定批量禁用 {0} 个账号？',
+                'batch.confirmOverageOn': '确定为已选 {0} 个账号开启超额使用？',
+                'batch.confirmOverageOff': '确定为已选 {0} 个账号关闭超额使用？',
+                'batch.confirmDelete': '确定删除已选 {0} 个账号？此操作无法撤销。',
+                'batch.deleteResult': '删除完成：成功 {0}，失败 {1}',
                 'batch.confirmRefresh': '确定批量刷新 {0} 个账号？',
                 'batch.refreshResult': '刷新完成：成功 {0}，失败 {1}',
                 'batch.confirmRefreshModels': '确定为已选 {0} 个账号刷新模型缓存？',
@@ -2371,12 +2381,19 @@
                 'privacy.tooltip': 'Mask email addresses when enabled',
                 'batch.enable': 'Batch Enable',
                 'batch.disable': 'Batch Disable',
+                'batch.overageOn': 'Batch Overage On',
+                'batch.overageOff': 'Batch Overage Off',
+                'batch.delete': 'Batch Delete',
                 'batch.refresh': 'Batch Refresh',
                 'batch.refreshModels': 'Batch Refresh Models',
                 'batch.selected': '{0} selected',
                 'batch.selectAll': 'Select All',
                 'batch.confirmEnable': 'Enable {0} accounts?',
                 'batch.confirmDisable': 'Disable {0} accounts?',
+                'batch.confirmOverageOn': 'Turn ON overage usage for {0} selected accounts?',
+                'batch.confirmOverageOff': 'Turn OFF overage usage for {0} selected accounts?',
+                'batch.confirmDelete': 'Delete {0} selected accounts? This cannot be undone.',
+                'batch.deleteResult': 'Delete done: {0} success, {1} failed',
                 'batch.confirmRefresh': 'Refresh {0} accounts?',
                 'batch.refreshResult': 'Refresh done: {0} success, {1} failed',
                 'batch.confirmRefreshModels': 'Refresh model cache for {0} selected accounts?',
@@ -2675,7 +2692,15 @@
         async function batchAction(action) {
             const ids = Array.from(selectedAccounts);
             if (ids.length === 0) return;
-            const confirmKey = 'batch.confirm' + action.charAt(0).toUpperCase() + action.slice(1);
+            // Map each action to its confirm-message i18n key. Overage on/off
+            // and delete have their own copy; enable/disable/refresh keep the
+            // existing capitalized-suffix convention.
+            const confirmKeyMap = {
+                'overage-on': 'batch.confirmOverageOn',
+                'overage-off': 'batch.confirmOverageOff',
+                'delete': 'batch.confirmDelete'
+            };
+            const confirmKey = confirmKeyMap[action] || ('batch.confirm' + action.charAt(0).toUpperCase() + action.slice(1));
             if (!confirm(t(confirmKey, ids.length))) return;
             try {
                 const res = await fetch('/admin/api/accounts/batch', {
@@ -2686,6 +2711,8 @@
                 const d = await res.json();
                 if (action === 'refresh' && d.success) {
                     alert(t('batch.refreshResult', d.refreshed, d.failed));
+                } else if (action === 'delete') {
+                    alert(t('batch.deleteResult', d.deleted || 0, d.failed || 0));
                 }
                 selectedAccounts.clear();
                 updateBatchBar();
