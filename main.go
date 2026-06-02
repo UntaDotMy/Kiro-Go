@@ -78,7 +78,9 @@ func main() {
 	// default. The user must either supply ADMIN_PASSWORD or change the
 	// password in data/config.json before the proxy starts. Allow the
 	// override env to skip this check for explicit unattended deployments.
-	if config.GetPassword() == defaultAdminPassword && os.Getenv("KIRO_ALLOW_DEFAULT_PASSWORD") == "" {
+	// Uses IsDefaultPassword (a verify) rather than string-equality because the
+	// password is stored bcrypt-hashed at rest — a plain `==` would never match.
+	if config.IsDefaultPassword() && os.Getenv("KIRO_ALLOW_DEFAULT_PASSWORD") == "" {
 		logger.Errorf("Refusing to start: admin password is still the default '%s'.", defaultAdminPassword)
 		logger.Errorf("Set the ADMIN_PASSWORD environment variable, or edit data/config.json,")
 		logger.Errorf("or set KIRO_ALLOW_DEFAULT_PASSWORD=1 to bypass this guard (not recommended).")

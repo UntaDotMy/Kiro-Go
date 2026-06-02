@@ -19,7 +19,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendResponsesError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -121,7 +121,6 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
-		OnError:    func(err error) { h.recordPoolError(account.ID, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
@@ -491,7 +490,6 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 			})
 		},
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
-		OnError:    func(err error) { h.recordPoolError(account.ID, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)

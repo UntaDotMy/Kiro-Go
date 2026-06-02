@@ -51,6 +51,7 @@ func TestThinkingSourceSameSourceRemainsAllowed(t *testing.T) {
 
 func TestValidateOpenAIRequestShapeRejectsAssistantPrefill(t *testing.T) {
 	req := &OpenAIRequest{
+		Model: "gpt-4o",
 		Messages: []OpenAIMessage{
 			{Role: "user", Content: "hello"},
 			{Role: "assistant", Content: "prefill"},
@@ -64,6 +65,7 @@ func TestValidateOpenAIRequestShapeRejectsAssistantPrefill(t *testing.T) {
 
 func TestValidateOpenAIRequestShapeAllowsToolResultFinalTurn(t *testing.T) {
 	req := &OpenAIRequest{
+		Model: "gpt-4o",
 		Messages: []OpenAIMessage{
 			{Role: "user", Content: "find weather"},
 			{
@@ -88,6 +90,7 @@ func TestValidateOpenAIRequestShapeAllowsToolResultFinalTurn(t *testing.T) {
 
 func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
 	req := &ClaudeRequest{
+		Model: "claude-opus-4.7",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "hello"},
 			{Role: "assistant", Content: "prefill"},
@@ -96,6 +99,35 @@ func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
 
 	if msg := validateClaudeRequestShape(req); msg == "" {
 		t.Fatalf("expected assistant-prefill final message to be rejected")
+	}
+}
+
+// TestValidateRequestShapeRejectsEmptyModel locks in the empty-model fix: a
+// request omitting `model` must be rejected with a clear error, on both the
+// Claude and OpenAI shapes. An empty model would otherwise slip past the
+// per-key model-whitelist guard (which only fires when model != "").
+func TestValidateRequestShapeRejectsEmptyModel(t *testing.T) {
+	claude := &ClaudeRequest{
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	if msg := validateClaudeRequestShape(claude); msg == "" {
+		t.Fatal("expected empty-model Claude request to be rejected")
+	}
+
+	openai := &OpenAIRequest{
+		Messages: []OpenAIMessage{{Role: "user", Content: "hi"}},
+	}
+	if msg := validateOpenAIRequestShape(openai); msg == "" {
+		t.Fatal("expected empty-model OpenAI request to be rejected")
+	}
+
+	// Whitespace-only model is also empty after trim.
+	claudeWS := &ClaudeRequest{
+		Model:    "   ",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	if msg := validateClaudeRequestShape(claudeWS); msg == "" {
+		t.Fatal("expected whitespace-only model to be rejected")
 	}
 }
 

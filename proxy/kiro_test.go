@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/binary"
 	"net/http"
 	"net/url"
 	"testing"
@@ -14,6 +16,24 @@ func TestNormalizeChunkBasicProgression(t *testing.T) {
 	}
 	if got := normalizeChunk("abcde", &prev); got != "de" {
 		t.Fatalf("expected appended delta, got %q", got)
+	}
+}
+
+// TestParseEventStreamRejectsOversizedFrame locks in the frame-allocation cap:
+// a frame whose total-length prefix claims more than maxEventStreamFrameBytes
+// must be rejected with an error BEFORE the proxy allocates for it, so a
+// malformed/tampered upstream frame can't trigger a giant make([]byte) and OOM
+// the process.
+func TestParseEventStreamRejectsOversizedFrame(t *testing.T) {
+	// Build a 12-byte prelude claiming a ~2 GiB total length.
+	var prelude [12]byte
+	binary.BigEndian.PutUint32(prelude[0:4], uint32(2<<30)) // totalLength ~2GiB
+	binary.BigEndian.PutUint32(prelude[4:8], 0)             // headersLength
+	// crc bytes [8:12] left zero — parse rejects on size before reading them.
+
+	err := parseEventStream(bytes.NewReader(prelude[:]), &KiroStreamCallback{})
+	if err == nil {
+		t.Fatal("expected an error for an oversized frame, got nil (would have allocated ~2GiB)")
 	}
 }
 

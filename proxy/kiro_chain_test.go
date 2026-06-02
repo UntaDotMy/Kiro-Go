@@ -143,7 +143,6 @@ func TestCallKiroAPIRecoversWhenSecondEndpointSucceeds(t *testing.T) {
 		OnText:         func(text string, isThinking bool) {},
 		OnToolUse:      func(KiroToolUse) {},
 		OnComplete:     func(in, out int) {},
-		OnError:        func(err error) {},
 		OnCredits:      func(c float64) {},
 		OnContextUsage: func(p float64) {},
 		OnStopReason:   func(r string) {},

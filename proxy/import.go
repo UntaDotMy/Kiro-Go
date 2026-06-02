@@ -13,6 +13,12 @@ import (
 	"kiro-go/logger"
 )
 
+// maxImportBatch caps how many credential rows a single POST /admin/api/import
+// may carry. Each row triggers a synchronous upstream auth.RefreshToken call,
+// so an unbounded array would be a self-inflicted DoS on the AWS auth endpoint.
+// 500 is far above any realistic real-world import.
+const maxImportBatch = 500
+
 // importRequest is the wire shape POST /admin/api/import accepts. It tolerates
 // three input forms that real users paste in:
 //
@@ -122,6 +128,19 @@ func (h *Handler) apiImportAccounts(w http.ResponseWriter, r *http.Request) {
 	if len(creds) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "no accounts in request"})
+		return
+	}
+
+	// Bound the batch size. Each row triggers a synchronous upstream
+	// auth.RefreshToken call, so a 32 MiB body packed with hundreds of
+	// thousands of tiny credential objects would become a self-inflicted DoS
+	// on the AWS auth endpoint (and a multi-minute request). 500 is far above
+	// any realistic real-world import.
+	if len(creds) > maxImportBatch {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("too many accounts in one import: %d (max %d)", len(creds), maxImportBatch),
+		})
 		return
 	}
 

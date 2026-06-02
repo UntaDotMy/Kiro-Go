@@ -12,6 +12,7 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"kiro-go/logger"
@@ -22,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -416,6 +419,17 @@ func Load() error {
 		// than being the only source.
 		_ = Save()
 	}
+
+	// One-shot migration: hash a legacy PLAINTEXT admin password at rest. Older
+	// configs (and the bundled default) stored the password verbatim. bcrypt is
+	// idempotent here — looksLikeBcrypt skips an already-hashed value — so this
+	// runs at most once per config and is a no-op on every subsequent load.
+	// VerifyPassword / IsDefaultPassword handle both forms, so this never breaks
+	// the default-password startup guard.
+	if cfg.Password != "" && !looksLikeBcrypt(cfg.Password) {
+		cfg.Password = hashPasswordForStorage(cfg.Password)
+		_ = Save()
+	}
 	return nil
 }
 
@@ -492,10 +506,68 @@ func migrateFilterDefaults() {
 
 // SetPassword updates the admin password.
 // Primarily used for environment variable override in containerized deployments.
+// DefaultAdminPassword is the bundled first-run password. The startup guard
+// refuses to bind a public port while the admin password still verifies against
+// this value (see IsDefaultPassword), forcing the operator to change it first.
+const DefaultAdminPassword = "changeme"
+
+// bcryptCost is the work factor for hashing the admin password at rest. Admin
+// auth is human-paced (dashboard login + low-volume admin API), so the ~60ms
+// of a cost-10 hash per verify is imperceptible while still forcing an
+// expensive offline brute-force if config.json is ever exfiltrated.
+const bcryptCost = bcrypt.DefaultCost
+
+// looksLikeBcrypt reports whether a stored password value is already a bcrypt
+// hash (vs legacy plaintext). bcrypt hashes start with $2a$ / $2b$ / $2y$.
+func looksLikeBcrypt(s string) bool {
+	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
+}
+
+// hashPasswordForStorage returns the value to persist for a password. Non-empty
+// plaintext is bcrypt-hashed; an empty string is stored as-is (treated as "no
+// password set"); a value that is already a bcrypt hash is returned unchanged
+// so re-saving config doesn't double-hash.
+func hashPasswordForStorage(password string) string {
+	if password == "" || looksLikeBcrypt(password) {
+		return password
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		// Hashing only fails on absurd inputs (>72 bytes is truncated, not an
+		// error). Fall back to storing plaintext rather than losing the
+		// password — VerifyPassword still handles the plaintext branch.
+		logger.Errorf("[Config] bcrypt hashing failed, storing password unhashed: %v", err)
+		return password
+	}
+	return string(h)
+}
+
+// VerifyPassword reports whether candidate matches the stored admin password.
+// It transparently handles BOTH a bcrypt hash (current format) and a legacy
+// plaintext value (pre-hash configs, or the bundled default), so upgrades and
+// the default-password guard keep working. Both branches are constant-time.
+func VerifyPassword(candidate string) bool {
+	stored := GetPassword()
+	if looksLikeBcrypt(stored) {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(candidate)) == nil
+	}
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(stored)) == 1
+}
+
+// IsDefaultPassword reports whether the admin password still verifies against
+// the bundled default. Used by the startup guard so the check works regardless
+// of whether the stored value is hashed or plaintext.
+func IsDefaultPassword() bool {
+	return VerifyPassword(DefaultAdminPassword)
+}
+
+// SetPassword sets the admin password, hashing it at rest. Primarily used for
+// the ADMIN_PASSWORD environment-variable override in containerized
+// deployments (runtime-only; not persisted by this call).
 func SetPassword(password string) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.Password = password
+	cfg.Password = hashPasswordForStorage(password)
 }
 
 func GetPassword() string {
@@ -636,7 +708,7 @@ func UpdateSettingsPartial(apiKey *string, requireApiKey *bool, password *string
 		cfg.RequireApiKey = *requireApiKey
 	}
 	if password != nil && *password != "" {
-		cfg.Password = *password
+		cfg.Password = hashPasswordForStorage(*password)
 	}
 	return Save()
 }
@@ -691,6 +763,14 @@ func StartStatsSaver() {
 		return
 	}
 	go func() {
+		// Recover so a panic in the long-lived stats-flush goroutine (e.g.
+		// during json.MarshalIndent of cfg) can't crash the whole process and
+		// silently stop all stats persistence. Log and keep ticking.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[StatsSaver] flush goroutine panic recovered: %v", r)
+			}
+		}()
 		ticker := time.NewTicker(statsFlushInterval)
 		defer ticker.Stop()
 		for range ticker.C {
