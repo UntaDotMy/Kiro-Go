@@ -226,7 +226,6 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		},
 		OnComplete:   func(in, out int) { inputTokens, outputTokens = in, out },
 		OnCredits:    func(c float64) { credits = c },
-		OnError:      func(err error) { h.recordPoolError(account.ID, err) },
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 

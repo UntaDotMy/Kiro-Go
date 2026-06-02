@@ -421,6 +421,23 @@ func FindAPIKeyBySecret(secret string) *APIKey {
 // the upstream call hasn't happened yet; the actual values are committed by
 // ConsumeAPIKey on the success path.
 func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
+	return checkAPIKeyLimit(id, model, true)
+}
+
+// CheckAPIKeyRateLimit is the model-AGNOSTIC gate for metadata routes
+// (/v1/models, /v1/stats) that authenticate a key but don't invoke a model. It
+// enforces enable / absolute-expiry / lazy-expiry / per-minute / per-hour /
+// periodic / lifetime limits — closing the hole where a disabled, expired, or
+// rate-exhausted key could still hit those routes — but skips the model-
+// whitelist check so a restricted key can still list its (filtered) catalog.
+func CheckAPIKeyRateLimit(id string) (rejected bool, reason string) {
+	return checkAPIKeyLimit(id, "", false)
+}
+
+// checkAPIKeyLimit is the shared pre-flight implementation. checkModel gates the
+// model-whitelist / required-model checks so metadata routes can reuse the
+// rate/quota/expiry logic without a model dimension.
+func checkAPIKeyLimit(id, model string, checkModel bool) (rejected bool, reason string) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i := range cfg.APIKeys {
@@ -442,8 +459,20 @@ func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
 			_ = Save()
 			return true, "key expired (lazy)"
 		}
-		if model != "" && !modelIsAllowedByWhitelist(k.Models, model) {
-			return true, "model '" + model + "' not allowed for this key"
+		if checkModel {
+			if model != "" && !modelIsAllowedByWhitelist(k.Models, model) {
+				return true, "model '" + model + "' not allowed for this key"
+			}
+			// Defense-in-depth: a key that declares a model whitelist must never
+			// be served an EMPTY model. Callers should reject empty model upstream
+			// (the request-shape validators do), but if one slips through, an
+			// empty model would otherwise short-circuit the `model != ""` guard
+			// above and bypass the whitelist entirely. A key with no whitelist
+			// (len==0) is unrestricted and unaffected. Metadata routes pass
+			// checkModel=false so this never blocks /v1/models or /v1/stats.
+			if model == "" && len(k.Models) > 0 {
+				return true, "model is required for this key"
+			}
 		}
 		curMin := minuteBucket(k.ResetTZ)
 		if k.minuteBucketKey != curMin {
@@ -495,7 +524,11 @@ func CheckAPIKeyLimit(id, model string) (rejected bool, reason string) {
 		_ = Save() // persist any bucket roll-over zeroing
 		return false, ""
 	}
-	return false, ""
+	// Key ID not found. Callers only pass an id that was matched at auth time,
+	// so a miss here means the key was DELETED between auth and this gate —
+	// reject the in-flight request rather than treating the absent key as
+	// unrestricted (which would let a just-revoked key through).
+	return true, "key not found or revoked"
 }
 
 // ConsumeAPIKey records the usage of a request that has ALREADY completed and
@@ -606,5 +639,8 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 		_ = Save()
 		return rejected, reason
 	}
-	return false, ""
+	// Key ID not found — deleted between auth and this post-response accounting
+	// call. The response already streamed (this function never gates), so there
+	// is nothing to record; surface a non-empty reason for the caller's log.
+	return true, "key not found or revoked"
 }

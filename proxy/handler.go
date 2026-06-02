@@ -11,7 +11,10 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"kiro-go/stats"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,6 +122,9 @@ func allowTagSource(source *thinkingStreamSource) bool {
 }
 
 func validateClaudeRequestShape(req *ClaudeRequest) string {
+	if strings.TrimSpace(req.Model) == "" {
+		return "model is required"
+	}
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
 	}
@@ -256,6 +262,9 @@ func resolveClaudeThinkingResponseOptions(thinking *ClaudeThinkingConfig, defaul
 }
 
 func validateOpenAIRequestShape(req *OpenAIRequest) string {
+	if strings.TrimSpace(req.Model) == "" {
+		return "model is required"
+	}
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
 	}
@@ -567,6 +576,15 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 		if k.ExpiresAt > 0 && time.Now().Unix() > k.ExpiresAt {
 			continue
 		}
+		// Lazy expiry: a key with LazyExpirySeconds expires that many seconds
+		// after its FIRST use. Enforced here at auth time so a lazy-expired key
+		// stops authenticating on EVERY route — not just the inference routes
+		// that call enforceAPIKeyLimit. Without this, an expired-lazy key could
+		// still reach /v1/models and /v1/stats until an operator flipped Enabled.
+		if k.LazyExpirySeconds > 0 && k.FirstUsedAt > 0 &&
+			time.Now().Unix() > k.FirstUsedAt+k.LazyExpirySeconds {
+			continue
+		}
 		if providedKey != "" && subtle.ConstantTimeCompare([]byte(providedKey), []byte(k.Key)) == 1 {
 			// Stash the matched key on the request context so downstream
 			// handlers can debit per-key counters and filter by whitelist.
@@ -619,6 +637,32 @@ func (h *Handler) enforceAPIKeyLimit(w http.ResponseWriter, r *http.Request, mod
 		return false
 	}
 	rejected, reason := config.CheckAPIKeyLimit(k.ID, model)
+	if !rejected {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"type":    "rate_limit_error",
+			"message": "API key limit reached: " + reason,
+		},
+	})
+	return true
+}
+
+// enforceAPIKeyRateLimit is the model-agnostic gate for metadata routes
+// (/v1/models, /v1/stats). It enforces the key's enable/expiry/rate/quota
+// limits WITHOUT the model-whitelist dimension, so a disabled, expired, or
+// rate-exhausted key can't keep probing these routes, while a model-restricted
+// key can still list its filtered catalog. Returns true when the request was
+// rejected (429 already written).
+func (h *Handler) enforceAPIKeyRateLimit(w http.ResponseWriter, r *http.Request) bool {
+	k := matchedAPIKey(r)
+	if k == nil {
+		return false
+	}
+	rejected, reason := config.CheckAPIKeyRateLimit(k.ID)
 	if !rejected {
 		return false
 	}
@@ -739,6 +783,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.sendOpenAIError(w, 401, "authentication_error", "Invalid or missing API key")
 			return
 		}
+		// Apply the model-agnostic rate/quota gate so a disabled, expired, or
+		// rate-exhausted key can't probe this route unmetered.
+		if h.enforceAPIKeyRateLimit(w, r) {
+			return
+		}
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
@@ -770,6 +819,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(401)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid or missing API key"})
+			return
+		}
+		if h.enforceAPIKeyRateLimit(w, r) {
 			return
 		}
 		h.handleStats(w, r)
@@ -1496,7 +1548,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -1539,7 +1591,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 读取请求
-	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -1936,9 +1988,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			inputTokens = inTok
 			outputTokens = outTok
 		},
-		OnError: func(err error) {
-			h.recordPoolError(account.ID, err)
-		},
 		OnCredits: func(c float64) {
 			credits = c
 		},
@@ -2061,6 +2110,14 @@ func startSSEHeartbeat(interval time.Duration, tick func()) func() {
 	var once sync.Once
 	go func() {
 		defer close(done)
+		// Recover so a panic inside tick() (e.g. a nil flusher / ResponseWriter
+		// edge case) can't crash the whole process — this is a spawned
+		// goroutine, which net/http does NOT recover for us.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[SSEHeartbeat] tick panic recovered: %v", r)
+			}
+		}()
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -2241,11 +2298,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 			inputTokens = inTok
 			outputTokens = outTok
 		},
-		OnError: func(err error) {
-			// Pool cooldown bookkeeping happens here; the dispatcher handles
-			// stats + overage via handleUpstreamError on the returned error.
-			h.recordPoolError(account.ID, err)
-		},
 		OnCredits: func(c float64) {
 			credits = c
 		},
@@ -2349,7 +2401,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
@@ -2629,9 +2681,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			inputTokens = inTok
 			outputTokens = outTok
 		},
-		OnError: func(err error) {
-			h.recordPoolError(account.ID, err)
-		},
 		OnCredits: func(c float64) {
 			credits = c
 		},
@@ -2741,7 +2790,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-		OnError:    func(err error) { h.recordPoolError(account.ID, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
@@ -2872,7 +2920,7 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
+	if !config.VerifyPassword(password) {
 		h.recordAdminFailure(r)
 		logger.Warnf("[Admin] failed auth from %s for %s", clientIP(r), r.URL.Path)
 		w.WriteHeader(401)
@@ -2880,6 +2928,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.resetAdminFailures(r)
+
+	// Bound every admin request body to maxRequestBodyBytes. Most admin handlers
+	// decode r.Body with json.NewDecoder and no size cap, so without this an
+	// authenticated request (or one past the brute-force gate) could POST a
+	// multi-GB body and exhaust RAM. Capping once here covers all of them; the
+	// import handler re-wraps with the same limit, so this never shrinks its
+	// legitimate large-batch allowance.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 
 	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -3064,6 +3120,13 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	if account.Region == "" {
 		account.Region = "us-east-1"
 	}
+	if account.ProxyURL != "" {
+		if msg := validateProxyURL(account.ProxyURL); msg != "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
+			return
+		}
+	}
 
 	if err := config.AddAccount(account); err != nil {
 		w.WriteHeader(500)
@@ -3074,11 +3137,11 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	h.pool.Reload()
 	// 新账号若已启用且有 token，立即拉取并缓存模型列表
 	if account.Enabled && account.AccessToken != "" {
-		go func(acc config.Account) {
+		safeGoArg("addAccount-modelsRefresh", account, func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
 			}
-		}(account)
+		})
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": account.ID})
 }
@@ -3143,6 +3206,13 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		existing.OverageWeight = clampInt(int(v), 1, 10)
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
+		if v != "" {
+			if msg := validateProxyURL(v); msg != "" {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": msg})
+				return
+			}
+		}
 		existing.ProxyURL = v
 	}
 
@@ -3155,11 +3225,11 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	h.pool.Reload()
 	// 账号从禁用→启用时，自动拉取并缓存模型列表
 	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
-		go func(acc config.Account) {
+		safeGoArg("updateAccount-modelsRefresh", *existing, func(acc config.Account) {
 			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
 			}
-		}(*existing)
+		})
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -3212,12 +3282,13 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		h.pool.Reload()
 		// 为本次新启用的账号异步拉取模型缓存
 		for _, acc := range toRefreshModels {
-			go func(a config.Account) {
-				a.Enabled = true
-				if err := h.fetchAndCacheAccountModels(&a); err != nil {
-					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
+			a := acc
+			a.Enabled = true
+			safeGoArg("batchEnable-modelsRefresh", a, func(account config.Account) {
+				if err := h.fetchAndCacheAccountModels(&account); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", account.Email, err)
 				}
-			}(acc)
+			})
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
 
@@ -3917,8 +3988,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// supplied and verified — otherwise an XSS-stolen session cookie or a
 	// CSRF-able admin endpoint could rotate the password silently.
 	if req.Password != nil && *req.Password != "" {
-		if req.CurrentPassword == nil ||
-			subtle.ConstantTimeCompare([]byte(*req.CurrentPassword), []byte(config.GetPassword())) != 1 {
+		if req.CurrentPassword == nil || !config.VerifyPassword(*req.CurrentPassword) {
 			w.WriteHeader(403)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Current password incorrect"})
 			return
@@ -4040,7 +4110,6 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnText:         func(text string, isThinking bool) { content += text },
 		OnToolUse:      func(tu KiroToolUse) {},
 		OnComplete:     func(inTok, outTok int) {},
-		OnError:        func(err error) {},
 		OnCredits:      func(c float64) {},
 		OnContextUsage: func(pct float64) {},
 		OnStopReason:   func(r string) {},
@@ -4504,12 +4573,9 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 
 	// 验证代理 URL 格式（非空时）
 	if req.ProxyURL != "" {
-		if !strings.HasPrefix(req.ProxyURL, "http://") &&
-			!strings.HasPrefix(req.ProxyURL, "https://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5://") &&
-			!strings.HasPrefix(req.ProxyURL, "socks5h://") {
+		if msg := validateProxyURL(req.ProxyURL); msg != "" {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
 			return
 		}
 	}
@@ -4524,6 +4590,39 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	applyProxyConfig(req.ProxyURL)
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// validateProxyURL validates an outbound-proxy URL for both the global and the
+// per-account proxy settings. It enforces a known scheme and, by default,
+// rejects a LINK-LOCAL target (169.254.0.0/16 and fe80::/10). Link-local is
+// never a legitimate forward proxy but IS where cloud instance-metadata lives
+// (169.254.169.254) — the classic SSRF target that could be used to route the
+// AWS bearer token through an attacker-reachable endpoint. Private/LAN and
+// localhost proxies remain allowed because they are the common legitimate case
+// (a local SOCKS5 proxy, a corporate proxy). Set KIRO_ALLOW_LINKLOCAL_PROXY=1
+// to bypass the link-local guard for unusual setups. Returns "" when valid, or
+// an operator-facing error message.
+func validateProxyURL(raw string) string {
+	if !strings.HasPrefix(raw, "http://") &&
+		!strings.HasPrefix(raw, "https://") &&
+		!strings.HasPrefix(raw, "socks5://") &&
+		!strings.HasPrefix(raw, "socks5h://") {
+		return "proxyURL must start with http://, https://, socks5://, or socks5h://"
+	}
+	if os.Getenv("KIRO_ALLOW_LINKLOCAL_PROXY") == "1" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "proxyURL is not a valid URL: " + err.Error()
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return "proxyURL points at a link-local address (e.g. cloud metadata 169.254.169.254); refused. Set KIRO_ALLOW_LINKLOCAL_PROXY=1 to override."
+		}
+	}
+	return ""
 }
 
 // apiGetVersion 获取版本信息

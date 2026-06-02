@@ -25,7 +25,6 @@
 package proxy
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -136,7 +135,7 @@ func (h *Handler) handleDashboardWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
+	if !config.VerifyPassword(password) {
 		// Don't reveal whether the issue was missing protocol vs wrong
 		// password — both surface as 401 to the upgrade attempt.
 		w.WriteHeader(401)
@@ -174,6 +173,14 @@ func (h *Handler) handleDashboardWS(w http.ResponseWriter, r *http.Request) {
 	// signals. We also need ReadMessage to detect a client-side close so
 	// the connection is reaped promptly.
 	go func() {
+		// Recover so a panic in the read pump can't crash the whole process —
+		// this is a spawned goroutine, which net/http does not protect.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[DashboardWS] read pump panic recovered: %v", r)
+				h.dashboardHub.remove(sub)
+			}
+		}()
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		conn.SetPongHandler(func(string) error {
 			conn.SetReadDeadline(time.Now().Add(60 * time.Second))

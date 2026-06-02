@@ -442,7 +442,6 @@ type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
 	OnComplete     func(inputTokens, outputTokens int)
-	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
 	// OnStopReason surfaces a canonical stop reason ("end_turn", "max_tokens",
@@ -757,6 +756,14 @@ func parseRetryAfter(h http.Header) time.Duration {
 
 // ==================== Event Stream Parsing ====================
 
+// maxEventStreamFrameBytes caps a single AWS event-stream frame. The 4-byte
+// total-length prefix is attacker/transport-controlled (a malformed or MITMed
+// upstream frame could claim ~2GiB), and we allocate `remaining` bytes for it —
+// so without a cap one bad frame can OOM the process. Real Kiro frames are a
+// few KiB (text/reasoning deltas) up to low-MiB at most; 16 MiB is comfortably
+// above any legitimate frame while bounding the worst-case allocation.
+const maxEventStreamFrameBytes = 16 << 20 // 16 MiB
+
 // eventStreamMsgPool reuses message buffers across SSE frames. Each Kiro
 // streaming response can deliver hundreds of small frames; allocating a
 // fresh []byte per frame was a dominant GC source. The pool stores pointers
@@ -819,6 +826,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 
 		if totalLength < 16 {
 			continue
+		}
+		// Reject an implausibly large frame before allocating for it. The
+		// length prefix is upstream/transport-controlled, so a malformed or
+		// tampered frame claiming ~2GiB would otherwise trigger a giant
+		// make([]byte, remaining) and OOM the process.
+		if totalLength > maxEventStreamFrameBytes {
+			return fmt.Errorf("event stream frame too large: %d bytes (max %d)", totalLength, maxEventStreamFrameBytes)
 		}
 
 		// Read the remaining message bytes into the pooled scratch buffer.
@@ -890,14 +904,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				normalized := normalizeChunk(content, &lastAssistantContent)
-				if normalized != "" {
+				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
-				if normalized != "" {
+				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 				}
 			}
@@ -927,7 +941,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		callback.OnCredits(totalCredits)
 	}
 
-	callback.OnComplete(inputTokens, outputTokens)
+	if callback.OnComplete != nil {
+		callback.OnComplete(inputTokens, outputTokens)
+	}
 	return nil
 }
 
@@ -1192,6 +1208,9 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 	}
 	if input == nil {
 		input = make(map[string]interface{})
+	}
+	if callback.OnToolUse == nil {
+		return
 	}
 	callback.OnToolUse(KiroToolUse{
 		ToolUseID: state.ToolUseID,
