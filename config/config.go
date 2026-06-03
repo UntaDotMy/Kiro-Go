@@ -180,9 +180,19 @@ type Config struct {
 	// PoolStrategy chooses how the account pool picks the next account for a
 	// request. Recognized values:
 	//
-	//   "swr" / ""       — smooth weighted round-robin (default; existing
-	//                      behavior). Best for evenly weighted pools and
-	//                      operators who want predictable interleaving.
+	//   "least-request" / "" — least-outstanding-request (DEFAULT). Picks the
+	//                      eligible account with the fewest in-flight requests
+	//                      (Envoy's weighted form: score = weight/(inflight+1)),
+	//                      and applies an AIMD per-account concurrency limit that
+	//                      grows on success and halves on a 429. Best for bursty
+	//                      parallel load (agent fan-out) against per-identity
+	//                      rate limits — it prevents the whole pool throttling at
+	//                      once. This is the only strategy that reserves in-flight
+	//                      slots and gates admission.
+	//   "swr"            — smooth weighted round-robin (previous default).
+	//                      Balances assignment rate with predictable interleaving
+	//                      but is blind to concurrency, so a simultaneous burst
+	//                      can throttle every account at once. No in-flight gate.
 	//   "least-used"     — pick the eligible account with the lowest
 	//                      RequestCount (lifetime) so traffic naturally
 	//                      tilts toward fresher / less-burned accounts.
@@ -191,8 +201,9 @@ type Config struct {
 	//   "random"         — uniform random pick among eligible accounts.
 	//                      Cheap, jitter-friendly, useful as a control.
 	//
-	// All strategies obey cooldowns and model-list filters identically;
-	// only the picker among the eligible subset differs.
+	// All strategies obey cooldowns and model-list filters identically; only the
+	// picker among the eligible subset (and whether the AIMD gate applies)
+	// differs.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
@@ -250,6 +261,10 @@ type Config struct {
 
 	// FilterEnvNoise strips environment metadata lines from system prompts:
 	// git status, recent commits, environment sections, fast_mode_info tags, etc.
+	// It also drops whole <system-reminder>...</system-reminder> blocks. Because
+	// Claude Code delivers CLAUDE.md / AGENTS.md content inside <system-reminder>
+	// blocks, this defaults OFF (since 1.0.10-A11) so project memory files reach
+	// the model; enabling it trades that context for fewer tokens per request.
 	FilterEnvNoise bool `json:"filterEnvNoise,omitempty"`
 
 	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
@@ -309,7 +324,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A10"
+const Version = "1.0.10-A12"
 
 var (
 	cfg     *Config
@@ -394,7 +409,7 @@ func Load() error {
 				}},
 				Accounts:              []Account{},
 				FilterClaudeCode:      true,
-				FilterEnvNoise:        true,
+				FilterEnvNoise:        false,
 				FilterStripBoundaries: true,
 				FilterDefaultsApplied: true,
 			}
@@ -499,19 +514,23 @@ func writeConfigBytes(data []byte) error {
 	return os.Rename(tmpPath, cfgPath)
 }
 
-// migrateFilterDefaults sets the three prompt-filter flags ON for any
+// migrateFilterDefaults applies the default prompt-filter flags for any
 // pre-existing config that was loaded before the FilterDefaultsApplied
-// migration marker existed. Caller must hold cfgLock for write — Load()
-// satisfies that. The migration runs at most once per install: once
-// FilterDefaultsApplied is true (either from this migration or from the
-// fresh-install bootstrap), we never re-apply, so explicit operator
-// "off" toggles are preserved.
+// migration marker existed: FilterClaudeCode and FilterStripBoundaries ON,
+// FilterEnvNoise OFF. FilterEnvNoise defaults OFF because it strips whole
+// <system-reminder> blocks, and Claude Code delivers CLAUDE.md / AGENTS.md
+// inside those blocks — leaving it on would silently drop the user's project
+// memory files before they reach the model. Caller must hold cfgLock for
+// write — Load() satisfies that. The migration runs at most once per install:
+// once FilterDefaultsApplied is true (either from this migration or from the
+// fresh-install bootstrap), we never re-apply, so explicit operator toggles
+// are preserved.
 func migrateFilterDefaults() {
 	if cfg == nil || cfg.FilterDefaultsApplied {
 		return
 	}
 	cfg.FilterClaudeCode = true
-	cfg.FilterEnvNoise = true
+	cfg.FilterEnvNoise = false
 	cfg.FilterStripBoundaries = true
 	cfg.FilterDefaultsApplied = true
 	// Persist immediately so a subsequent restart sees the marker even if
@@ -1252,8 +1271,14 @@ func isValidAWSRegionShape(s string) bool {
 	return true
 }
 
-// GetPoolStrategy returns the configured pool selection strategy. Empty /
-// unrecognized values map to "swr". See cfg.PoolStrategy for the full menu.
+// GetPoolStrategy returns the configured pool selection strategy. An empty or
+// unrecognized PoolStrategy maps to "least-request" (the production default).
+//
+// The cfg==nil case returns "swr" instead: cfg is only nil before Init() (i.e.
+// in unit tests that construct a pool directly without loading config), and the
+// pool's SWRR/eligibility tests rely on that non-reserving fallback. In
+// production Init() always runs first, so a real install with an empty
+// PoolStrategy gets least-request.
 func GetPoolStrategy() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1261,12 +1286,16 @@ func GetPoolStrategy() string {
 		return "swr"
 	}
 	switch strings.ToLower(strings.TrimSpace(cfg.PoolStrategy)) {
+	case "swr", "swrr":
+		return "swr"
 	case "least-used", "leastused", "least_used":
 		return "least-used"
 	case "random":
 		return "random"
+	case "least-request", "least-conn", "leastrequest", "least_request", "lor":
+		return "least-request"
 	default:
-		return "swr"
+		return "least-request"
 	}
 }
 

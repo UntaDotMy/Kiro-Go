@@ -1505,11 +1505,12 @@
                 <div class="form-group">
                     <label>Pool Strategy</label>
                     <select id="poolStrategy">
-                        <option value="swr">Smooth Weighted Round-Robin (default)</option>
+                        <option value="least-request">Least-Request (default, best for bursts)</option>
+                        <option value="swr">Smooth Weighted Round-Robin</option>
                         <option value="least-used">Least-Used (drain freshest first)</option>
                         <option value="random">Random</option>
                     </select>
-                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. SWR is the existing balanced rotation. Least-used naturally tilts traffic toward less-burned accounts when the pool is heterogeneous. Random is useful as a control or to break unintended request synchronisation.</small>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. Least-request (default) steers each request to the least-busy account by outstanding in-flight requests and applies a per-account adaptive concurrency limit (grows on success, halves on a 429) — best for bursty parallel load like agent fan-out, where it stops the whole pool throttling at once. SWR is balanced rate-based rotation but blind to concurrency. Least-used tilts traffic toward less-burned accounts when the pool is heterogeneous. Random is a control or to break unintended request synchronisation.</small>
                 </div>
                 <button class="btn btn-primary" onclick="saveEndpointConfig()"
                     data-i18n="settings.saveEndpoint"></button>
@@ -1817,11 +1818,11 @@
                 'settings.promptFilter': 'System Prompt 过滤',
                 'settings.builtinFilters': '内置过滤器',
                 'settings.filterClaudeCode': '丢弃 Claude Code 系统提示',
-                'settings.filterClaudeCodeHint': '检测到 Claude Code 内置系统提示时，整个丢弃；工具定义仍通过结构化字段传递，模型使用训练时的默认表现。避免上游模型把代理的合成提示词识别为伪造的注入。',
+                'settings.filterClaudeCodeHint': '仅作用于请求的 SYSTEM 字段。检测到 Claude Code 内置系统提示时，整个 system 字段被丢弃——工具定义仍通过结构化 tools 字段传递，模型使用训练时的默认表现来组织回复。目的：避免上游模型把脚手架提示词识别为伪造的注入。注意：CLAUDE.md / AGENTS.md 并不在 system 字段中（它们随第一条用户消息传递），所以此开关不影响它们。建议：开启。',
                 'settings.filterEnvNoise': '过滤环境噪音行',
-                'settings.filterEnvNoiseHint': '移除系统提示中注入的环境变量、Git 状态、最近提交等噪音内容。',
+                'settings.filterEnvNoiseHint': '移除注入的噪音：环境变量、Git 状态、最近提交、以及保留的计费头行——并且会丢弃整个 <system-reminder>…</system-reminder> 块。重要：Claude Code 把 CLAUDE.md 和 AGENTS.md 的内容放在 <system-reminder> 块里传递，因此保持开启会在这些项目记忆文件到达模型之前将其一并删除。若希望 CLAUDE.md / AGENTS.md 指令生效请关闭——代价是每次请求的 token 增多（环境/Git 噪音会一并带上），并失去计费头清理。建议：除非依赖 CLAUDE.md，否则开启。',
                 'settings.filterStripBoundaries': '清理边界标记',
-                'settings.filterStripBoundariesHint': '从客户端提交的系统提示中清除 --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- 等边界标记行（代理本身已不再发出这类标记）。',
+                'settings.filterStripBoundariesHint': '从客户端提交的系统提示中清除 --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- 等边界标记行（代理本身已不再发出这类标记）。纯属外观清理，不影响 CLAUDE.md 或工具行为。可安全保持开启。',
                 'settings.savePromptFilter': '保存过滤设置',
                 'settings.promptFilterSaved': '过滤设置已保存',
                 'settings.customRules': '自定义过滤规则',
@@ -2012,6 +2013,8 @@
                 'filter.disabled': '已禁用',
                 'filter.banned': '已封禁',
                 'accounts.weight': '权重',
+                'accounts.inflight': '并发',
+                'accounts.inflightHint': '当前在途请求数 / 自适应并发上限（仅 least-request 策略）。上限在成功时 +1、遇到 429 时减为 3/4，自动逼近 AWS 的限流阈值。',
                 'detail.weight': '请求权重',
                 'detail.weightHint': '0-1=普通, 2+=高优先级',
                 'detail.overage': '超额调用设置',
@@ -2210,11 +2213,11 @@
                 'settings.promptFilter': 'System Prompt Filter',
                 'settings.builtinFilters': 'Built-in Filters',
                 'settings.filterClaudeCode': 'Drop Claude Code system prompts',
-                'settings.filterClaudeCodeHint': 'When the Claude Code CLI built-in system prompt is detected, drop it entirely. Tool definitions still travel via the structured tools field; the model uses its training defaults for response styling. Avoids the upstream model fingerprinting our replacement prompt as fake injection.',
+                'settings.filterClaudeCodeHint': 'Targets the request SYSTEM field only. When the Claude Code CLI built-in system prompt is detected, the whole system field is dropped — your tool definitions still travel via the structured tools field, and the model styles its replies from its training defaults. Purpose: stop the upstream model from fingerprinting the harness prompt as a fake injection. Note: CLAUDE.md / AGENTS.md do NOT live in the system field (they ride in the first user message), so this toggle does not affect them. Recommended: ON.',
                 'settings.filterEnvNoise': 'Strip environment noise lines',
-                'settings.filterEnvNoiseHint': 'Removes injected env vars, git status, recent commits and similar noise from system prompts.',
+                'settings.filterEnvNoiseHint': 'Removes injected noise: environment variables, git status, recent commits, and the reserved billing-header line — and it drops whole <system-reminder>…</system-reminder> blocks. IMPORTANT: Claude Code delivers CLAUDE.md and AGENTS.md content INSIDE <system-reminder> blocks, so leaving this ON also strips your project memory files before they reach the model. Turn OFF if you want CLAUDE.md / AGENTS.md instructions honored — the tradeoff is more tokens per request (the env/git noise rides along) and loss of the billing-header strip. Recommended: ON unless you rely on CLAUDE.md.',
                 'settings.filterStripBoundaries': 'Clean boundary markers',
-                'settings.filterStripBoundariesHint': 'Strips --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- marker lines from client-supplied system prompts (the proxy itself no longer emits them).',
+                'settings.filterStripBoundariesHint': 'Strips --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- marker lines from client-supplied system prompts (the proxy itself no longer emits them). Cosmetic cleanup with no effect on CLAUDE.md or tool behavior. Safe to leave ON.',
                 'settings.savePromptFilter': 'Save Filter Settings',
                 'settings.promptFilterSaved': 'Filter settings saved',
                 'settings.customRules': 'Custom Filter Rules',
@@ -2405,6 +2408,8 @@
                 'filter.disabled': 'Disabled',
                 'filter.banned': 'Banned',
                 'accounts.weight': 'Weight',
+                'accounts.inflight': 'In-flight',
+                'accounts.inflightHint': 'Current outstanding requests / adaptive concurrency limit (least-request strategy only). The limit grows by 1 on success and drops to 3/4 on a 429, self-tuning toward the AWS throttle threshold.',
                 'detail.weight': 'Request Weight',
                 'detail.weightHint': '0-1=normal, 2+=higher priority',
                 'detail.overage': 'Overage Settings',
@@ -2826,6 +2831,7 @@
                     '<div class="account-stat"><div class="account-stat-value"><select onchange="quickSetWeight(\'' + a.id + '\',this.value)" style="width:52px;padding:1px 2px;border:1px solid #e2e8f0;border-radius:4px;font-size:12px;text-align:center;cursor:pointer;background:#fff">' +
                     [0,1,2,3,4,5].map(w => '<option value="' + w + '"' + (weightVal === w ? ' selected' : '') + '>' + w + '</option>').join('') +
                     '</select></div><div class="account-stat-label">' + t('accounts.weight') + '</div></div>' +
+                    (a.inflight !== undefined ? '<div class="account-stat" title="' + t('accounts.inflightHint') + '"><div class="account-stat-value">' + (a.inflight || 0) + ' / ' + (a.concurrencyLimit || 0) + '</div><div class="account-stat-label">' + t('accounts.inflight') + '</div></div>' : '') +
                     '</div>' +
                     '</div>';
             }).join('');
@@ -3702,7 +3708,7 @@
             }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) {
-                stratEl.value = d.poolStrategy || 'swr';
+                stratEl.value = d.poolStrategy || 'least-request';
             }
         }
         async function saveEndpointConfig() {
@@ -4288,7 +4294,7 @@
                     'usageCurrent','usageLimit','usagePercent',
                     'trialUsageCurrent','trialUsageLimit','trialUsagePercent',
                     'requestCount','errorCount','totalTokens','totalCredits',
-                    'lastUsed','lastRefresh'];
+                    'lastUsed','lastRefresh','inflight','concurrencyLimit'];
                 for (const f of fields) {
                     if (s[f] !== undefined && a[f] !== s[f]) { a[f] = s[f]; changed = true; }
                 }

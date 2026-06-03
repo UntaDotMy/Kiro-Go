@@ -85,6 +85,28 @@ func (h *Handler) recordAttemptError(err error, accountID string) {
 // request into a pool-wide stampede.
 const maxFailoverAttempts = 3
 
+// saturationPollHint is the upper bound (inclusive) on a pool retryAfter that
+// the dispatcher treats as "busy, slot will free shortly" rather than "cooling,
+// come back later". It must be >= the pool's saturationPollInterval (100ms); a
+// retryAfter at or below this is polled within admissionWaitBudget, anything
+// larger is surfaced to the client immediately. Kept here (proxy package) to
+// avoid importing the pool's internal constant.
+const saturationPollHint = 250 * time.Millisecond
+
+// tokenRefreshFailure tags a pre-commit token-refresh error so the failover
+// dispatcher rotates to a peer account without classifying it as an upstream
+// (quota/5xx) error. It is never surfaced to the client.
+type tokenRefreshFailure struct{ err error }
+
+func (e tokenRefreshFailure) Error() string { return "token refresh failed: " + e.err.Error() }
+func (e tokenRefreshFailure) Unwrap() error { return e.err }
+
+// isTokenRefreshFailure reports whether err is the token-refresh sentinel.
+func isTokenRefreshFailure(err error) bool {
+	var t tokenRefreshFailure
+	return errors.As(err, &t)
+}
+
 // isRetryableUpstreamError reports whether a CallKiroAPI error is worth
 // retrying on a *different* account. Retryable: 429/quota throttles and
 // transient 5xx / connection errors — a peer account can likely serve the

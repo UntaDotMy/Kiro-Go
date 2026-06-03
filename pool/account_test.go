@@ -240,33 +240,36 @@ func TestRecordErrorHonorsRetryAfter(t *testing.T) {
 	p := newTestPool()
 	p.setAccounts([]config.Account{{ID: "a"}})
 
-	// Server says retry in 45 seconds. We should use exactly that (within ±1s).
+	// Server says retry in 45 seconds. We should use that (clamped), plus up to
+	// cooldownExpiryJitter of anti-stampede jitter added on top — so the window
+	// is [45s, 45s+jitter] with a ±1s slop for the time elapsed in the call.
 	p.RecordError("a", true, 45*time.Second)
 	d := p.CooldownRemaining("a")
-	if d < 44*time.Second || d > 46*time.Second {
-		t.Fatalf("expected ~45s cooldown, got %s", d)
+	if d < 44*time.Second || d > 45*time.Second+cooldownExpiryJitter+time.Second {
+		t.Fatalf("expected ~45s cooldown (+ up to %s jitter), got %s", cooldownExpiryJitter, d)
 	}
 
 	// Tiny Retry-After (1s) is now honored directly: dropping the 5s clamp
 	// floor is intentional. Upstream sometimes hints "retry in 1s" during
 	// light throttling and burning four extra seconds wasted free capacity.
 	// We still honor retryAfterAbsoluteMin (1s) so a misformed 0/negative
-	// header can't pin the account on a hot loop.
+	// header can't pin the account on a hot loop. Cooldown-expiry jitter (up to
+	// cooldownExpiryJitter) is added on top.
 	p2 := newTestPool()
 	p2.setAccounts([]config.Account{{ID: "b"}})
 	p2.RecordError("b", true, 1*time.Second)
 	d2 := p2.CooldownRemaining("b")
-	if d2 < retryAfterAbsoluteMin-time.Second || d2 > retryAfterAbsoluteMin+time.Second {
-		t.Fatalf("expected cooldown ~%s, got %s", retryAfterAbsoluteMin, d2)
+	if d2 < retryAfterAbsoluteMin-time.Second || d2 > retryAfterAbsoluteMin+cooldownExpiryJitter+time.Second {
+		t.Fatalf("expected cooldown ~%s (+ up to %s jitter), got %s", retryAfterAbsoluteMin, cooldownExpiryJitter, d2)
 	}
 
-	// Huge Retry-After should be clamped down to retryAfterMax.
+	// Huge Retry-After should be clamped down to retryAfterMax (+ jitter).
 	p3 := newTestPool()
 	p3.setAccounts([]config.Account{{ID: "c"}})
 	p3.RecordError("c", true, 24*time.Hour)
 	d3 := p3.CooldownRemaining("c")
-	if d3 > retryAfterMax+time.Second {
-		t.Fatalf("expected cooldown clamped to %s, got %s", retryAfterMax, d3)
+	if d3 > retryAfterMax+cooldownExpiryJitter+time.Second {
+		t.Fatalf("expected cooldown clamped to %s (+ up to %s jitter), got %s", retryAfterMax, cooldownExpiryJitter, d3)
 	}
 }
 
