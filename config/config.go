@@ -250,6 +250,10 @@ type Config struct {
 
 	// FilterEnvNoise strips environment metadata lines from system prompts:
 	// git status, recent commits, environment sections, fast_mode_info tags, etc.
+	// It also drops whole <system-reminder>...</system-reminder> blocks. Because
+	// Claude Code delivers CLAUDE.md / AGENTS.md content inside <system-reminder>
+	// blocks, this defaults OFF (since 1.0.10-A11) so project memory files reach
+	// the model; enabling it trades that context for fewer tokens per request.
 	FilterEnvNoise bool `json:"filterEnvNoise,omitempty"`
 
 	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
@@ -309,7 +313,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A10"
+const Version = "1.0.10-A11"
 
 var (
 	cfg     *Config
@@ -394,7 +398,7 @@ func Load() error {
 				}},
 				Accounts:              []Account{},
 				FilterClaudeCode:      true,
-				FilterEnvNoise:        true,
+				FilterEnvNoise:        false,
 				FilterStripBoundaries: true,
 				FilterDefaultsApplied: true,
 			}
@@ -499,19 +503,23 @@ func writeConfigBytes(data []byte) error {
 	return os.Rename(tmpPath, cfgPath)
 }
 
-// migrateFilterDefaults sets the three prompt-filter flags ON for any
+// migrateFilterDefaults applies the default prompt-filter flags for any
 // pre-existing config that was loaded before the FilterDefaultsApplied
-// migration marker existed. Caller must hold cfgLock for write — Load()
-// satisfies that. The migration runs at most once per install: once
-// FilterDefaultsApplied is true (either from this migration or from the
-// fresh-install bootstrap), we never re-apply, so explicit operator
-// "off" toggles are preserved.
+// migration marker existed: FilterClaudeCode and FilterStripBoundaries ON,
+// FilterEnvNoise OFF. FilterEnvNoise defaults OFF because it strips whole
+// <system-reminder> blocks, and Claude Code delivers CLAUDE.md / AGENTS.md
+// inside those blocks — leaving it on would silently drop the user's project
+// memory files before they reach the model. Caller must hold cfgLock for
+// write — Load() satisfies that. The migration runs at most once per install:
+// once FilterDefaultsApplied is true (either from this migration or from the
+// fresh-install bootstrap), we never re-apply, so explicit operator toggles
+// are preserved.
 func migrateFilterDefaults() {
 	if cfg == nil || cfg.FilterDefaultsApplied {
 		return
 	}
 	cfg.FilterClaudeCode = true
-	cfg.FilterEnvNoise = true
+	cfg.FilterEnvNoise = false
 	cfg.FilterStripBoundaries = true
 	cfg.FilterDefaultsApplied = true
 	// Persist immediately so a subsequent restart sees the marker even if
