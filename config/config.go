@@ -469,8 +469,12 @@ func Load() error {
 // truncated or empty.
 //
 // Save assumes the caller is already holding cfgLock (most callers are
-// inside a "Lock + mutate + Save" block). Use FlushStats / saveLocked when
-// you want a snapshot under your own lock discipline.
+// inside a "Lock + mutate + Save" block) — it does NOT take the lock itself.
+// FlushConfig is the public wrapper that acquires cfgLock and then calls Save,
+// for callers (e.g. the background refresh sweep) that mutated via the
+// *NoSave helpers and want a single batched persist afterwards. Use
+// FlushStats / saveLocked when you want a snapshot under your own lock
+// discipline.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -916,6 +920,31 @@ func applyAutoDisableTransition(a *Account, globalOverage bool) bool {
 func UpdateAccountInfo(id string, info AccountInfo) (bool, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	flipped, found := applyAccountInfoLocked(id, info)
+	if !found {
+		return false, nil
+	}
+	return flipped, Save()
+}
+
+// UpdateAccountInfoNoSave applies the same mutation as UpdateAccountInfo but
+// does NOT persist to disk — the caller is responsible for one batched
+// FlushConfig() afterward. This exists for the background refresh sweep, which
+// updates every account on each tick: the prior per-account Save() rewrote the
+// ENTIRE config.json (marshal + fsync + rename) under the write lock once per
+// account, so a 30-account pool did 30 full-file rewrites per 5-minute tick.
+// Batching collapses that to a single write. Returns (flipped, found).
+func UpdateAccountInfoNoSave(id string, info AccountInfo) (bool, bool) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	return applyAccountInfoLocked(id, info)
+}
+
+// applyAccountInfoLocked mutates the matching account's subscription/usage
+// fields and applies the auto-disable transition. Caller MUST hold cfgLock.
+// Returns (flipped, found): flipped is true when Enabled changed (caller should
+// Reload the pool), found is true when an account with the id existed.
+func applyAccountInfoLocked(id string, info AccountInfo) (flipped bool, found bool) {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			if info.Email != "" {
@@ -937,11 +966,19 @@ func UpdateAccountInfo(id string, info AccountInfo) (bool, error) {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			flipped := applyAutoDisableTransition(&cfg.Accounts[i], cfg.AllowOverUsage)
-			return flipped, Save()
+			flipped = applyAutoDisableTransition(&cfg.Accounts[i], cfg.AllowOverUsage)
+			return flipped, true
 		}
 	}
-	return false, nil
+	return false, false
+}
+
+// FlushConfig persists the current config to disk. Used after a batch of
+// UpdateAccountInfoNoSave calls to write once instead of per-account.
+func FlushConfig() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	return Save()
 }
 
 // GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.

@@ -79,6 +79,17 @@ func (h *dashboardHub) remove(s *dashboardSubscriber) {
 	h.mu.Unlock()
 }
 
+// hasSubscribers reports whether any dashboard client is currently connected.
+// Used by broadcastDashboardUpdate to skip building an (expensive) snapshot —
+// full pool copy, config copy, N per-account locks, and a JSON marshal — on the
+// request hot path when nobody is listening, which is the common case in
+// production where the admin dashboard is usually closed.
+func (h *dashboardHub) hasSubscribers() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.subscribers) > 0
+}
+
 // broadcast sends payload to every active subscriber. Drops the message
 // for any subscriber whose buffer is full — clients are responsible for
 // keeping up; the snapshot model means a missed message is harmless.
@@ -310,6 +321,13 @@ func (h *Handler) dashboardSnapshot() []byte {
 // function publishes whatever the current state is.
 func (h *Handler) broadcastDashboardUpdate() {
 	if h.dashboardHub == nil {
+		return
+	}
+	// Fast path: when no dashboard is connected (the common production case),
+	// skip building the snapshot entirely. dashboardSnapshot copies the whole
+	// pool + config, takes a per-account lock for each, and JSON-marshals the
+	// result — pure waste on every successful request if nobody is listening.
+	if !h.dashboardHub.hasSubscribers() {
 		return
 	}
 	if snapshot := h.dashboardSnapshot(); snapshot != nil {

@@ -81,7 +81,13 @@ type Handler struct {
 	// off their own N-account fan-out.
 	modelsRefreshing atomic.Bool
 	promptCache      *promptCacheTracker
-	tokenRefreshMu   sync.Mutex
+	// tokenRefreshLocks holds one mutex per account id so a slow synchronous
+	// token refresh on one account no longer serializes the refresh-check path
+	// for every other account (the prior single Handler-wide mutex did). The
+	// fast path in ensureValidToken stays lock-free; only the rare near-expiry
+	// refresh acquires the per-account lock. Keyed by account id, created on
+	// demand via sync.Map.
+	tokenRefreshLocks sync.Map // accountID -> *sync.Mutex
 	// Per-account debounce for lazy quota refresh after a request completes.
 	refreshDebounceMu sync.Mutex
 	refreshScheduled  map[string]bool
@@ -474,6 +480,11 @@ func (h *Handler) refreshAllAccounts() {
 
 	sem := make(chan struct{}, refreshFanoutConcurrency)
 	var wg sync.WaitGroup
+	// anyFlipped records whether any account's Enabled state changed during the
+	// sweep (auto-disable / auto-recover). Set from worker goroutines, so it must
+	// be atomic. We Reload the pool unconditionally below, but keep the signal for
+	// future use / clarity.
+	var anyFlipped atomic.Bool
 	for i := range accounts {
 		account := &accounts[i]
 		if !account.Enabled || account.AccessToken == "" {
@@ -521,11 +532,22 @@ func (h *Handler) refreshAllAccounts() {
 				return
 			}
 
-			config.UpdateAccountInfo(account.ID, *info)
+			// Apply in memory WITHOUT a per-account disk write; the whole sweep
+			// is flushed once after the WaitGroup below. The prior per-account
+			// config.UpdateAccountInfo rewrote the entire config.json (marshal +
+			// fsync + rename) under the write lock once per account per tick.
+			flipped, _ := config.UpdateAccountInfoNoSave(account.ID, *info)
+			if flipped {
+				anyFlipped.Store(true)
+			}
 			logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
 		}(account)
 	}
 	wg.Wait()
+	// Single batched persist for the whole sweep instead of one write per account.
+	if err := config.FlushConfig(); err != nil {
+		logger.Warnf("[BackgroundRefresh] Failed to persist refreshed account info: %v", err)
+	}
 	h.pool.Reload()
 }
 
@@ -718,11 +740,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-ID", reqID)
 	w.Header().Set("Request-Id", reqID)
 
-	// CORS - 完整的头部支持
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
-	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
+	// CORS — scoped per path. The inference API keeps the wildcard SDK callers
+	// need; admin/portal/landing/health are same-origin only (no wildcard).
+	// See proxy/security.go.
+	setCORSHeaders(w, r)
+
+	// Security response headers. HTML UI surfaces (landing/admin/portal) get the
+	// full hardening set (CSP, X-Frame-Options, ...); JSON surfaces get the cheap
+	// always-safe subset. HSTS only on TLS / trusted-proxy https.
+	setSecurityHeaders(w, r, isHTMLSurfacePath(path))
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
@@ -789,6 +815,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleModels(w, r)
+	case path == "/v1/key-status" || path == "/portal/api/key-status":
+		// Public customer portal endpoint: authenticated by the presented key
+		// itself, its own per-IP rate limit, no oracle, never leaks the raw key.
+		// See proxy/portal_handler.go.
+		h.handlePortalKeyStatus(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -809,8 +840,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/admin/"):
 		h.serveStaticFile(w, r)
 
-	// 健康检查
-	case path == "/health" || path == "/":
+	// 客户门户（公开只读）
+	case path == "/portal" || path == "/portal/":
+		h.servePortalPage(w, r)
+	case strings.HasPrefix(path, "/portal/"):
+		h.serveJailedStaticFile(w, r, "/portal/")
+
+	// 落地页
+	case path == "/":
+		h.serveLandingPage(w, r)
+
+	// 健康检查（最小化输出，不泄露版本/uptime 指纹）
+	case path == "/health":
 		h.handleHealth(w, r)
 
 	// 统计端点（需要 API Key 鉴权）
@@ -831,13 +872,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleHealth 健康检查（不暴露统计数据）
+// handleHealth 健康检查（不暴露版本/uptime 指纹，仅返回存活状态）。
+// 版本与运行时长改由鉴权后的 /admin/api/status 提供，避免未鉴权指纹采集。
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
-		"version": config.Version,
-		"uptime":  time.Now().Unix() - h.startTime,
+		"status": "ok",
 	})
 }
 
@@ -2893,8 +2933,14 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 		return nil
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+	// Per-account lock: only concurrent refreshes of the SAME account serialize;
+	// different accounts refresh in parallel. The prior single Handler-wide mutex
+	// meant one slow auth.RefreshToken blocked the refresh-check for every other
+	// account on the pool.
+	muAny, _ := h.tokenRefreshLocks.LoadOrStore(account.ID, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Another concurrent request may have refreshed this account while we waited.
 	if latest := h.pool.GetByID(account.ID); latest != nil {
@@ -4408,9 +4454,21 @@ func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "web/index.html")
 }
 
+// serveLandingPage serves the public marketing landing page at "/".
+func (h *Handler) serveLandingPage(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "web/landing.html")
+}
+
+// servePortalPage serves the public customer key-status portal at "/portal".
+func (h *Handler) servePortalPage(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "web/portal.html")
+}
+
+// serveStaticFile serves admin assets from web/, jailed to the web/ directory.
+// http.ServeFile already rejects ".." request paths with 400; serveJailedStaticFile
+// adds a resolved-path containment check as defense-in-depth.
 func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/")
-	http.ServeFile(w, r, "web/"+path)
+	h.serveJailedStaticFile(w, r, "/admin/")
 }
 
 // apiGetThinkingConfig 获取 thinking 配置
