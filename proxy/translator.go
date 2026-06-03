@@ -238,6 +238,33 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+
+	// OutputConfig carries Anthropic's native, graded reasoning-effort knob
+	// ("output_config": {"effort": "low|medium|high|xhigh|max"}). It is a
+	// top-level GA field on the Messages API (NOT nested under thinking), and is
+	// what Claude Code's CLAUDE_CODE_EFFORT_LEVEL maps onto 1:1 (auto omits it).
+	// We read effort from here and forward it natively to the Kiro upstream when
+	// the resolved model advertises support — the same output_config.effort path
+	// used for the OpenAI reasoning_effort knob. A nil pointer / empty effort
+	// means "unset", leaving the model's default and the thinking decision
+	// unchanged. See reasoning_effort.go.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+}
+
+// ClaudeOutputConfig is the Anthropic Messages output_config object. Only the
+// effort field is meaningful to the proxy today; other keys are ignored.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
+// claudeRequestEffort returns the raw reasoning-effort string carried by an
+// Anthropic Messages request's output_config, or "" when absent. Centralized so
+// the handler and the agentic loops read it the same way.
+func claudeRequestEffort(req *ClaudeRequest) string {
+	if req == nil || req.OutputConfig == nil {
+		return ""
+	}
+	return strings.TrimSpace(req.OutputConfig.Effort)
 }
 
 type ClaudeThinkingConfig struct {
@@ -281,6 +308,13 @@ type ClaudeTool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
+
+	// DeferLoading is the Anthropic Tool Search marker. When true, the client is
+	// asking that this tool's schema be withheld from the model's context until
+	// the model discovers it via a tool_search call. CodeWhisperer has no such
+	// concept, so the tool-search emulation (tool_search.go) reads this flag to
+	// decide which tools to withhold from the upstream payload and search over.
+	DeferLoading bool `json:"defer_loading,omitempty"`
 }
 
 type ClaudeResponse struct {

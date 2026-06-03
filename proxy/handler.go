@@ -1631,6 +1631,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 解析模型和 thinking 模式
 	_, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 
+	// Fold Anthropic's native reasoning-effort knob (output_config.effort, which
+	// is what Claude Code's CLAUDE_CODE_EFFORT_LEVEL maps onto) into the thinking
+	// decision, mirroring the OpenAI path: an explicit "minimal" turns reasoning
+	// off, low/medium/high/xhigh/max turn it on, and an unset value leaves the
+	// suffix/thinking-config decision untouched. The graded level is forwarded
+	// natively below (and inside the agentic loops via ClaudeToKiro) for models
+	// that advertise output_config.effort support.
+	claudeEffort := claudeRequestEffort(&req)
+	thinking = resolveThinkingWithEffort(thinking, claudeEffort)
+
 	matchedKeyID := ""
 	if k := matchedAPIKey(r); k != nil {
 		matchedKeyID = k.ID
@@ -1647,6 +1657,19 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// Tool-search agentic loop: only when the feature is enabled AND the request
+	// carries a tool_search server tool together with at least one deferred
+	// (defer_loading) tool. This withholds the deferred tool schemas from the
+	// upstream model, runs the regex/BM25 match proxy-side, and answers with
+	// native tool_search_tool_result blocks. A tool_search tool with no deferred
+	// tools is inert and falls through to the normal path below.
+	if config.GetToolSearchEnabled() {
+		if requestHasToolSearch(req.Tools) {
+			h.handleClaudeToolSearch(w, &req, req.Model, matchedKeyID, thinking)
+			return
+		}
+	}
+
 	// mapping happens inside ClaudeToKiro; keep req.Model as the original id
 	// (e.g. "claude-opus-4-7" or a dated alias the client still has cached)
 	// so the response echoes the exact id the client sent.
@@ -1657,6 +1680,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 转换请求（与账号无关，可在多账号故障转移之间复用）
 	kiroPayload := ClaudeToKiro(&req, thinking)
+
+	// Forward graded reasoning effort natively when the resolved model supports
+	// it (output_config.effort), clamped to the model's advertised levels. No-op
+	// for models without effort support or an unset/"minimal" request, where the
+	// thinking on/off decision above already applied. Sets payload.ResolvedEffort
+	// so the per-effort success analytics on this path are populated.
+	h.applyReasoningEffort(kiroPayload, claudeEffort)
 
 	// matchedKeyID was resolved above (before the web-search branch) and is
 	// reused here for the per-key success debit on the normal path.
@@ -3834,6 +3864,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"host":                     config.GetHost(),
 		"allowOverUsage":           config.GetAllowOverUsage(),
 		"webSearchEnabled":         config.GetWebSearchEnabled(),
+		"toolSearchEnabled":        config.GetToolSearchEnabled(),
 		"globalRateLimitPerMinute": config.GetGlobalRateLimitPerMinute(),
 	})
 }
@@ -3976,6 +4007,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		CurrentPassword          *string `json:"currentPassword,omitempty"`
 		AllowOverUsage           *bool   `json:"allowOverUsage,omitempty"`
 		WebSearchEnabled         *bool   `json:"webSearchEnabled,omitempty"`
+		ToolSearchEnabled        *bool   `json:"toolSearchEnabled,omitempty"`
 		GlobalRateLimitPerMinute *int    `json:"globalRateLimitPerMinute,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4013,6 +4045,16 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Web-search emulation toggle (opt-in; default off).
 	if req.WebSearchEnabled != nil {
 		if err := config.UpdateWebSearchEnabled(*req.WebSearchEnabled); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// Tool-search emulation toggle (default on; inert unless a request carries a
+	// tool_search tool with deferred tools).
+	if req.ToolSearchEnabled != nil {
+		if err := config.UpdateToolSearchEnabled(*req.ToolSearchEnabled); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
