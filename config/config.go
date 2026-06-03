@@ -212,6 +212,21 @@ type Config struct {
 	// failed call falls back to dropping the tool so a request never breaks.
 	WebSearchEnabled *bool `json:"webSearchEnabled,omitempty"`
 
+	// ToolSearchEnabled turns on proxy-side emulation of Anthropic's Tool Search
+	// feature (the tool_search_tool_regex / tool_search_tool_bm25 server tools).
+	// When a client (e.g. Claude Code with ENABLE_TOOL_SEARCH) sends most of its
+	// tools marked defer_loading:true plus a tool_search server tool, the proxy
+	// withholds the deferred tool schemas from the upstream model, exposes a
+	// single synthetic search tool, runs the regex/BM25 search itself over the
+	// deferred tool descriptions, and expands only the matched tools — reshaping
+	// the result into native server_tool_use + tool_search_tool_result blocks.
+	// This keeps both the client context AND the upstream CodeWhisperer context
+	// small. ON by default like WebSearchEnabled, but completely inert unless a
+	// request actually carries a tool_search tool with deferred tools (which only
+	// happens when the client opts in), so the default is safe. A nil pointer
+	// means "use the default (on)"; set it explicitly to false to opt out.
+	ToolSearchEnabled *bool `json:"toolSearchEnabled,omitempty"`
+
 	// GlobalRateLimitPerMinute caps the proxy's TOTAL inbound request rate
 	// across all API keys (token-bucket). 0 = disabled (default), which leaves
 	// behavior unchanged — only the existing per-key limits and per-account
@@ -1284,6 +1299,29 @@ func UpdateWebSearchEnabled(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.WebSearchEnabled = &enabled
+	return Save()
+}
+
+// GetToolSearchEnabled reports whether proxy-side tool-search emulation is on.
+// Default TRUE, mirroring GetWebSearchEnabled: a nil pointer (fresh install or
+// a config predating this field) means "use the default", which is on. The
+// feature stays inert unless an inbound request actually carries a tool_search
+// server tool with deferred tools, so defaulting on costs nothing for clients
+// that never opt in. Only an explicit false hard-disables it.
+func GetToolSearchEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ToolSearchEnabled == nil {
+		return true
+	}
+	return *cfg.ToolSearchEnabled
+}
+
+// UpdateToolSearchEnabled persists the tool-search emulation toggle.
+func UpdateToolSearchEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ToolSearchEnabled = &enabled
 	return Save()
 }
 

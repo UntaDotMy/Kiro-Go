@@ -154,6 +154,10 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 		roundReq := *req
 		roundReq.Messages = messages
 		payload := ClaudeToKiro(&roundReq, thinking)
+		// Forward native reasoning effort (output_config.effort) per round, the
+		// same as the non-web-search Claude path, so an effort level set by the
+		// client isn't silently dropped on web-search requests.
+		h.applyReasoningEffort(payload, claudeRequestEffort(req))
 
 		res, err := h.runKiroCollect(model, apiKeyID, payload)
 		if err != nil {

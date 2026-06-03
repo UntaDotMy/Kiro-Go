@@ -9,8 +9,15 @@ import "strings"
 // three different ways:
 //   - OpenAI Chat Completions: `reasoning_effort` ("minimal"|"low"|"medium"|"high")
 //   - OpenAI Responses / Codex: `reasoning.effort` (same scale, also "max")
-//   - Anthropic Messages:       no native effort field; effort is expressed via
-//                               thinking.type (enabled/adaptive/disabled)
+//   - Anthropic Messages:       `output_config.effort` — a native, GA top-level
+//                               field (low|medium|high|xhigh|max) that Claude
+//                               Code's CLAUDE_CODE_EFFORT_LEVEL maps onto 1:1
+//                               ("auto" omits it). We read it via
+//                               claudeRequestEffort and forward it the same way
+//                               as the OpenAI knobs. (Thinking on/off is still
+//                               derived from thinking.type and the -thinking
+//                               suffix, and an explicit "minimal" effort folds
+//                               into that decision — see resolveThinkingWithEffort.)
 //
 // HOW KIRO ACTUALLY ACCEPTS EFFORT (verified against kiro-cli 2.5.0):
 // The Kiro generateAssistantResponse backend DOES accept a graded effort value,
