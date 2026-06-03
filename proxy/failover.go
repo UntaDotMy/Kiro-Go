@@ -17,12 +17,49 @@ import (
 // failover, and the terminal "all accounts failed" error.
 type streamWorker func(account *config.Account) (committed bool, err error)
 
+// admissionWaitBudget bounds how long the dispatcher will wait for an in-flight
+// slot to free when every eligible account is at its AIMD concurrency limit
+// (least-request strategy). A short bounded wait absorbs the common case where a
+// slot frees in a few hundred ms under a burst, without turning the request into
+// an unbounded queue. Past the budget we shed with 429 + Retry-After so the
+// client backs off coherently. See AWS "Using load shedding to avoid overload".
+//
+// TODO(load-balancing) — remaining work before this is fully shippable, NOT yet
+// done in this commit (see PR description):
+//   1. TESTS: no dedicated unit tests yet for the new hot-path code —
+//      least-request weighted selection, AIMD grow/shrink (RecordSuccess/
+//      RecordError limit math), Acquire/Release in-flight accounting (incl. the
+//      leak-safety defer and decayCountersLocked preserving inflight),
+//      saturation -> admission-wait -> shed, and the tokenRefreshFailure
+//      rotation path. Add pool/account_test.go + proxy/failover_test.go cases
+//      and run `go test -race` (needs cgo / a C compiler; not available on the
+//      dev box — CI runs it on Linux).
+//   2. ADMIN UI: add "least-request" to the poolStrategy <select> in
+//      web/index.html (+ EN/ZH i18n) and show per-account inflight/limit on the
+//      dashboard. Backend GetPoolStrategy already accepts the value.
+//   3. VERSION: bump config.Version + version.json (A12) with a changelog entry.
+//   4. POOL-WIDE SHEDDING (optional next layer): the Google SRE adaptive-throttle
+//      reject probability p=max(0,(req-K*acc)/(req+1)) for when the WHOLE pool is
+//      saturated, so we shed locally before queueing. Per-account AIMD + bounded
+//      admission wait cover most of it; this is the belt-and-suspenders layer.
+//   5. LIVE VERIFICATION: confirm against the real account pool that the 429
+//      storm is gone under an ultracode parallel-agent burst.
+const admissionWaitBudget = 2 * time.Second
+
 // runWithFailover selects an eligible account for the model and invokes the
 // worker, rotating to a different account when the worker reports a
 // retryable pre-commit failure. This converts a single unlucky pick onto a
 // just-throttled account from a client-visible 5xx into a transparent retry
 // while healthy peers exist (the #1 reliability gap surfaced by the pool
 // audit).
+//
+// Concurrency control: account selection goes through the pool's RESERVING
+// picker (AcquireForModelExcluding). Under the least-request strategy this
+// reserves an in-flight slot on the chosen account and skips accounts already at
+// their AIMD concurrency limit; the reserved slot is always released via a defer
+// before the function returns (whether the attempt commits, fails over, or the
+// worker panics). Under the other strategies the picker reserves nothing and
+// Release is a no-op, so behavior is unchanged.
 //
 // model + apiKeyID are used to record exactly ONE global failed-request
 // counter bump on the terminal path (when every attempt failed), so a
@@ -31,9 +68,10 @@ type streamWorker func(account *config.Account) (committed bool, err error)
 // overage bookkeeping is the worker's job (recordAttemptError).
 //
 // Contract:
-//   - selectErr handles the "no account at all / all cooling" case BEFORE the
-//     first attempt — it's returned to the caller's protocol-specific error
-//     path, with retryAfter set when the pool is merely cooling.
+//   - selectErr handles the "no account at all / all cooling / all saturated"
+//     case BEFORE the first attempt — it's returned to the caller's
+//     protocol-specific error path, with retryAfter set when the pool is merely
+//     cooling or saturated.
 //   - Once the worker commits (writes to the client), its result is final;
 //     no failover happens after the first byte (we can't un-send SSE frames).
 //   - ensureValidToken failures are treated as retryable pre-commit errors:
@@ -59,44 +97,45 @@ func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamW
 	}
 
 	for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
-		account, poolRetryAfter, ok := h.pool.GetNextForModelExcluding(model, tried)
+		account, poolRetryAfter, ok := h.acquireWithAdmissionWait(model, tried)
 		if !ok {
-			// No (more) eligible accounts. If the pool is merely cooling,
-			// surface the soonest recovery hint; otherwise it's a hard
-			// "no accounts" condition.
+			// No (more) eligible accounts. If the pool is merely cooling or
+			// saturated, surface the soonest recovery hint; otherwise it's a
+			// hard "no accounts" condition.
 			if poolRetryAfter > 0 {
 				recordTerminal()
 				return false, poolRetryAfter, lastErr
 			}
-			// If we already tried at least one account, return its error so
-			// the caller's envelope is informative; else signal empty pool.
 			recordTerminal()
 			return false, lastRetryAfter, lastErr
 		}
 		tried[account.ID] = true
 
-		// Token refresh is a pre-commit step; a failure here is retryable on
-		// a peer account (its token may be valid).
-		if tokErr := h.ensureValidToken(account); tokErr != nil {
-			lastErr = tokErr
-			logger.Warnf("[Failover] Token refresh failed for %s (attempt %d/%d): %v",
-				redactForLog(account.Email), attempt+1, maxFailoverAttempts, tokErr)
-			continue
-		}
+		// A slot may have been reserved on this account (least-request strategy);
+		// release it exactly once when this attempt is done, regardless of how
+		// the iteration exits. Release is a no-op for non-reserving strategies
+		// and for an account that reserved nothing.
+		committedThisAttempt, workErr := h.runOneAttempt(account, worker, attempt)
+		h.pool.Release(account.ID)
 
-		didCommit, workErr := worker(account)
-		if didCommit {
+		if committedThisAttempt {
 			// Bytes are on the wire — the worker fully owns the outcome.
 			return true, 0, workErr
 		}
 		if workErr == nil {
-			// Worker chose not to commit but reported success (shouldn't
-			// normally happen); treat as done.
+			// Either a token-refresh failover signal (handled below) or a
+			// non-committing success. runOneAttempt returns a sentinel for the
+			// token case; a genuine nil here means done.
 			return false, 0, nil
 		}
 		lastErr = workErr
 		if ra := retryAfterFromErr(workErr); ra > 0 {
 			lastRetryAfter = ra
+		}
+		if isTokenRefreshFailure(workErr) {
+			// Token refresh is a pre-commit step; a peer account may have a
+			// valid token. Already logged in runOneAttempt; just rotate.
+			continue
 		}
 		if !isRetryableUpstreamError(workErr) {
 			// Terminal for this request (auth/payment/client-cancel). Don't
@@ -110,4 +149,46 @@ func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamW
 
 	recordTerminal()
 	return false, lastRetryAfter, lastErr
+}
+
+// acquireWithAdmissionWait wraps the pool's reserving picker with a bounded wait
+// for a free in-flight slot. When the picker reports saturation (every eligible
+// account at its AIMD limit, signalled by a small retryAfter with ok=false and
+// no account), it retries for up to admissionWaitBudget before giving up — a
+// slot frees as concurrent requests complete. A cooling-pool retryAfter (longer
+// than the saturation poll) is returned immediately, since waiting won't help on
+// that timescale.
+func (h *Handler) acquireWithAdmissionWait(model string, tried map[string]bool) (*config.Account, time.Duration, bool) {
+	deadline := time.Now().Add(admissionWaitBudget)
+	for {
+		account, retryAfter, ok := h.pool.AcquireForModelExcluding(model, tried)
+		if ok {
+			return account, 0, true
+		}
+		// Distinguish "busy, try again very soon" (saturation poll) from
+		// "cooling / empty" (return now). Saturation uses the small poll
+		// interval; anything larger is a real cooldown the wait can't beat.
+		if retryAfter <= 0 || retryAfter > saturationPollHint {
+			return nil, retryAfter, false
+		}
+		if time.Now().After(deadline) {
+			// Waited our budget and still no slot. Shed with the poll hint so
+			// the caller emits a short Retry-After.
+			return nil, retryAfter, false
+		}
+		time.Sleep(retryAfter)
+	}
+}
+
+// runOneAttempt performs token refresh + a single worker invocation for one
+// account. It returns (committed, err). A token-refresh failure is returned as a
+// retryable error tagged via tokenRefreshFailure so the dispatcher rotates
+// without treating it as an upstream error.
+func (h *Handler) runOneAttempt(account *config.Account, worker streamWorker, attempt int) (bool, error) {
+	if tokErr := h.ensureValidToken(account); tokErr != nil {
+		logger.Warnf("[Failover] Token refresh failed for %s (attempt %d/%d): %v",
+			redactForLog(account.Email), attempt+1, maxFailoverAttempts, tokErr)
+		return false, tokenRefreshFailure{tokErr}
+	}
+	return worker(account)
 }

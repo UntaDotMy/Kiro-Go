@@ -180,9 +180,19 @@ type Config struct {
 	// PoolStrategy chooses how the account pool picks the next account for a
 	// request. Recognized values:
 	//
-	//   "swr" / ""       — smooth weighted round-robin (default; existing
-	//                      behavior). Best for evenly weighted pools and
-	//                      operators who want predictable interleaving.
+	//   "least-request" / "" — least-outstanding-request (DEFAULT). Picks the
+	//                      eligible account with the fewest in-flight requests
+	//                      (Envoy's weighted form: score = weight/(inflight+1)),
+	//                      and applies an AIMD per-account concurrency limit that
+	//                      grows on success and halves on a 429. Best for bursty
+	//                      parallel load (agent fan-out) against per-identity
+	//                      rate limits — it prevents the whole pool throttling at
+	//                      once. This is the only strategy that reserves in-flight
+	//                      slots and gates admission.
+	//   "swr"            — smooth weighted round-robin (previous default).
+	//                      Balances assignment rate with predictable interleaving
+	//                      but is blind to concurrency, so a simultaneous burst
+	//                      can throttle every account at once. No in-flight gate.
 	//   "least-used"     — pick the eligible account with the lowest
 	//                      RequestCount (lifetime) so traffic naturally
 	//                      tilts toward fresher / less-burned accounts.
@@ -191,8 +201,9 @@ type Config struct {
 	//   "random"         — uniform random pick among eligible accounts.
 	//                      Cheap, jitter-friendly, useful as a control.
 	//
-	// All strategies obey cooldowns and model-list filters identically;
-	// only the picker among the eligible subset differs.
+	// All strategies obey cooldowns and model-list filters identically; only the
+	// picker among the eligible subset (and whether the AIMD gate applies)
+	// differs.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
@@ -1260,8 +1271,14 @@ func isValidAWSRegionShape(s string) bool {
 	return true
 }
 
-// GetPoolStrategy returns the configured pool selection strategy. Empty /
-// unrecognized values map to "swr". See cfg.PoolStrategy for the full menu.
+// GetPoolStrategy returns the configured pool selection strategy. An empty or
+// unrecognized PoolStrategy maps to "least-request" (the production default).
+//
+// The cfg==nil case returns "swr" instead: cfg is only nil before Init() (i.e.
+// in unit tests that construct a pool directly without loading config), and the
+// pool's SWRR/eligibility tests rely on that non-reserving fallback. In
+// production Init() always runs first, so a real install with an empty
+// PoolStrategy gets least-request.
 func GetPoolStrategy() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1269,12 +1286,16 @@ func GetPoolStrategy() string {
 		return "swr"
 	}
 	switch strings.ToLower(strings.TrimSpace(cfg.PoolStrategy)) {
+	case "swr", "swrr":
+		return "swr"
 	case "least-used", "leastused", "least_used":
 		return "least-used"
 	case "random":
 		return "random"
+	case "least-request", "least-conn", "leastrequest", "least_request", "lor":
+		return "least-request"
 	default:
-		return "swr"
+		return "least-request"
 	}
 }
 
