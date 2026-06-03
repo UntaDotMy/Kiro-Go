@@ -116,10 +116,19 @@ func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamW
 
 		// A slot may have been reserved on this account (least-request strategy);
 		// release it exactly once when this attempt is done, regardless of how
-		// the iteration exits. Release is a no-op for non-reserving strategies
-		// and for an account that reserved nothing.
-		committedThisAttempt, workErr := h.runOneAttempt(account, worker, attempt)
-		h.pool.Release(account.ID)
+		// the iteration exits — including a worker panic. The defer inside this
+		// closure is what guarantees that: a bare sequential Release (the prior
+		// form) was skipped when the worker panicked, permanently leaking the
+		// reserved in-flight slot and slowly shrinking the account out of the
+		// least-request rotation (decayCountersLocked preserves entries while
+		// inflight>0). The panic still propagates to net/http's per-request
+		// recover; we only ensure the slot is freed on the way out. Release is a
+		// no-op for non-reserving strategies and for an account that reserved
+		// nothing.
+		committedThisAttempt, workErr := func() (bool, error) {
+			defer h.pool.Release(account.ID)
+			return h.runOneAttempt(account, worker, attempt)
+		}()
 
 		if committedThisAttempt {
 			// Bytes are on the wire — the worker fully owns the outcome.

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
+	"time"
 )
 
 // apiRevealAPIKey returns the full secret for one key. The list endpoint
@@ -143,13 +145,36 @@ func (h *Handler) apiDeleteAPIKey(w http.ResponseWriter, r *http.Request, id str
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+// modelStatsCache memoizes the (expensive) ByModel + ByModelEffort full-history
+// aggregations for a short window. The admin Overview loads it on login and the
+// Analytics tab re-fetches it on every switch, so without a cache each visit ran
+// two GROUP-BY scans of the whole stats history. A few-second TTL keeps the
+// numbers effectively live while collapsing bursts (overview + analytics in the
+// same session) onto a single pair of queries.
+var (
+	modelStatsCacheMu  sync.Mutex
+	modelStatsCacheVal []byte
+	modelStatsCacheAt  time.Time
+)
+
+const modelStatsCacheTTL = 5 * time.Second
+
 // apiGetModelStats returns the persisted per-model totals (lifetime). Each
 // entry includes lastUsed so the dashboard can render "last seen" timestamps,
 // plus an "effort" breakdown: per reasoning-effort level (low/medium/high/
 // xhigh/max/default), the requests / tokens / credits driven at that level.
 // The per-effort entries sum to the model's own totals. Backed by the SQLite
-// stats table — survives restarts.
+// stats table — survives restarts. Result is cached for modelStatsCacheTTL.
 func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
+	modelStatsCacheMu.Lock()
+	if modelStatsCacheVal != nil && time.Since(modelStatsCacheAt) < modelStatsCacheTTL {
+		payload := modelStatsCacheVal
+		modelStatsCacheMu.Unlock()
+		w.Write(payload)
+		return
+	}
+	modelStatsCacheMu.Unlock()
+
 	byModel, _ := stats.ByModel()
 	byEffort, _ := stats.ByModelEffort()
 	out := make(map[string]map[string]interface{}, len(byModel))
@@ -175,7 +200,16 @@ func (h *Handler) apiGetModelStats(w http.ResponseWriter, r *http.Request) {
 		}
 		out[model] = entry
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
+	payload, err := json.Marshal(map[string]interface{}{"models": out})
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
+		return
+	}
+	modelStatsCacheMu.Lock()
+	modelStatsCacheVal = payload
+	modelStatsCacheAt = time.Now()
+	modelStatsCacheMu.Unlock()
+	w.Write(payload)
 }
 
 // apiGetAvailableModels returns the unfiltered model catalog the API key

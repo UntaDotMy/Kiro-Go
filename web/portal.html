@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Key portal — Kiro-Go</title>
+    <meta name="description" content="Check the live usage, limits, allowed models and expiry of your Kiro-Go API key.">
+    <style>
+        :root {
+            --bg:#ffffff; --surface:#ffffff; --surface-2:#f6f7f9; --surface-3:#eef0f3;
+            --border:#e8e9ed; --border-strong:#d6d8de;
+            --text:#16181d; --muted:#5b626d; --faint:#9aa0aa;
+            --accent:#4f46e5; --accent-hover:#4338ca; --accent-soft:#eef2ff; --accent-border:#c7d2fe;
+            --on-accent:#fff; --success:#15803d; --success-soft:#f0fdf4; --success-border:#bbf7d0;
+            --warning:#b45309; --warning-soft:#fffbeb; --warning-border:#fde68a;
+            --danger:#dc2626; --danger-soft:#fef2f2; --danger-border:#fecaca;
+            --shadow-1:0 1px 2px rgba(16,18,24,.05); --shadow-2:0 8px 28px rgba(16,18,24,.10);
+            --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+            --r-sm:8px; --r-md:12px; --r-lg:18px; color-scheme: light;
+        }
+        @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+            --bg:#0b0d11; --surface:#14171d; --surface-2:#1a1e25; --surface-3:#222732;
+            --border:#252a33; --border-strong:#363c47; --text:#e8eaed; --muted:#9aa1ac; --faint:#6b727d;
+            --accent:#6366f1; --accent-hover:#818cf8; --accent-soft:#1a1f2e; --accent-border:#34384d;
+            --success:#34d399; --success-soft:#102a1f; --success-border:#1e4937;
+            --warning:#fbbf24; --warning-soft:#2a2310; --warning-border:#4a3d18;
+            --danger:#f87171; --danger-soft:#2a1515; --danger-border:#4d2727;
+            --shadow-1:0 1px 2px rgba(0,0,0,.4); --shadow-2:0 10px 30px rgba(0,0,0,.5); color-scheme: dark;
+        }}
+        :root[data-theme="dark"]{
+            --bg:#0b0d11; --surface:#14171d; --surface-2:#1a1e25; --surface-3:#222732;
+            --border:#252a33; --border-strong:#363c47; --text:#e8eaed; --muted:#9aa1ac; --faint:#6b727d;
+            --accent:#6366f1; --accent-hover:#818cf8; --accent-soft:#1a1f2e; --accent-border:#34384d;
+            --success:#34d399; --success-soft:#102a1f; --success-border:#1e4937;
+            --warning:#fbbf24; --warning-soft:#2a2310; --warning-border:#4a3d18;
+            --danger:#f87171; --danger-soft:#2a1515; --danger-border:#4d2727;
+            --shadow-1:0 1px 2px rgba(0,0,0,.4); --shadow-2:0 10px 30px rgba(0,0,0,.5); color-scheme: dark;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+            background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.55;
+            -webkit-font-smoothing: antialiased;
+        }
+        .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+        a { color: var(--accent); text-decoration: none; }
+        .nav {
+            position: sticky; top: 0; z-index: 20; height: 60px; display: flex; align-items: center;
+            border-bottom: 1px solid var(--border);
+            background: color-mix(in srgb, var(--bg) 84%, transparent); backdrop-filter: saturate(160%) blur(12px);
+        }
+        .nav-inner { max-width: 760px; margin: 0 auto; width: 100%; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; }
+        .brand { display: flex; align-items: center; gap: 9px; font-weight: 680; font-size: 16px; letter-spacing: -.02em; }
+        .brand svg { width: 21px; height: 21px; color: var(--accent); }
+        .nav-right { display: flex; align-items: center; gap: 8px; }
+        .icon-btn { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border-radius: var(--r-sm); border: 1px solid var(--border-strong); background: var(--surface); color: var(--muted); cursor: pointer; }
+        .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+        .icon-btn svg { width: 16px; height: 16px; }
+        .link-btn { font-size: 14px; color: var(--muted); padding: 8px 12px; border-radius: var(--r-sm); }
+        .link-btn:hover { color: var(--text); background: var(--surface-2); }
+        .theme-toggle .moon { display: none; }
+        :root[data-theme="dark"] .theme-toggle .moon { display: block; }
+        :root[data-theme="dark"] .theme-toggle .sun { display: none; }
+        @media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .theme-toggle .moon{display:block}:root:not([data-theme="light"]) .theme-toggle .sun{display:none}}
+
+        .wrap { max-width: 760px; margin: 0 auto; padding: 44px 24px 80px; }
+        .head { text-align: center; margin-bottom: 30px; }
+        .head h1 { font-size: 30px; letter-spacing: -.03em; font-weight: 700; margin-bottom: 8px; }
+        .head p { color: var(--muted); font-size: 15px; }
+
+        .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-1); padding: 22px; }
+        .key-row { display: flex; gap: 10px; }
+        input[type=password], input[type=text] {
+            flex: 1; width: 100%; padding: 12px 14px; font-size: 15px; font-family: var(--mono);
+            border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--text);
+        }
+        input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+        .btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 12px 20px; border-radius: var(--r-sm); font-weight: 560; font-size: 14px; border: 1px solid transparent; cursor: pointer; font-family: inherit; white-space: nowrap; }
+        .btn-primary { background: var(--accent); color: var(--on-accent); }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-primary:disabled { opacity: .6; cursor: not-allowed; }
+        .hint { font-size: 12.5px; color: var(--faint); margin-top: 10px; }
+
+        .msg { margin-top: 16px; padding: 14px 16px; border-radius: var(--r-sm); font-size: 14px; border: 1px solid transparent; display: none; }
+        .msg.show { display: block; }
+        .msg-err { background: var(--danger-soft); color: var(--danger); border-color: var(--danger-border); }
+
+        .result { margin-top: 22px; display: none; }
+        .result.show { display: block; }
+        .status-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+        .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 560; border: 1px solid transparent; }
+        .badge-ok { background: var(--success-soft); color: var(--success); border-color: var(--success-border); }
+        .badge-warn { background: var(--warning-soft); color: var(--warning); border-color: var(--warning-border); }
+        .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+        .quota { display: grid; gap: 16px; }
+        .quota-group { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: 16px; }
+        .quota-group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 620; margin-bottom: 14px; }
+        .meter { margin-bottom: 14px; }
+        .meter:last-child { margin-bottom: 0; }
+        .meter-top { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
+        .meter-top .lbl { color: var(--muted); }
+        .meter-top .val { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+        .bar { height: 7px; background: var(--surface-3); border-radius: 999px; overflow: hidden; }
+        .fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width .4s ease; }
+        .fill.high { background: var(--warning); } .fill.crit { background: var(--danger); }
+
+        .meta-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 16px; }
+        .meta { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 12px 14px; }
+        .meta .k { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+        .meta .v { font-size: 14px; font-weight: 540; word-break: break-word; }
+        .models { display: flex; flex-wrap: wrap; gap: 6px; }
+        .chip { font-family: var(--mono); font-size: 12px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); padding: 3px 9px; border-radius: 6px; }
+        @media (max-width: 560px){ .meta-grid { grid-template-columns: 1fr; } .key-row { flex-direction: column; } }
+    </style>
+</head>
+
+<body>
+    <nav class="nav">
+        <div class="nav-inner">
+            <a class="brand" href="/">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                Kiro-Go
+            </a>
+            <div class="nav-right">
+                <a class="link-btn" href="/">Home</a>
+                <button class="icon-btn theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme" title="Toggle theme">
+                    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/></svg>
+                    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="wrap">
+        <div class="head">
+            <h1>Check your API key</h1>
+            <p>Paste the key you were given to see its live usage, limits, allowed models, and expiry. Your key is sent over TLS and never stored by this page.</p>
+        </div>
+
+        <div class="panel">
+            <form id="keyForm" onsubmit="return checkKey(event)">
+                <div class="key-row">
+                    <input type="password" id="keyInput" placeholder="sk-kg-..." autocomplete="off" spellcheck="false" aria-label="API key">
+                    <button class="btn btn-primary" id="checkBtn" type="submit">Check key</button>
+                </div>
+                <label class="hint" style="display:flex;align-items:center;gap:7px;margin-top:12px;cursor:pointer">
+                    <input type="checkbox" id="showKey" onchange="toggleReveal()"> Show key
+                </label>
+            </form>
+            <div id="msg" class="msg msg-err"></div>
+
+            <div id="result" class="result">
+                <div class="status-head">
+                    <span id="statusBadge" class="badge badge-ok"><span class="dot"></span> Active</span>
+                    <button class="link-btn" onclick="recheck()" style="border:1px solid var(--border-strong)">Refresh</button>
+                </div>
+                <div class="quota">
+                    <div class="quota-group">
+                        <h3 id="periodTitle">This period</h3>
+                        <div id="periodMeters"></div>
+                    </div>
+                    <div class="quota-group">
+                        <h3>Lifetime</h3>
+                        <div id="lifetimeMeters"></div>
+                    </div>
+                </div>
+                <div class="meta-grid">
+                    <div class="meta"><div class="k">Resets</div><div class="v" id="mResets">—</div></div>
+                    <div class="meta"><div class="k">Next reset</div><div class="v num" id="mNextReset">—</div></div>
+                    <div class="meta"><div class="k">Expires</div><div class="v num" id="mExpires">—</div></div>
+                    <div class="meta"><div class="k">Burst limits</div><div class="v num" id="mBurst">—</div></div>
+                </div>
+                <div class="meta" style="margin-top:12px">
+                    <div class="k">Allowed models</div>
+                    <div class="v"><div class="models" id="mModels"></div></div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        function applyStoredTheme() {
+            const s = localStorage.getItem('kiro_theme');
+            if (s === 'light' || s === 'dark') document.documentElement.setAttribute('data-theme', s);
+            else document.documentElement.removeAttribute('data-theme');
+        }
+        function effectiveTheme() {
+            const a = document.documentElement.getAttribute('data-theme');
+            return a || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        }
+        function toggleTheme() {
+            const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+            localStorage.setItem('kiro_theme', next);
+            document.documentElement.setAttribute('data-theme', next);
+        }
+        applyStoredTheme();
+
+        function toggleReveal() {
+            const i = document.getElementById('keyInput');
+            i.type = document.getElementById('showKey').checked ? 'text' : 'password';
+        }
+        function fmtNum(n) {
+            n = Number(n) || 0;
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return String(n);
+        }
+        function fmtDate(unix) {
+            if (!unix) return '—';
+            try { return new Date(unix * 1000).toLocaleString(); } catch (e) { return '—'; }
+        }
+        function meter(label, used, limit, opts) {
+            opts = opts || {};
+            const u = Number(used) || 0;
+            const lim = Number(limit) || 0;
+            const fmt = opts.fmt || fmtNum;
+            if (lim <= 0) {
+                return '<div class="meter"><div class="meter-top"><span class="lbl">' + label + '</span>' +
+                    '<span class="val">' + fmt(u) + ' / ∞</span></div>' +
+                    '<div class="bar"><div class="fill" style="width:0%"></div></div></div>';
+            }
+            const pct = Math.min(100, (u / lim) * 100);
+            const cls = pct > 90 ? 'crit' : pct > 70 ? 'high' : '';
+            return '<div class="meter"><div class="meter-top"><span class="lbl">' + label + '</span>' +
+                '<span class="val">' + fmt(u) + ' / ' + fmt(lim) + ' · ' + pct.toFixed(0) + '%</span></div>' +
+                '<div class="bar"><div class="fill ' + cls + '" style="width:' + pct + '%"></div></div></div>';
+        }
+        function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+        function showError(text) {
+            const m = document.getElementById('msg');
+            m.textContent = text; m.classList.add('show');
+            document.getElementById('result').classList.remove('show');
+        }
+        function clearError() { document.getElementById('msg').classList.remove('show'); }
+
+        let lastKey = '';
+        function recheck() { if (lastKey) doCheck(lastKey); }
+        function checkKey(ev) {
+            ev.preventDefault();
+            const key = document.getElementById('keyInput').value.trim();
+            if (!key) { showError('Enter your API key.'); return false; }
+            doCheck(key);
+            return false;
+        }
+        async function doCheck(key) {
+            lastKey = key;
+            clearError();
+            const btn = document.getElementById('checkBtn');
+            btn.disabled = true; btn.textContent = 'Checking…';
+            try {
+                const res = await fetch('/v1/key-status', { headers: { 'Authorization': 'Bearer ' + key } });
+                if (res.status === 429) { showError('Too many requests — wait a moment and try again.'); return; }
+                const d = await res.json();
+                if (!d || !d.valid) { showError('This key is not recognized, disabled, or expired.'); return; }
+                render(d);
+            } catch (e) {
+                showError('Could not reach the server. Check your connection and try again.');
+            } finally {
+                btn.disabled = false; btn.textContent = 'Check key';
+            }
+        }
+        function render(d) {
+            // Status badge
+            const badge = document.getElementById('statusBadge');
+            badge.className = 'badge badge-ok';
+            badge.innerHTML = '<span class="dot"></span> Active';
+
+            // Period
+            const p = d.period || {};
+            const periodName = ({ daily: 'Today', weekly: 'This week', monthly: 'This month' })[p.resetPeriod] || 'This period';
+            document.getElementById('periodTitle').textContent = periodName;
+            document.getElementById('periodMeters').innerHTML =
+                meter('Requests', p.requests, p.reqLimit) +
+                meter('Tokens', p.tokens, p.tokLimit) +
+                meter('Credits', p.credits, p.credLimit, { fmt: n => (Number(n) || 0).toFixed(2) });
+
+            // Lifetime
+            const l = d.lifetime || {};
+            document.getElementById('lifetimeMeters').innerHTML =
+                meter('Requests', l.requests, l.reqLimit) +
+                meter('Tokens', l.tokens, l.tokLimit) +
+                meter('Credits', l.credits, l.credLimit, { fmt: n => (Number(n) || 0).toFixed(2) });
+
+            // Meta
+            document.getElementById('mResets').textContent =
+                (p.resetPeriod ? p.resetPeriod[0].toUpperCase() + p.resetPeriod.slice(1) : 'Daily') + ' · ' + (p.resetTZ || 'UTC');
+            document.getElementById('mNextReset').textContent = fmtDate(p.nextReset);
+            const expiresParts = [];
+            if (d.expiresAt) expiresParts.push(fmtDate(d.expiresAt));
+            if (d.lazyExpiry) expiresParts.push(fmtDate(d.lazyExpiry) + ' (from first use)');
+            document.getElementById('mExpires').textContent = expiresParts.length ? expiresParts.join(' · ') : 'Never';
+            const burst = [];
+            if (d.minuteLimit > 0) burst.push(d.minuteLimit + '/min');
+            if (d.hourLimit > 0) burst.push(d.hourLimit + '/hr');
+            document.getElementById('mBurst').textContent = burst.length ? burst.join(' · ') : 'None';
+
+            // Models
+            const mc = document.getElementById('mModels');
+            if (!d.models || d.models.length === 0) {
+                mc.innerHTML = '<span class="chip" style="background:var(--surface-3);color:var(--muted);border-color:var(--border)">All models</span>';
+            } else {
+                mc.innerHTML = d.models.map(m => '<span class="chip">' + esc(m) + '</span>').join('');
+            }
+
+            document.getElementById('result').classList.add('show');
+        }
+    </script>
+</body>
+
+</html>

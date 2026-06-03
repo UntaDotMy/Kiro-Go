@@ -6,1245 +6,785 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Kiro-Go</title>
     <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
+        /* ============================================================
+           Kiro-Go admin — design system
+           OpenRouter-style shell · auto dark/light · indigo accent
+           Numerals in mono for alignment. Hairline borders, no slop.
+           Legacy class names are preserved so existing render output
+           (account cards, badges, usage bars, detail items, modals)
+           stays styled and theme-aware.
+           ============================================================ */
+
+        :root {
+            --bg: #ffffff;
+            --surface: #ffffff;
+            --surface-2: #f6f7f9;
+            --surface-3: #eef0f3;
+            --sidebar: #fbfbfc;
+            --border: #e8e9ed;
+            --border-strong: #d6d8de;
+            --text: #16181d;
+            --muted: #6b7280;
+            --faint: #9aa0aa;
+            --accent: #4f46e5;
+            --accent-hover: #4338ca;
+            --accent-soft: #eef2ff;
+            --accent-border: #c7d2fe;
+            --on-accent: #ffffff;
+            --success: #15803d;
+            --success-soft: #f0fdf4;
+            --success-border: #bbf7d0;
+            --warning: #b45309;
+            --warning-soft: #fffbeb;
+            --warning-border: #fde68a;
+            --danger: #dc2626;
+            --danger-soft: #fef2f2;
+            --danger-border: #fecaca;
+            --shadow-1: 0 1px 2px rgba(16, 18, 24, 0.05);
+            --shadow-2: 0 4px 12px rgba(16, 18, 24, 0.08);
+            --shadow-lg: 0 24px 48px -16px rgba(16, 18, 24, 0.22);
+            --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+            --r-sm: 7px;
+            --r-md: 10px;
+            --r-lg: 14px;
+            --sidebar-w: 232px;
+            color-scheme: light;
         }
+
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) {
+                --bg: #0e1014;
+                --surface: #16181d;
+                --surface-2: #1b1e25;
+                --surface-3: #21252e;
+                --sidebar: #121419;
+                --border: #262a32;
+                --border-strong: #353b46;
+                --text: #e7e9ec;
+                --muted: #939aa4;
+                --faint: #6b727d;
+                --accent: #6366f1;
+                --accent-hover: #818cf8;
+                --accent-soft: #1b1f2e;
+                --accent-border: #34384d;
+                --on-accent: #ffffff;
+                --success: #34d399;
+                --success-soft: #102a1f;
+                --success-border: #1e4937;
+                --warning: #fbbf24;
+                --warning-soft: #2a2310;
+                --warning-border: #4a3d18;
+                --danger: #f87171;
+                --danger-soft: #2a1515;
+                --danger-border: #4d2727;
+                --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+                --shadow-2: 0 6px 16px rgba(0, 0, 0, 0.45);
+                --shadow-lg: 0 24px 48px -12px rgba(0, 0, 0, 0.6);
+                color-scheme: dark;
+            }
+        }
+
+        :root[data-theme="dark"] {
+            --bg: #0e1014;
+            --surface: #16181d;
+            --surface-2: #1b1e25;
+            --surface-3: #21252e;
+            --sidebar: #121419;
+            --border: #262a32;
+            --border-strong: #353b46;
+            --text: #e7e9ec;
+            --muted: #939aa4;
+            --faint: #6b727d;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --accent-soft: #1b1f2e;
+            --accent-border: #34384d;
+            --on-accent: #ffffff;
+            --success: #34d399;
+            --success-soft: #102a1f;
+            --success-border: #1e4937;
+            --warning: #fbbf24;
+            --warning-soft: #2a2310;
+            --warning-border: #4a3d18;
+            --danger: #f87171;
+            --danger-soft: #2a1515;
+            --danger-border: #4d2727;
+            --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+            --shadow-2: 0 6px 16px rgba(0, 0, 0, 0.45);
+            --shadow-lg: 0 24px 48px -12px rgba(0, 0, 0, 0.6);
+            color-scheme: dark;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html { -webkit-text-size-adjust: 100%; }
 
         body {
-            font-family: system-ui, -apple-system, sans-serif;
-            background: #f8fafc;
-            color: #1e293b;
+            font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             -webkit-tap-highlight-color: transparent;
+            font-size: 14px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
         }
 
-        .container {
-            max-width: 1100px;
-            margin: 0 auto;
-            padding: 16px;
-        }
+        .num { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 
+        ::selection { background: var(--accent-soft); }
+
+        /* Scrollbars */
+        * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+        *::-webkit-scrollbar { width: 10px; height: 10px; }
+        *::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; border: 3px solid var(--bg); }
+        *::-webkit-scrollbar-track { background: transparent; }
+
+        /* ---------- Login ---------- */
         .login-wrapper {
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            background: linear-gradient(135deg, #f0f4ff 0%, #faf5ff 100%);
+            background:
+                radial-gradient(900px 500px at 50% -10%, var(--accent-soft), transparent 70%),
+                var(--bg);
             padding: 16px;
         }
 
         .login-box {
-            background: #fff;
-            padding: 32px 24px;
-            border-radius: 16px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            background: var(--surface);
+            padding: 32px 28px;
+            border-radius: var(--r-lg);
+            box-shadow: var(--shadow-2);
+            border: 1px solid var(--border);
             width: 100%;
             max-width: 380px;
         }
 
         .login-box h1 {
-            text-align: center;
-            color: #7c3aed;
-            margin-bottom: 8px;
-            font-size: 22px;
+            display: flex;
+            align-items: center;
             justify-content: center;
+            gap: 9px;
+            color: var(--text);
+            margin-bottom: 6px;
+            font-size: 22px;
+            font-weight: 650;
+            letter-spacing: -0.02em;
         }
 
         .login-box p {
             text-align: center;
-            color: #64748b;
+            color: var(--muted);
             margin-bottom: 24px;
             font-size: 14px;
         }
 
-        .form-group {
-            margin-bottom: 16px;
+        .login-top {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-bottom: 18px;
         }
+
+        /* ---------- Forms ---------- */
+        .form-group { margin-bottom: 16px; }
 
         label {
             display: block;
             margin-bottom: 6px;
-            color: #374151;
-            font-size: 14px;
-            font-weight: 500;
+            color: var(--text);
+            font-size: 13px;
+            font-weight: 550;
         }
 
         input[type="text"],
         input[type="password"],
         input[type="number"],
+        input[type="datetime-local"],
         select,
         textarea {
             width: 100%;
-            padding: 12px 14px;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 16px;
-            background: #fff;
-            color: #1e293b;
+            padding: 9px 12px;
+            border: 1px solid var(--border-strong);
+            border-radius: var(--r-sm);
+            font-size: 14px;
+            background: var(--surface);
+            color: var(--text);
             -webkit-appearance: none;
+            appearance: none;
+            transition: border-color 0.12s ease, box-shadow 0.12s ease;
         }
 
-        input:focus,
-        textarea:focus {
+        select {
+            cursor: pointer;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            padding-right: 30px;
+        }
+
+        input::placeholder, textarea::placeholder { color: var(--faint); }
+
+        input:focus, select:focus, textarea:focus {
             outline: none;
-            border-color: #7c3aed;
-            box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1);
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
         }
 
         textarea {
             resize: vertical;
             min-height: 100px;
-            font-family: monospace;
-            font-size: 14px;
-        }
-
-        .btn {
-            padding: 12px 18px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            transition: all 0.2s;
-            touch-action: manipulation;
-        }
-
-        .btn-primary {
-            background: #7c3aed;
-            color: white;
-        }
-
-        .btn-primary:hover,
-        .btn-primary:active {
-            background: #6d28d9;
-        }
-
-        .btn-danger {
-            background: #ef4444;
-            color: white;
-        }
-
-        .btn-secondary {
-            background: #f1f5f9;
-            color: #374151;
-        }
-
-        .btn-success {
-            background: #10B981;
-            color: white;
-        }
-
-        .btn-sm {
-            padding: 8px 12px;
+            font-family: var(--mono);
             font-size: 13px;
-        }
-
-        .card {
-            background: #fff;
-            border-radius: 12px;
-            padding: 16px;
-            margin-bottom: 16px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-
-        .card-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 16px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid #e2e8f0;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
-
-        .card-title {
-            font-size: 16px;
-            font-weight: 600;
-        }
-
-        .card-actions {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-
-        .stat-card {
-            background: #fff;
-            border-radius: 10px;
-            padding: 12px 8px;
-            text-align: center;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-
-        .stat-value {
-            font-size: 20px;
-            font-weight: 700;
-            color: #7c3aed;
-        }
-
-        .stat-label {
-            font-size: 11px;
-            color: #64748b;
-            margin-top: 2px;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            font-weight: 500;
-            white-space: nowrap;
-        }
-
-        .badge-success {
-            background: #dcfce7;
-            color: #16a34a;
-        }
-
-        .badge-warning {
-            background: #fef3c7;
-            color: #d97706;
-        }
-
-        .badge-error {
-            background: #fee2e2;
-            color: #dc2626;
-        }
-
-        .badge-info {
-            background: #ede9fe;
-            color: #7c3aed;
-        }
-
-        .badge-pro {
-            background: #3b82f6;
-            color: white;
-        }
-
-        .badge-proplus {
-            background: #8b5cf6;
-            color: white;
-        }
-
-        .badge-power {
-            background: #f59e0b;
-            color: white;
-        }
-
-        .badge-free {
-            background: #6b7280;
-            color: white;
-        }
-
-        .badge-trial {
-            background: #10b981;
-            color: white;
-        }
-
-        .badge-banned {
-            background: #dc2626;
-            color: white;
-        }
-
-        .badge-suspended {
-            background: #f59e0b;
-            color: white;
-        }
-
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-            padding: 16px;
-            overflow-y: auto;
-        }
-
-        .modal.active {
-            display: flex;
-            align-items: flex-start;
-            justify-content: center;
-            padding-top: 5vh;
-        }
-
-        .modal-content {
-            background: #fff;
-            border-radius: 12px;
-            padding: 20px;
-            width: 100%;
-            max-width: 600px;
-            margin-bottom: 20px;
-        }
-
-        .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-
-        .modal-title {
-            font-size: 18px;
-            font-weight: 600;
-        }
-
-        .modal-close {
-            background: none;
-            border: none;
-            font-size: 28px;
-            cursor: pointer;
-            color: #64748b;
-            padding: 0 8px;
-        }
-
-        .modal-footer {
-            margin-top: 20px;
-            display: flex;
-            gap: 10px;
-            justify-content: flex-end;
-        }
-
-        .switch {
-            position: relative;
-            display: inline-block;
-            width: 44px;
-            height: 24px;
-            flex-shrink: 0;
-        }
-
-        .switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-            position: absolute;
-        }
-
-        .slider {
-            position: absolute;
-            cursor: pointer;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: #cbd5e1;
-            border-radius: 24px;
-            transition: 0.3s;
-        }
-
-        .slider:before {
-            position: absolute;
-            content: "";
-            height: 18px;
-            width: 18px;
-            left: 3px;
-            bottom: 3px;
-            background: white;
-            border-radius: 50%;
-            transition: 0.3s;
-        }
-
-        input:checked+.slider {
-            background: #7c3aed;
-        }
-
-        input:checked+.slider:before {
-            transform: translateX(20px);
-        }
-
-        .tabs {
-            display: flex;
-            gap: 4px;
-            margin-bottom: 16px;
-            background: #f1f5f9;
-            padding: 4px;
-            border-radius: 10px;
-            overflow-x: auto;
-            -webkit-overflow-scrolling: touch;
-        }
-
-        .tab {
-            padding: 10px 16px;
-            border-radius: 8px;
-            cursor: pointer;
-            color: #64748b;
-            font-weight: 500;
-            font-size: 14px;
-            white-space: nowrap;
-            flex-shrink: 0;
-        }
-
-        .tab:hover {
-            color: #374151;
-        }
-
-        .tab.active {
-            background: #fff;
-            color: #7c3aed;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-
-        .hidden {
-            display: none !important;
-        }
-
-        .message {
-            padding: 12px 16px;
-            border-radius: 8px;
-            margin-bottom: 12px;
-            font-size: 14px;
-        }
-
-        .message-error {
-            background: #fee2e2;
-            color: #dc2626;
-        }
-
-        .endpoint {
-            background: #f8fafc;
-            padding: 12px;
-            border-radius: 8px;
-            font-family: monospace;
-            font-size: 12px;
-            margin-bottom: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 10px;
-            word-break: break-all;
-        }
-
-        .endpoint span {
-            flex: 1;
-        }
-
-        .header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 16px;
-            gap: 12px;
-        }
-
-        .header h1 {
-            font-size: 18px;
-            color: #7c3aed;
-        }
-
-        .account-card {
-            background: #fff;
-            border-radius: 12px;
-            padding: 14px;
-            margin-bottom: 12px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-            border-left: 4px solid #7c3aed;
-        }
-
-        .account-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 10px;
-            gap: 10px;
-        }
-
-        .account-info {
-            flex: 1;
-            min-width: 0;
-        }
-
-        .account-email {
-            font-weight: 600;
-            font-size: 14px;
-            color: #1e293b;
-            word-break: break-all;
-        }
-
-        .account-meta {
-            display: flex;
-            gap: 6px;
-            flex-wrap: wrap;
-            margin-top: 6px;
-        }
-
-        .account-usage {
-            margin: 10px 0;
-        }
-
-        .usage-bar {
-            height: 6px;
-            background: #e2e8f0;
-            border-radius: 3px;
-            overflow: hidden;
-        }
-
-        .usage-fill {
-            height: 100%;
-            background: #7c3aed;
-            border-radius: 3px;
-            transition: width 0.3s;
-        }
-
-        .usage-fill.high {
-            background: #f59e0b;
-        }
-
-        .usage-fill.critical {
-            background: #ef4444;
-        }
-
-        .usage-text {
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: #64748b;
-            margin-top: 4px;
-        }
-
-        .usage-label {
-            font-size: 12px;
-            color: #64748b;
-            margin-bottom: 4px;
-            font-weight: 500;
-        }
-
-        .account-usage+.account-usage {
-            margin-top: 8px;
-        }
-
-        .badge-trial {
-            background: #10b981;
-            color: white;
-        }
-
-        .account-stats {
-            display: grid;
-            grid-template-columns: repeat(5, 1fr);
-            gap: 6px;
-            margin-top: 10px;
-            padding-top: 10px;
-            border-top: 1px solid #e2e8f0;
-        }
-
-        .account-stat {
-            text-align: center;
-        }
-
-        .account-stat-value {
-            font-weight: 600;
-            font-size: 13px;
-        }
-
-        .account-stat-label {
-            font-size: 10px;
-            color: #64748b;
-        }
-
-        .account-actions {
-            display: flex;
-            gap: 6px;
-            flex-shrink: 0;
-            flex-wrap: wrap;
-        }
-
-        .detail-section {
-            margin-bottom: 20px;
-        }
-
-        .detail-section h4 {
-            font-size: 13px;
-            color: #64748b;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .detail-grid {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 10px;
-        }
-
-        .detail-item {
-            background: #f8fafc;
-            padding: 10px 12px;
-            border-radius: 8px;
-        }
-
-        .detail-label {
-            font-size: 11px;
-            color: #64748b;
-            margin-bottom: 2px;
-        }
-
-        .detail-value {
-            font-size: 13px;
-            font-weight: 500;
-            word-break: break-all;
-        }
-
-        .model-list {
-            display: grid;
-            gap: 8px;
-            max-height: 250px;
-            overflow-y: auto;
-        }
-
-        .model-item {
-            background: #f8fafc;
-            padding: 14px 16px;
-            border-radius: 8px;
-            margin-bottom: 10px;
-            transition: background 0.2s ease;
-        }
-
-        .model-item:last-child {
-            margin-bottom: 0;
-        }
-
-        .model-item:hover {
-            background: #f1f5f9;
-        }
-
-        .model-name {
-            font-weight: 600;
-            font-size: 14px;
-            color: #0f172a;
-            line-height: 1.4;
-        }
-
-        .model-credit {
-            font-size: 13px;
-            margin-top: 4px;
-        }
-
-        .credit-ratio {
-            color: #7c3aed;
-            font-weight: 600;
-        }
-
-        .model-info {
-            font-size: 12px;
-            color: #64748b;
-            margin-top: 6px;
             line-height: 1.5;
         }
+
+        /* ---------- Buttons ---------- */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 8px 14px;
+            border: 1px solid transparent;
+            border-radius: var(--r-sm);
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 550;
+            font-family: inherit;
+            line-height: 1.2;
+            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, transform 0.04s ease;
+            touch-action: manipulation;
+            white-space: nowrap;
+        }
+        .btn:active { transform: translateY(0.5px); }
+        .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+        .btn-primary { background: var(--accent); color: var(--on-accent); }
+        .btn-primary:hover, .btn-primary:active { background: var(--accent-hover); }
+
+        .btn-secondary { background: var(--surface); color: var(--text); border-color: var(--border-strong); }
+        .btn-secondary:hover { background: var(--surface-2); border-color: var(--faint); }
+
+        .btn-danger { background: var(--surface); color: var(--danger); border-color: var(--danger-border); }
+        .btn-danger:hover { background: var(--danger-soft); border-color: var(--danger); }
+
+        .btn-success { background: var(--surface); color: var(--success); border-color: var(--success-border); }
+        .btn-success:hover { background: var(--success-soft); border-color: var(--success); }
+
+        .btn-warning { background: var(--surface); color: var(--warning); border-color: var(--warning-border); }
+        .btn-warning:hover { background: var(--warning-soft); border-color: var(--warning); }
+
+        .btn-sm { padding: 6px 10px; font-size: 12px; }
 
         .btn-icon {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            width: 36px;
-            height: 36px;
+            width: 32px;
+            height: 32px;
             padding: 0;
         }
+        .btn-icon svg { width: 16px; height: 16px; }
+        .btn-sm.btn-icon { width: 30px; height: 30px; }
 
-        .btn-icon svg {
-            width: 18px;
-            height: 18px;
+        /* ---------- App shell ---------- */
+        .app { display: flex; min-height: 100vh; }
+
+        .sidebar {
+            width: var(--sidebar-w);
+            flex-shrink: 0;
+            background: var(--sidebar);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            padding: 16px 12px;
+            gap: 4px;
+            z-index: 30;
         }
 
-        .loading {
-            opacity: 0.6;
-            pointer-events: none;
-        }
-
-        .logo {
+        .brand {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 9px;
+            padding: 6px 8px 14px;
+            font-size: 16px;
+            font-weight: 650;
+            letter-spacing: -0.02em;
+            color: var(--text);
         }
+        .brand svg { width: 22px; height: 22px; color: var(--accent); }
 
-        .logo svg {
-            width: 24px;
-            height: 24px;
-            color: #7c3aed;
-        }
+        .nav { display: flex; flex-direction: column; gap: 2px; }
 
-        .machine-id-row {
-            display: flex;
-            gap: 8px;
-            align-items: stretch;
-            flex-wrap: wrap;
-        }
-
-        .machine-id-row input {
-            flex: 1;
-            min-width: 200px;
-            font-family: monospace;
-            font-size: 11px;
-        }
-
-        .machine-id-row .btn {
-            flex-shrink: 0;
-        }
-
-        .lang-switch {
-            display: flex;
-            gap: 4px;
-            background: #f1f5f9;
-            padding: 2px;
-            border-radius: 6px;
-        }
-
-        .lang-btn {
-            padding: 4px 8px;
-            border: none;
-            background: transparent;
-            cursor: pointer;
-            font-size: 12px;
-            border-radius: 4px;
-            color: #64748b;
-        }
-
-        .lang-btn.active {
-            background: #fff;
-            color: #7c3aed;
-            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
-        }
-
-        .header-right {
+        .nav-item {
             display: flex;
             align-items: center;
             gap: 10px;
+            padding: 8px 10px;
+            border-radius: var(--r-sm);
+            color: var(--muted);
+            font-size: 13.5px;
+            font-weight: 550;
+            cursor: pointer;
+            user-select: none;
+            border: 1px solid transparent;
+            transition: background 0.12s ease, color 0.12s ease;
+        }
+        .nav-item svg { width: 17px; height: 17px; flex-shrink: 0; }
+        .nav-item:hover { background: var(--surface-2); color: var(--text); }
+        .nav-item.active { background: var(--accent-soft); color: var(--accent); }
+        :root[data-theme="dark"] .nav-item.active,
+        .nav-item.active { border-color: var(--accent-border); }
+
+        .sidebar-footer {
+            margin-top: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
         }
 
-        @media (max-width: 640px) {
-            .container {
-                padding: 12px;
-            }
+        .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
-            .stats-grid {
-                grid-template-columns: repeat(3, 1fr);
-                gap: 8px;
-            }
-
-            .stat-card {
-                padding: 10px 6px;
-            }
-
-            .stat-value {
-                font-size: 18px;
-            }
-
-            .stat-label {
-                font-size: 10px;
-            }
-
-            .card {
-                padding: 14px;
-            }
-
-            .card-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-
-            .card-actions {
-                width: 100%;
-            }
-
-            .card-actions .btn {
-                flex: 1;
-                text-align: center;
-            }
-
-            .account-header {
-                flex-direction: column;
-            }
-
-            .account-actions {
-                width: 100%;
-                justify-content: flex-start;
-            }
-
-            .account-actions .btn {
-                padding: 8px 10px;
-                font-size: 12px;
-            }
-
-            .account-stats {
-                grid-template-columns: repeat(2, 1fr);
-            }
-
-            .detail-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .tabs {
-                gap: 2px;
-            }
-
-            .tab {
-                padding: 10px 12px;
-                font-size: 13px;
-            }
-
-            .modal-content {
-                padding: 16px;
-            }
-
-            .endpoint {
-                flex-direction: column;
-                align-items: stretch;
-            }
-
-            .endpoint .btn {
-                width: 100%;
-            }
-
-            .machine-id-row {
-                flex-direction: column;
-            }
-
-            .machine-id-row input {
-                min-width: 100%;
-            }
-
-            .machine-id-row .btn {
-                width: 100%;
-            }
-        }
-
-        @media (min-width: 641px) {
-            .detail-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
-        }
-
-        /* 隐私模式开关样式 */
-        .privacy-toggle {
-            white-space: nowrap;
-        }
-
-        @media (max-width: 640px) {
-            .privacy-toggle {
-                order: -1;
-                width: 100%;
-                justify-content: space-between;
-                padding: 8px 0;
-                border-bottom: 1px solid #e2e8f0;
-                margin-bottom: 8px;
-            }
-
-            .privacy-toggle span {
-                font-size: 14px;
-            }
-        }
-
-        /* ============================================================
-           Dashboard polish — restrained, single-palette modern look.
-           Palette: surfaces / borders / one brand accent (#7c3aed).
-           Semantic colours (green/red) only for status meaning.
-           ============================================================ */
-
-        :root {
-            --surface: #ffffff;
-            --canvas: #fafafa;
-            --canvas-2: #f5f5f7;
-            --border: #ececef;
-            --border-strong: #d4d4d8;
-            --text: #18181b;
-            --text-muted: #71717a;
-            --text-faint: #a1a1aa;
-            --brand: #7c3aed;
-            --brand-hover: #6d28d9;
-            --brand-soft: #f5f3ff;
-            --success: #16a34a;
-            --warning: #d97706;
-            --danger: #dc2626;
-            --shadow-1: 0 1px 0 rgba(24, 24, 27, 0.04);
-        }
-
-        body {
-            background: var(--canvas);
-            color: var(--text);
-        }
-
-        .container {
-            max-width: 1180px;
-        }
-
-        /* Header */
-        .header {
-            padding: 6px 0 14px;
+        .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 24px;
+            background: color-mix(in srgb, var(--bg) 86%, transparent);
+            backdrop-filter: saturate(160%) blur(10px);
             border-bottom: 1px solid var(--border);
-            margin-bottom: 18px;
+        }
+        .topbar-title { font-size: 17px; font-weight: 650; letter-spacing: -0.02em; }
+        .topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+
+        .content { padding: 22px 24px 60px; max-width: 1280px; width: 100%; }
+
+        /* status dot badge in topbar */
+        .live-dot {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            font-weight: 550;
+            color: var(--success);
+        }
+        .live-dot::before {
+            content: "";
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 60%, transparent);
+            animation: pulse 2.4s infinite;
+        }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success) 55%, transparent); }
+            70% { box-shadow: 0 0 0 6px transparent; }
+            100% { box-shadow: 0 0 0 0 transparent; }
         }
 
-        .header h1 {
-            font-size: 18px;
-            font-weight: 600;
-            letter-spacing: -0.01em;
-            color: var(--text);
+        .theme-toggle, .icon-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px; height: 32px;
+            border-radius: var(--r-sm);
+            border: 1px solid var(--border-strong);
+            background: var(--surface);
+            color: var(--muted);
+            cursor: pointer;
+            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+        }
+        .theme-toggle:hover, .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+        .theme-toggle svg { width: 16px; height: 16px; }
+        .theme-toggle .moon { display: none; }
+        :root[data-theme="dark"] .theme-toggle .moon { display: block; }
+        :root[data-theme="dark"] .theme-toggle .sun { display: none; }
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) .theme-toggle .moon { display: block; }
+            :root:not([data-theme="light"]) .theme-toggle .sun { display: none; }
         }
 
-        .header h1 + * { color: var(--text-muted); }
+        /* ---------- Cards ---------- */
+        .container { max-width: 1280px; margin: 0 auto; }
 
-        /* Stat cards — flat, identical, no rail, no hover lift,
-           tabular numbers for alignment. */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--r-lg);
+            padding: 18px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow-1);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            padding-bottom: 13px;
+            border-bottom: 1px solid var(--border);
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .card-title { font-size: 15px; font-weight: 620; letter-spacing: -0.01em; }
+        .card-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+        /* ---------- KPI / stat tiles ---------- */
         .stats-grid {
-            gap: 8px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin-bottom: 18px;
         }
 
         .stat-card {
             background: var(--surface);
             border: 1px solid var(--border);
-            border-radius: 10px;
-            box-shadow: none;
-            padding: 14px 14px 12px;
+            border-radius: var(--r-md);
+            padding: 15px 16px;
             text-align: left;
+            box-shadow: var(--shadow-1);
         }
-
-        .stat-card::before { content: none; }
-
         .stat-value {
-            font-size: 20px;
-            font-weight: 600;
+            font-size: 24px;
+            font-weight: 640;
             color: var(--text);
+            font-family: var(--mono);
             font-variant-numeric: tabular-nums;
-            letter-spacing: -0.01em;
+            letter-spacing: -0.02em;
+            line-height: 1.1;
         }
-
         .stat-label {
             font-size: 12px;
-            font-weight: 500;
-            color: var(--text-muted);
-            text-transform: none;
-            letter-spacing: 0;
-            margin-top: 2px;
+            font-weight: 530;
+            color: var(--muted);
+            margin-top: 5px;
         }
+        .stat-sub { font-size: 11px; color: var(--faint); margin-top: 3px; }
 
-        /* No per-card colour overrides; numbers stay neutral. */
-        #statSuccess, #statFailed, #statSuccessRate,
-        #statAvailable, #statCredits, #statCreditsTotal,
-        #statTokens, #statRequests, #statAccounts, #statUptime {
-            color: var(--text);
-        }
-
-        /* Cards */
-        .card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            box-shadow: var(--shadow-1);
-        }
-
-        .card-header {
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 12px;
-        }
-
-        .card-title {
-            font-weight: 600;
-            color: var(--text);
-            letter-spacing: -0.005em;
-        }
-
-        /* Tabs — clean segmented control */
-        .tabs {
-            background: var(--canvas-2);
-            border: 1px solid var(--border);
-            padding: 3px;
-            border-radius: 8px;
-            backdrop-filter: none;
-        }
-
-        .tab {
-            color: var(--text-muted);
-            font-weight: 500;
-            border-radius: 6px;
-            padding: 8px 14px;
-        }
-
-        .tab:hover {
-            color: var(--text);
-            background: rgba(255, 255, 255, 0.5);
-        }
-
-        .tab.active {
-            background: var(--surface);
-            color: var(--text);
-            box-shadow: var(--shadow-1);
-        }
-
-        /* Buttons — flat, single brand accent, no gradients */
-        .btn {
-            border-radius: 8px;
-            font-weight: 500;
-            box-shadow: none;
-            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
-        }
-
-        .btn-primary {
-            background: var(--brand);
-            color: #fff;
-        }
-
-        .btn-primary:hover,
-        .btn-primary:active {
-            background: var(--brand-hover);
-        }
-
-        .btn-secondary {
-            background: var(--surface);
-            color: var(--text);
-            border: 1px solid var(--border-strong);
-        }
-
-        .btn-secondary:hover {
-            background: var(--canvas-2);
-        }
-
-        .btn-danger {
-            background: var(--surface);
-            color: var(--danger);
-            border: 1px solid #fecaca;
-        }
-
-        .btn-danger:hover {
-            background: #fef2f2;
-            color: var(--danger);
-            border-color: var(--danger);
-        }
-
-        .btn-success {
-            background: var(--surface);
-            color: var(--success);
-            border: 1px solid #bbf7d0;
-        }
-
-        .btn-success:hover {
-            background: #f0fdf4;
-            border-color: var(--success);
-        }
-
-        .btn-warning {
-            background: var(--surface);
-            color: var(--warning);
-            border: 1px solid #fed7aa;
-        }
-
-        .btn-warning:hover {
-            background: #fffbeb;
-            border-color: var(--warning);
-        }
-
-        .btn:focus-visible {
-            outline: 2px solid var(--brand);
-            outline-offset: 2px;
-        }
-
-        /* Inputs */
-        input[type="text"],
-        input[type="password"],
-        input[type="number"],
-        select,
-        textarea {
-            border: 1px solid var(--border-strong);
-            border-radius: 8px;
-            font-size: 14px;
-            padding: 10px 12px;
-            background: var(--surface);
-            color: var(--text);
-        }
-
-        input::placeholder, textarea::placeholder {
-            color: var(--text-faint);
-        }
-
-        input:focus, select:focus, textarea:focus {
-            border-color: var(--brand);
-            box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.12);
-        }
-
-        select {
-            cursor: pointer;
-        }
-
-        /* Endpoint blocks — single mono style, no hover tint */
-        .endpoint {
-            background: var(--canvas-2);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            font-size: 13px;
-            color: var(--text);
-        }
-
-        /* Badges — flat, consistent shape, semantic colours only.
-           Keep base shape; neutralize the multi-coloured plan badges. */
+        /* ---------- Badges ---------- */
         .badge {
-            font-size: 11px;
-            font-weight: 500;
-            padding: 3px 8px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
             border-radius: 999px;
+            font-size: 11px;
+            font-weight: 560;
+            white-space: nowrap;
             border: 1px solid transparent;
+            line-height: 1.5;
+        }
+        .badge-success { background: var(--success-soft); color: var(--success); border-color: var(--success-border); }
+        .badge-warning { background: var(--warning-soft); color: var(--warning); border-color: var(--warning-border); }
+        .badge-error, .badge-banned { background: var(--danger-soft); color: var(--danger); border-color: var(--danger-border); }
+        .badge-info { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+        .badge-pro, .badge-proplus, .badge-power, .badge-trial {
+            background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border);
+        }
+        .badge-free, .badge-suspended { background: var(--surface-2); color: var(--muted); border-color: var(--border); }
+
+        /* ---------- Switch ---------- */
+        .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+        .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+        .slider {
+            position: absolute; cursor: pointer; inset: 0;
+            background: var(--border-strong); border-radius: 999px; transition: 0.2s;
+        }
+        .slider:before {
+            position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px;
+            background: #fff; border-radius: 50%; transition: 0.2s; box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+        }
+        input:checked + .slider { background: var(--accent); }
+        input:checked + .slider:before { transform: translateX(18px); }
+
+        /* ---------- Tabs (legacy, hidden in shell but kept harmless) ---------- */
+        .tabs { display: none; }
+        .tab-content { animation: fade 0.18s ease; }
+        @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+        .hidden { display: none !important; }
+
+        /* ---------- Messages ---------- */
+        .message { padding: 11px 14px; border-radius: var(--r-sm); margin-bottom: 12px; font-size: 13px; border: 1px solid transparent; }
+        .message-error { background: var(--danger-soft); color: var(--danger); border-color: var(--danger-border); }
+
+        /* ---------- Endpoint blocks ---------- */
+        .endpoint {
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            padding: 11px 12px;
+            border-radius: var(--r-sm);
+            font-family: var(--mono);
+            font-size: 12.5px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            word-break: break-all;
+            color: var(--text);
+        }
+        .endpoint span { flex: 1; }
+
+        /* ---------- Data table (accounts) ---------- */
+        .table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid var(--border);
+            border-radius: var(--r-md);
+            background: var(--surface);
+        }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 760px; }
+        .data-table thead th {
+            position: sticky; top: 0;
+            background: var(--surface-2);
+            color: var(--muted);
+            font-weight: 560;
+            font-size: 11.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+        .data-table th.sortable { cursor: pointer; user-select: none; }
+        .data-table th.sortable:hover { color: var(--text); }
+        .data-table th .sort-ind { opacity: 0.5; font-size: 10px; margin-left: 3px; }
+        .data-table th.sorted { color: var(--accent); }
+        .data-table th.sorted .sort-ind { opacity: 1; }
+        .data-table tbody td {
+            padding: 11px 12px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+        }
+        .data-table tbody tr:last-child td { border-bottom: none; }
+        .data-table tbody tr { transition: background 0.1s ease; }
+        .data-table tbody tr:hover { background: var(--surface-2); }
+        .data-table tbody tr.is-selected { background: var(--accent-soft); }
+        .data-table tbody tr.is-disabled { opacity: 0.62; }
+        .data-table .cell-num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+        .acct-email { font-weight: 580; color: var(--text); word-break: break-all; }
+        .acct-sub { font-size: 11px; color: var(--faint); margin-top: 2px; }
+        .row-actions { display: flex; gap: 5px; align-items: center; justify-content: flex-end; flex-wrap: nowrap; }
+        .row-meta { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 5px; }
+        .mini-usage { display: flex; flex-direction: column; gap: 3px; min-width: 120px; }
+        .weight-select {
+            width: 56px; padding: 4px 6px; font-size: 12px; text-align: center;
+            border: 1px solid var(--border-strong); border-radius: var(--r-sm);
+            background: var(--surface); color: var(--text);
+            background-image: none; padding-right: 6px;
         }
 
-        .badge-success {
-            background: #f0fdf4;
-            color: var(--success);
-            border-color: #bbf7d0;
-        }
+        /* ---------- Usage bars ---------- */
+        .account-usage { margin: 8px 0; }
+        .usage-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; font-weight: 520; }
+        .usage-bar { height: 6px; background: var(--surface-3); border-radius: 999px; overflow: hidden; }
+        .usage-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
+        .usage-fill.high { background: var(--warning); }
+        .usage-fill.critical { background: var(--danger); }
+        .usage-text { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
-        .badge-warning {
-            background: #fffbeb;
-            color: var(--warning);
-            border-color: #fde68a;
-        }
-
-        .badge-error,
-        .badge-banned {
-            background: #fef2f2;
-            color: var(--danger);
-            border-color: #fecaca;
-        }
-
-        .badge-info {
-            background: var(--brand-soft);
-            color: var(--brand);
-            border-color: #ddd6fe;
-        }
-
-        .badge-pro,
-        .badge-proplus,
-        .badge-power,
-        .badge-trial {
-            background: var(--brand-soft);
-            color: var(--brand);
-            border-color: #ddd6fe;
-        }
-
-        .badge-free,
-        .badge-suspended {
-            background: var(--canvas-2);
-            color: var(--text-muted);
-            border-color: var(--border);
-        }
-
-        /* Account cards — neutral surface, minimal status accent
-           only on the left rail, no full-card colour wash. */
+        /* ---------- Account card (legacy; used by API keys list) ---------- */
         .account-card {
             background: var(--surface);
             border: 1px solid var(--border);
-            border-left: 3px solid var(--brand);
-            border-radius: 10px;
-            box-shadow: none;
+            border-left: 3px solid var(--accent);
+            border-radius: var(--r-md);
+            padding: 15px 16px;
+            margin-bottom: 12px;
+            box-shadow: var(--shadow-1);
         }
-
-        .account-card.is-disabled {
-            border-left-color: var(--border-strong);
-            background: var(--surface);
-            opacity: 0.85;
-        }
-
-        .account-card.is-banned {
-            border-left-color: var(--danger);
-            background: var(--surface);
-        }
-
-        .account-card.is-suspended {
-            border-left-color: var(--warning);
-            background: var(--surface);
-        }
-
-        .account-stat-value {
-            font-variant-numeric: tabular-nums;
-        }
-
+        .account-card.is-disabled { border-left-color: var(--border-strong); opacity: 0.82; }
+        .account-card.is-banned { border-left-color: var(--danger); }
+        .account-card.is-suspended { border-left-color: var(--warning); }
+        .account-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; gap: 10px; }
+        .account-info { flex: 1; min-width: 0; }
+        .account-email { font-weight: 600; font-size: 14px; color: var(--text); word-break: break-all; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .account-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; align-items: center; }
+        .account-actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
         .account-stats {
-            border-top-color: var(--border);
+            display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+            margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
         }
+        .account-stat { text-align: center; }
+        .account-stat-value { font-weight: 600; font-size: 13px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+        .account-stat-label { font-size: 10px; color: var(--muted); margin-top: 2px; }
+        .account-card.loading { opacity: 0.6; pointer-events: none; }
 
-        /* Usage bar — single brand colour, rounded, thin. */
-        .usage-bar {
-            height: 6px;
-            background: var(--canvas-2);
-            border-radius: 999px;
+        /* ---------- Detail / modal grids ---------- */
+        .detail-section { margin-bottom: 20px; }
+        .detail-section h4 { font-size: 12px; color: var(--muted); margin-bottom: 10px; font-weight: 600; letter-spacing: 0; }
+        .detail-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+        .detail-item { background: var(--surface-2); border: 1px solid var(--border); padding: 10px 12px; border-radius: var(--r-sm); }
+        .detail-label { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+        .detail-value { font-size: 13px; font-weight: 530; word-break: break-all; }
+
+        .model-list { display: grid; gap: 8px; max-height: 260px; overflow-y: auto; }
+        .model-item { background: var(--surface-2); border: 1px solid var(--border); padding: 13px 15px; border-radius: var(--r-sm); }
+        .model-name { font-weight: 600; font-size: 14px; color: var(--text); line-height: 1.4; font-family: var(--mono); }
+        .model-credit { font-size: 13px; margin-top: 4px; }
+        .credit-ratio { color: var(--accent); font-weight: 600; font-family: var(--mono); }
+        .model-info { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+
+        .machine-id-row { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; }
+        .machine-id-row input { flex: 1; min-width: 200px; font-family: var(--mono); font-size: 12px; }
+        .machine-id-row .btn { flex-shrink: 0; }
+
+        .loading { opacity: 0.6; pointer-events: none; }
+        .logo { display: flex; align-items: center; gap: 8px; }
+        .logo svg { width: 22px; height: 22px; color: var(--accent); }
+
+        /* ---------- Lang switch ---------- */
+        .lang-switch { display: flex; gap: 2px; background: var(--surface-2); padding: 2px; border-radius: var(--r-sm); border: 1px solid var(--border); }
+        .lang-btn { padding: 4px 9px; border: none; background: transparent; cursor: pointer; font-size: 12px; border-radius: 5px; color: var(--muted); font-weight: 550; font-family: inherit; }
+        .lang-btn:hover { color: var(--text); }
+        .lang-btn.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-1); }
+
+        .version-badge { cursor: pointer; }
+
+        /* ---------- Modal ---------- */
+        .modal {
+            display: none; position: fixed; inset: 0;
+            background: rgba(10, 12, 16, 0.55);
+            backdrop-filter: blur(3px);
+            z-index: 1000; padding: 16px; overflow-y: auto;
         }
-
-        .usage-fill {
-            background: var(--brand);
-            border-radius: 999px;
-        }
-
-        .usage-fill.high {
-            background: var(--warning);
-        }
-
-        .usage-fill.critical {
-            background: var(--danger);
-        }
-
-        /* Detail dialog */
-        .detail-item {
-            background: var(--canvas-2);
-            border: 1px solid var(--border);
-        }
-
-        .detail-section h4 {
-            color: var(--text-muted);
-            font-weight: 600;
-            text-transform: none;
-            letter-spacing: 0;
-            font-size: 12px;
-        }
-
-        /* Modal */
+        .modal.active { display: flex; align-items: flex-start; justify-content: center; padding-top: 5vh; }
         .modal-content {
-            border: 1px solid var(--border);
-            box-shadow: 0 24px 48px -12px rgba(24, 24, 27, 0.18);
-        }
-
-        /* Login box */
-        .login-wrapper {
-            background: var(--canvas);
-        }
-
-        .login-box {
-            border: 1px solid var(--border);
-            box-shadow: var(--shadow-1);
-        }
-
-        .login-box h1 {
-            color: var(--text);
-        }
-
-        /* Switch — tighter and consistent with brand colour */
-        .slider {
-            background: var(--border-strong);
-        }
-
-        input:checked + .slider {
-            background: var(--brand);
-        }
-
-        /* Language switch */
-        .lang-switch {
-            background: var(--canvas-2);
-            border: 1px solid var(--border);
-        }
-
-        .lang-btn.active {
             background: var(--surface);
-            color: var(--text);
-            box-shadow: var(--shadow-1);
+            border: 1px solid var(--border);
+            border-radius: var(--r-lg);
+            padding: 22px;
+            width: 100%; max-width: 600px; margin-bottom: 20px;
+            box-shadow: var(--shadow-lg);
+            animation: modalIn 0.16s ease;
         }
+        @keyframes modalIn { from { opacity: 0; transform: translateY(8px) scale(0.99); } to { opacity: 1; transform: none; } }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+        .modal-title { font-size: 17px; font-weight: 620; letter-spacing: -0.01em; }
+        .modal-close { background: none; border: none; font-size: 26px; cursor: pointer; color: var(--muted); padding: 0 6px; line-height: 1; border-radius: 6px; }
+        .modal-close:hover { color: var(--text); }
+        .modal-footer { margin-top: 20px; display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap; }
+
+        /* ---------- Charts ---------- */
+        .chart-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 16px; }
+        .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 18px; box-shadow: var(--shadow-1); }
+        .chart-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+        .chart-title { font-size: 13px; font-weight: 580; color: var(--muted); }
+        .chart-value { font-size: 22px; font-weight: 640; font-family: var(--mono); letter-spacing: -0.02em; }
+        .chart-svg { width: 100%; height: 72px; display: block; margin-top: 8px; }
+        .chart-foot { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); margin-top: 6px; font-family: var(--mono); }
+
+        .toplist { display: flex; flex-direction: column; gap: 11px; }
+        .toplist-row { display: grid; grid-template-columns: 1fr auto; gap: 4px; }
+        .toplist-name { font-size: 13px; font-weight: 530; font-family: var(--mono); }
+        .toplist-val { font-size: 12px; color: var(--muted); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+        .empty { text-align: center; color: var(--muted); padding: 36px 16px; font-size: 13.5px; }
+        .empty svg { width: 34px; height: 34px; color: var(--faint); margin-bottom: 10px; }
+
+        .field-hint { color: var(--muted); font-size: 12px; margin-top: 5px; display: block; line-height: 1.5; }
+
+        /* ---------- API tab ---------- */
+        .ep-list { display: flex; flex-direction: column; gap: 8px; }
+        .ep-line { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-sm); flex-wrap: wrap; }
+        .ep-verb { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); padding: 2px 8px; border-radius: 6px; flex-shrink: 0; }
+        .ep-url { font-family: var(--mono); font-size: 13px; flex: 1; min-width: 180px; word-break: break-all; color: var(--text); }
+        .ep-tag { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+        .seg { display: inline-flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 2px; }
+        .seg-btn { padding: 5px 11px; border: none; background: transparent; color: var(--muted); font-size: 12.5px; font-weight: 540; font-family: inherit; border-radius: 6px; cursor: pointer; }
+        .seg-btn:hover { color: var(--text); }
+        .seg-btn.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-1); }
+        .code-block { position: relative; }
+        .code-copy { position: absolute; top: 10px; right: 10px; z-index: 1; }
+        .code-pre { background: var(--surface-3); border: 1px solid var(--border); border-radius: var(--r-md); padding: 16px 18px; font-family: var(--mono); font-size: 12.5px; line-height: 1.65; overflow-x: auto; white-space: pre; color: var(--text); margin: 0; }
+
+        /* ---------- Settings groups ---------- */
+        .settings-search { position: relative; margin-bottom: 18px; }
+        .settings-search input { padding-left: 36px; }
+        .settings-search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: var(--faint); pointer-events: none; }
+        .settings-group { scroll-margin-top: 80px; }
+        .settings-group.filtered-out { display: none; }
+        .card.filtered-out { display: none; }
+
+        /* ---------- Responsive ---------- */
+        @media (max-width: 860px) {
+            .chart-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 720px) {
+            :root { --sidebar-w: 100%; }
+            .app { flex-direction: column; }
+            .sidebar {
+                position: sticky; top: 0; width: 100%; height: auto; flex-direction: row;
+                align-items: center; padding: 10px 12px; gap: 8px; overflow-x: auto;
+            }
+            .brand { padding: 0 8px 0 4px; white-space: nowrap; }
+            .nav { flex-direction: row; gap: 4px; }
+            .nav-item span.nav-label { display: none; }
+            .nav-item { padding: 8px; }
+            .sidebar-footer { margin: 0 0 0 auto; flex-direction: row; border: none; padding: 0; align-items: center; }
+            .topbar { padding: 12px 16px; }
+            .content { padding: 16px; }
+            .account-stats { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (min-width: 641px) {
+            .detail-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        /* ---------- Dark-mode fixups for legacy inline-styled static markup ---------- */
+        #accountsToolbar input[type="text"],
+        #accountsToolbar select {
+            background: var(--surface) !important;
+            border-color: var(--border-strong) !important;
+            color: var(--text) !important;
+        }
+        #accountsToolbar div[style*="background:#e2e8f0"] { background: var(--border) !important; }
+        .privacy-toggle span { color: var(--text) !important; }
+        .privacy-toggle { white-space: nowrap; }
+
+        /* Legacy inline colors → theme tokens. Many static hints and
+           dynamically-built modal/detail strings hardcode the old slate
+           palette (#64748b muted, #94a3b8 faint, #f1f5f9 chip bg, #475569).
+           Re-mapping them here in one place keeps them readable in dark mode
+           without hand-editing ~40 scattered inline styles (which is edit-risky
+           on a 4800-line file). Attribute selectors match the exact inline
+           declarations the markup uses. */
+        [style*="color:#64748b"] { color: var(--muted) !important; }
+        [style*="color: #64748b"] { color: var(--muted) !important; }
+        [style*="color:#94a3b8"] { color: var(--faint) !important; }
+        [style*="color: #94a3b8"] { color: var(--faint) !important; }
+        [style*="color:#475569"] { color: var(--muted) !important; }
+        [style*="color:#374151"] { color: var(--text) !important; }
+        [style*="color:#1f2937"] { color: var(--text) !important; }
+        [style*="background:#f1f5f9"] { background: var(--surface-3) !important; }
+        [style*="background: #f1f5f9"] { background: var(--surface-3) !important; }
+        [style*="background:#f8fafc"] { background: var(--surface-2) !important; }
+        [style*="background:#fafbfc"] { background: var(--surface-2) !important; }
+        [style*="background:#f0f4ff"] { background: var(--accent-soft) !important; }
+        [style*="background:#faf5ff"] { background: var(--accent-soft) !important; }
+        [style*="background:#f0fdf4"] { background: var(--success-soft) !important; }
+        [style*="background:#fef2f2"] { background: var(--danger-soft) !important; }
+        [style*="background:#fffbeb"] { background: var(--warning-soft) !important; }
+        [style*="border:1px solid #e5e7eb"], [style*="border: 1px solid #e5e7eb"] { border-color: var(--border) !important; }
+        [style*="border:1px solid #d1d5db"] { border-color: var(--border-strong) !important; }
+        /* Inline code chips in the add-account modals */
+        .modal code[style*="background"] { background: var(--surface-3) !important; color: var(--text) !important; }
     </style>
+
 </head>
 
 <body>
@@ -1270,72 +810,97 @@
             <div id="loginError" class="message message-error hidden" style="margin-top:12px"></div>
         </div>
     </div>
-    <div id="mainPage" class="container hidden">
-        <div class="header">
-            <h1 class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
-                </svg>Kiro-Go</h1>
-            <div class="header-right">
+    <div id="mainPage" class="app hidden">
+        <aside class="sidebar">
+            <div class="brand">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg>
+                Kiro-Go
+            </div>
+            <nav class="nav">
+                <div class="nav-item active" data-tab="overview" onclick="switchTab('overview')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+                    <span class="nav-label" data-i18n="nav.overview"></span>
+                </div>
+                <div class="nav-item" data-tab="accounts" onclick="switchTab('accounts')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+                    <span class="nav-label" data-i18n="tabs.accounts"></span>
+                </div>
+                <div class="nav-item" data-tab="apikeys" onclick="switchTab('apikeys')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+                    <span class="nav-label" data-i18n="tabs.apikeys"></span>
+                </div>
+                <div class="nav-item" data-tab="analytics" onclick="switchTab('analytics')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M18 17V9M13 17V5M8 17v-3"/></svg>
+                    <span class="nav-label" data-i18n="tabs.analytics"></span>
+                </div>
+                <div class="nav-item" data-tab="settings" onclick="switchTab('settings')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+                    <span class="nav-label" data-i18n="tabs.settings"></span>
+                </div>
+                <div class="nav-item" data-tab="api" onclick="switchTab('api')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                    <span class="nav-label" data-i18n="tabs.api"></span>
+                </div>
+            </nav>
+            <div class="sidebar-footer">
                 <div class="lang-switch">
                     <button class="lang-btn" data-lang="zh" onclick="setLang('zh')">中文</button>
                     <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
                 </div>
-                <span class="badge badge-success" id="statusBadge" data-i18n="status.running"></span>
-                <span class="badge badge-info" id="versionBadge" style="cursor:pointer" onclick="checkUpdate(true)"></span>
-                <button class="btn btn-sm btn-danger" onclick="logout()" data-i18n="common.logout" style="padding:4px 12px;font-size:12px"></button>
             </div>
-        </div>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value" id="statAccounts">0</div>
-                <div class="stat-label" data-i18n="stats.accounts"></div>
+        </aside>
+        <div class="main">
+            <div class="topbar">
+                <div class="topbar-title" id="sectionTitle" data-i18n="nav.overview"></div>
+                <div class="topbar-right">
+                    <span class="live-dot" id="statusBadge" data-i18n="status.running"></span>
+                    <span class="badge badge-info version-badge" id="versionBadge" onclick="checkUpdate(true)"></span>
+                    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle theme">
+                        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+                        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+                    </button>
+                    <button class="btn btn-sm btn-secondary" onclick="logout()" data-i18n="common.logout"></button>
+                </div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statAvailable">0</div>
-                <div class="stat-label" data-i18n="stats.available"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statRequests">0</div>
-                <div class="stat-label" data-i18n="stats.requests"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statSuccess">0</div>
-                <div class="stat-label" data-i18n="stats.success"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statFailed">0</div>
-                <div class="stat-label" data-i18n="stats.failed"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statSuccessRate">-</div>
-                <div class="stat-label" data-i18n="stats.successRate"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statTokens">0</div>
-                <div class="stat-label">Tokens</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statCredits">0</div>
-                <div class="stat-label" data-i18n="stats.creditsUsed"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statCreditsTotal">0</div>
-                <div class="stat-label" data-i18n="stats.creditsTotal"></div>
-                <div class="stat-sub" id="statCreditsRemaining" style="font-size:11px;color:#64748b;margin-top:2px"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="statUptime">-</div>
-                <div class="stat-label" data-i18n="stats.uptime"></div>
-            </div>
-        </div>
-        <div class="tabs">
-            <div class="tab active" data-tab="accounts" data-i18n="tabs.accounts"></div>
-            <div class="tab" data-tab="apikeys" data-i18n="tabs.apikeys"></div>
-            <div class="tab" data-tab="analytics" data-i18n="tabs.analytics"></div>
-            <div class="tab" data-tab="settings" data-i18n="tabs.settings"></div>
-            <div class="tab" data-tab="api" data-i18n="tabs.api"></div>
-        </div>
-        <div id="tabAccounts" class="tab-content">
+            <div class="content">
+                <div id="tabOverview" class="tab-content">
+                    <div class="stats-grid">
+                        <div class="stat-card"><div class="stat-value num" id="statAccounts">0</div><div class="stat-label" data-i18n="stats.accounts"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statAvailable">0</div><div class="stat-label" data-i18n="stats.available"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statRequests">0</div><div class="stat-label" data-i18n="stats.requests"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statSuccess">0</div><div class="stat-label" data-i18n="stats.success"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statFailed">0</div><div class="stat-label" data-i18n="stats.failed"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statSuccessRate">-</div><div class="stat-label" data-i18n="stats.successRate"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statTokens">0</div><div class="stat-label">Tokens</div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statCredits">0</div><div class="stat-label" data-i18n="stats.creditsUsed"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statCreditsTotal">0</div><div class="stat-label" data-i18n="stats.creditsTotal"></div><div class="stat-sub num" id="statCreditsRemaining"></div></div>
+                        <div class="stat-card"><div class="stat-value num" id="statUptime">-</div><div class="stat-label" data-i18n="stats.uptime"></div></div>
+                    </div>
+                    <div class="chart-grid">
+                        <div class="chart-card">
+                            <div class="chart-head"><span class="chart-title" data-i18n="overview.requests14"></span><span class="chart-value num" id="ovReqValue">0</span></div>
+                            <div id="ovReqSpark"></div>
+                            <div class="chart-foot"><span id="ovReqStart"></span><span id="ovReqEnd"></span></div>
+                        </div>
+                        <div class="chart-card">
+                            <div class="chart-head"><span class="chart-title" data-i18n="overview.credits14"></span><span class="chart-value num" id="ovCredValue">0</span></div>
+                            <div id="ovCredSpark"></div>
+                            <div class="chart-foot"><span id="ovCredStart"></span><span id="ovCredEnd"></span></div>
+                        </div>
+                    </div>
+                    <div class="chart-grid">
+                        <div class="card" style="margin:0">
+                            <div class="card-header" style="margin-bottom:14px;padding-bottom:11px"><span class="card-title" data-i18n="overview.topModels"></span></div>
+                            <div id="ovTopModels" class="toplist"></div>
+                        </div>
+                        <div class="card" style="margin:0">
+                            <div class="card-header" style="margin-bottom:14px;padding-bottom:11px"><span class="card-title" data-i18n="overview.health"></span></div>
+                            <div id="ovHealth" class="toplist"></div>
+                        </div>
+                    </div>
+                </div>
+                <div id="tabAccounts" class="tab-content hidden">
+
             <div class="card">
                 <div class="card-header">
                     <span class="card-title" data-i18n="accounts.title"></span>
@@ -1393,18 +958,34 @@
             </div>
         </div>
         <div id="tabAnalytics" class="tab-content hidden">
+            <div class="chart-grid">
+                <div class="chart-card">
+                    <div class="chart-head"><span class="chart-title" data-i18n="overview.requests14"></span><span class="chart-value num" id="anReqValue">0</span></div>
+                    <div id="anReqSpark"></div>
+                    <div class="chart-foot"><span id="anReqStart"></span><span id="anReqEnd"></span></div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-head"><span class="chart-title" data-i18n="overview.credits14"></span><span class="chart-value num" id="anCredValue">0</span></div>
+                    <div id="anCredSpark"></div>
+                    <div class="chart-foot"><span id="anCredStart"></span><span id="anCredEnd"></span></div>
+                </div>
+            </div>
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="analytics.byModel"></span></div>
-                <p style="font-size:12px;color:#64748b;padding:0 0 12px" data-i18n="analytics.byModelHint"></p>
+                <p style="font-size:12px;color:var(--muted);padding:0 0 12px" data-i18n="analytics.byModelHint"></p>
                 <div id="modelStatsList"></div>
             </div>
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="analytics.byKey"></span></div>
-                <p style="font-size:12px;color:#64748b;padding:0 0 12px" data-i18n="analytics.byKeyHint"></p>
+                <p style="font-size:12px;color:var(--muted);padding:0 0 12px" data-i18n="analytics.byKeyHint"></p>
                 <div id="keyStatsList"></div>
             </div>
         </div>
         <div id="tabSettings" class="tab-content hidden">
+            <div class="settings-search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg>
+                <input type="text" id="settingsSearch" oninput="filterSettings()" data-i18n-placeholder="settings.search" autocomplete="off">
+            </div>
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.apiSettings"></span></div>
                 <div class="form-group">
@@ -1595,24 +1176,33 @@
         <div id="tabApi" class="tab-content hidden">
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="api.endpoints"></span></div>
-                <p style="margin-bottom:10px;font-weight:500;font-size:14px">Claude API <span style="font-size:11px;color:#64748b;font-weight:400">(/v1/messages)</span></p>
-                <div class="endpoint"><span id="claudeEndpoint"></span><button class="btn btn-sm btn-secondary"
-                        onclick="copy('claudeEndpoint')" data-i18n="common.copy"></button></div>
-                <p style="margin:14px 0 10px;font-weight:500;font-size:14px">OpenAI Chat Completions <span style="font-size:11px;color:#64748b;font-weight:400">(/v1/chat/completions)</span></p>
-                <div class="endpoint"><span id="openaiEndpoint"></span><button class="btn btn-sm btn-secondary"
-                        onclick="copy('openaiEndpoint')" data-i18n="common.copy"></button></div>
-                <p style="margin:14px 0 10px;font-weight:500;font-size:14px">OpenAI Responses <span style="font-size:11px;color:#64748b;font-weight:400">(/v1/responses)</span></p>
-                <div class="endpoint"><span id="responsesEndpoint"></span><button class="btn btn-sm btn-secondary"
-                        onclick="copy('responsesEndpoint')" data-i18n="common.copy"></button></div>
-                <p style="font-size:12px;color:#64748b;margin-top:4px" data-i18n="api.responsesHint"></p>
-                <p style="margin:14px 0 10px;font-weight:500;font-size:14px" data-i18n="api.modelList"></p>
-                <div class="endpoint"><span id="modelsEndpoint"></span><button class="btn btn-sm btn-secondary"
-                        onclick="copy('modelsEndpoint')" data-i18n="common.copy"></button></div>
-                <p style="font-size:12px;color:#64748b;margin-top:4px" data-i18n="api.modelListHint"></p>
-                <p style="margin:14px 0 10px;font-weight:500;font-size:14px" data-i18n="api.stats"></p>
-                <div class="endpoint"><span id="statsEndpoint"></span><button class="btn btn-sm btn-secondary"
-                        onclick="copy('statsEndpoint')" data-i18n="common.copy"></button></div>
-                <p style="font-size:12px;color:#64748b;margin-top:4px" data-i18n="api.statsHint"></p>
+                <div class="ep-list">
+                    <div class="ep-line"><span class="ep-verb">POST</span><span class="ep-url" id="claudeEndpoint"></span><span class="ep-tag">Claude · /v1/messages</span><button class="btn btn-sm btn-secondary" onclick="copy('claudeEndpoint')" data-i18n="common.copy"></button></div>
+                    <div class="ep-line"><span class="ep-verb">POST</span><span class="ep-url" id="openaiEndpoint"></span><span class="ep-tag">OpenAI · /v1/chat/completions</span><button class="btn btn-sm btn-secondary" onclick="copy('openaiEndpoint')" data-i18n="common.copy"></button></div>
+                    <div class="ep-line"><span class="ep-verb">POST</span><span class="ep-url" id="responsesEndpoint"></span><span class="ep-tag">Responses · /v1/responses</span><button class="btn btn-sm btn-secondary" onclick="copy('responsesEndpoint')" data-i18n="common.copy"></button></div>
+                    <div class="ep-line"><span class="ep-verb">GET</span><span class="ep-url" id="modelsEndpoint"></span><span class="ep-tag" data-i18n="api.modelList"></span><button class="btn btn-sm btn-secondary" onclick="copy('modelsEndpoint')" data-i18n="common.copy"></button></div>
+                    <div class="ep-line"><span class="ep-verb">GET</span><span class="ep-url" id="statsEndpoint"></span><span class="ep-tag" data-i18n="api.stats"></span><button class="btn btn-sm btn-secondary" onclick="copy('statsEndpoint')" data-i18n="common.copy"></button></div>
+                    <div class="ep-line"><span class="ep-verb">GET</span><span class="ep-url" id="keystatusEndpoint"></span><span class="ep-tag" data-i18n="api.keyStatus"></span><button class="btn btn-sm btn-secondary" onclick="copy('keystatusEndpoint')" data-i18n="common.copy"></button></div>
+                </div>
+                <p style="font-size:12px;color:var(--muted);margin-top:10px" data-i18n="api.responsesHint"></p>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title" data-i18n="api.quickstart"></span>
+                    <div class="seg" id="apiLangSeg">
+                        <button class="seg-btn active" data-lang="curl" onclick="setApiLang('curl')">cURL</button>
+                        <button class="seg-btn" data-lang="python" onclick="setApiLang('python')">Python</button>
+                        <button class="seg-btn" data-lang="node" onclick="setApiLang('node')">Node</button>
+                        <button class="seg-btn" data-lang="openai" onclick="setApiLang('openai')">OpenAI SDK</button>
+                    </div>
+                </div>
+                <p style="font-size:12px;color:var(--muted);margin:-4px 0 12px" data-i18n="api.quickstartHint"></p>
+                <div class="code-block">
+                    <button class="code-copy btn btn-sm btn-secondary" onclick="copyCode()" data-i18n="common.copy"></button>
+                    <pre id="apiCodeSample" class="code-pre"></pre>
+                </div>
+            </div>
+        </div>
             </div>
         </div>
     </div>
@@ -1661,6 +1251,11 @@
                 'login.error': '密码错误',
                 'login.connectError': '连接失败',
                 'status.running': '运行中',
+                'nav.overview': '概览',
+                'overview.requests14': '近 14 天请求',
+                'overview.credits14': '近 14 天 Credits',
+                'overview.topModels': '热门模型',
+                'overview.health': '账号池健康',
                 'stats.accounts': '账号',
                 'stats.available': '可用账号',
                 'stats.requests': '请求',
@@ -1770,6 +1365,7 @@
                 'time.hours': '小时',
                 'time.days': '天',
                 'settings.apiSettings': 'API 设置',
+                'settings.search': '搜索设置…',
                 'settings.enableApiKey': '启用 API Key 验证',
                 'settings.enableApiKeyHint': '开启后，所有调用 /v1/messages /v1/chat/completions /v1/responses 的请求都必须携带 Bearer 密钥。在「API 密钥」标签页管理。',
                 'settings.apiKeyMoved': 'API 密钥已迁移至独立的「API 密钥」标签页，可创建多个密钥并各自设置每日上限（请求 / Tokens / Credits）。',
@@ -1831,6 +1427,9 @@
                 'api.modelListHint': '返回 Anthropic 标准模型 ID（如 claude-opus-4-7、claude-sonnet-4-5），便于 Claude Code 等客户端识别。',
                 'api.stats': '统计数据',
                 'api.statsHint': '需要在请求头中携带 API Key 鉴权（Authorization: Bearer sk-xxx），未启用 API Key 验证时无需鉴权',
+                'api.keyStatus': '密钥状态（客户）',
+                'api.quickstart': '快速开始',
+                'api.quickstartHint': '把任意 Anthropic / OpenAI SDK 的 base URL 指向本网关即可，无需改动其他代码。',
                 'api.responsesHint': '兼容 OpenAI Responses API（Codex CLI 使用）。支持 input/instructions、tools、reasoning、流式 SSE 事件（response.created / response.output_text.delta / response.completed 等）。',
                 'detail.title': '账号详情',
                 'detail.basicInfo': '基本信息',
@@ -2056,6 +1655,11 @@
                 'login.error': 'Wrong password',
                 'login.connectError': 'Connection failed',
                 'status.running': 'Running',
+                'nav.overview': 'Overview',
+                'overview.requests14': 'Requests · 14d',
+                'overview.credits14': 'Credits · 14d',
+                'overview.topModels': 'Top models',
+                'overview.health': 'Pool health',
                 'stats.accounts': 'Accounts',
                 'stats.available': 'Available',
                 'stats.requests': 'Requests',
@@ -2165,6 +1769,7 @@
                 'time.hours': 'hr',
                 'time.days': 'd',
                 'settings.apiSettings': 'API Settings',
+                'settings.search': 'Search settings…',
                 'settings.enableApiKey': 'Require API key on all client requests',
                 'settings.enableApiKeyHint': 'When on, every call to /v1/messages, /v1/chat/completions and /v1/responses must include a Bearer key. Manage keys in the API Keys tab.',
                 'settings.apiKeyMoved': 'API keys are managed in the dedicated API Keys tab. Create multiple keys, each with optional daily limits (requests / tokens / credits).',
@@ -2226,6 +1831,9 @@
                 'api.modelListHint': 'Returns canonical Anthropic model IDs (e.g. claude-opus-4-7, claude-sonnet-4-5) so Claude Code recognizes them in its picker.',
                 'api.stats': 'Statistics',
                 'api.statsHint': 'Requires API Key in header (Authorization: Bearer sk-xxx). No auth needed if API Key verification is disabled.',
+                'api.keyStatus': 'Key status (customer)',
+                'api.quickstart': 'Quickstart',
+                'api.quickstartHint': 'Point any Anthropic / OpenAI SDK base URL at this gateway — no other code changes.',
                 'api.responsesHint': 'OpenAI Responses API compatible (used by Codex CLI). Supports input/instructions, tools, reasoning, and full SSE streaming (response.created / response.output_text.delta / response.completed, etc).',
                 'detail.title': 'Account Details',
                 'detail.basicInfo': 'Basic Info',
@@ -2608,6 +2216,9 @@
             document.getElementById('responsesEndpoint').textContent = baseUrl + '/v1/responses';
             document.getElementById('modelsEndpoint').textContent = baseUrl + '/v1/models';
             document.getElementById('statsEndpoint').textContent = baseUrl + '/v1/stats';
+            const ksEl = document.getElementById('keystatusEndpoint');
+            if (ksEl) ksEl.textContent = baseUrl + '/v1/key-status';
+            renderApiCode();
             // 自动检查更新
             setTimeout(() => checkUpdate(false), 2000);
         }
@@ -3232,7 +2843,7 @@
             const container = document.getElementById('apikeysList');
             if (!container) return;
             if (apikeysData.length === 0) {
-                container.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:30px 0">' + t('apikeys.empty') + '</p>';
+                container.innerHTML = '<div class="empty">' + t('apikeys.empty') + '</div>';
                 return;
             }
             container.innerHTML = apikeysData.map(k => {
@@ -3270,15 +2881,15 @@
                 }
                 const flagsRow = flags.length === 0 ? '' :
                     '<div style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0;font-size:11px">' +
-                    flags.map(f => '<span style="background:#f1f5f9;padding:2px 8px;border-radius:10px;color:#475569">' + f + '</span>').join('') +
+                    flags.map(f => '<span style="background:var(--surface-3);border:1px solid var(--border);padding:2px 9px;border-radius:999px;color:var(--muted)">' + escapeHTML(f) + '</span>').join('') +
                     '</div>';
                 return '<div class="account-card ' + statusClass + '">' +
                     '<div class="account-header">' +
                     '<div class="account-info">' +
-                    '<div class="account-email">' + escapeHTML(k.name || '(unnamed)') + ' ' + statusBadge + ' <span style="color:#94a3b8;font-size:11px;margin-left:6px">' + periodLabel + ' · ' + tzLabel + '</span></div>' +
-                    '<div class="account-meta"><code id="apikey-' + k.id + '" style="background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:11px">' + escapeHTML(k.key) + '</code>' +
-                    '<button class="btn btn-sm" style="margin-left:6px;padding:2px 8px;font-size:11px" title="' + t('common.copy') + '" onclick="copyApiKey(\'' + k.id + '\')">📋</button>' +
-                    '<span style="font-size:11px;color:#94a3b8;margin-left:8px">' + t('apikeys.maskedHint') + '</span></div>' +
+                    '<div class="account-email">' + escapeHTML(k.name || '(unnamed)') + ' ' + statusBadge + ' <span style="color:var(--faint);font-size:11px;margin-left:6px">' + escapeHTML(periodLabel) + ' · ' + escapeHTML(tzLabel) + '</span></div>' +
+                    '<div class="account-meta"><code id="apikey-' + k.id + '" style="background:var(--surface-3);border:1px solid var(--border);padding:2px 7px;border-radius:5px;font-size:11px;font-family:var(--mono)">' + escapeHTML(k.key) + '</code>' +
+                    '<button class="btn btn-sm btn-secondary" style="margin-left:6px;padding:3px 9px;font-size:11px" title="' + t('common.copy') + '" onclick="copyApiKey(\'' + k.id + '\')">📋</button>' +
+                    '<span style="font-size:11px;color:var(--faint);margin-left:8px">' + t('apikeys.maskedHint') + '</span></div>' +
                     '</div>' +
                     '<div class="account-actions">' +
                     '<button class="btn btn-sm btn-secondary" onclick="editApiKey(\'' + k.id + '\')">' + t('common.edit') + '</button>' +
@@ -3322,16 +2933,16 @@
             })();
             const lazy = v('lazyExpirySeconds', 0);
             const lazyDays = lazy > 0 ? (lazy / 86400) : '';
-            const sectionStyle = 'border:1px solid #e5e7eb;border-radius:8px;padding:12px;margin-bottom:12px;background:#fafbfc';
-            const sectionTitle = (txt) => '<div style="font-weight:600;color:#1f2937;font-size:13px;margin-bottom:8px">' + txt + '</div>';
+            const sectionStyle = 'border:1px solid var(--border);border-radius:var(--r-md);padding:14px;margin-bottom:12px;background:var(--surface-2)';
+            const sectionTitle = (txt) => '<div style="font-weight:620;color:var(--text);font-size:13px;margin-bottom:10px">' + txt + '</div>';
             return (
                 // Basic
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.basic')) +
                 '<div class="form-group"><label>' + t('apikeys.name') + '</label><input type="text" id="' + prefix + 'KeyName" value="' + escape(v('name', '')) + '" placeholder="my-app"></div>' +
                 '<div class="form-group"><label>Allowed Models</label>' +
-                '<div id="' + prefix + 'KeyModelsChecks" data-current="' + escape((Array.isArray(v('models', [])) ? v('models', []) : []).join(',')) + '" style="border:1px solid #e5e7eb;border-radius:6px;padding:8px;background:#fff;max-height:180px;overflow-y:auto;font-size:12px">Loading models…</div>' +
+                '<div id="' + prefix + 'KeyModelsChecks" data-current="' + escape((Array.isArray(v('models', [])) ? v('models', []) : []).join(',')) + '" style="border:1px solid var(--border-strong);border-radius:var(--r-sm);padding:8px;background:var(--surface);max-height:180px;overflow-y:auto;font-size:12px">Loading models…</div>' +
                 '<input type="text" id="' + prefix + 'KeyModelsExtra" value="" placeholder="extra ids not in the list, comma-separated (rare)" style="margin-top:6px;font-size:12px">' +
-                '<small style="color:#64748b;font-size:12px;display:block;margin-top:4px">Tick the models this key may invoke. Default (none ticked) = all models allowed. Dotted/dashed forms (claude-opus-4.7 ↔ claude-opus-4-7) match interchangeably; calls to disallowed models are rejected before any upstream account is touched, and /v1/models returns only the allowed entries when this key is used. The extra-ids field is for models not yet in the catalog (e.g. preview ids).</small>' +
+                '<small class="field-hint">Tick the models this key may invoke. Default (none ticked) = all models allowed. Dotted/dashed forms (claude-opus-4.7 ↔ claude-opus-4-7) match interchangeably; calls to disallowed models are rejected before any upstream account is touched, and /v1/models returns only the allowed entries when this key is used. The extra-ids field is for models not yet in the catalog (e.g. preview ids).</small>' +
                 '</div>' +
                 '</div>' +
                 // Periodic
@@ -3354,15 +2965,15 @@
                 '</div></div>' +
                 // Lifetime
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.lifetime')) +
-                '<small style="color:#64748b;font-size:12px;display:block;margin-bottom:8px">' + t('apikeys.lifetimeHint') + '</small>' +
+                '<small class="field-hint" style="margin-top:0;margin-bottom:8px">' + t('apikeys.lifetimeHint') + '</small>' +
                 '<div class="form-group"><label>' + t('apikeys.lifetimeReq') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyLifeReq" value="' + (v('lifetimeReqLimit', 0)) + '" min="0"></div>' +
                 '<div class="form-group"><label>' + t('apikeys.lifetimeTok') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyLifeTok" value="' + (v('lifetimeTokLimit', 0)) + '" min="0"></div>' +
                 '<div class="form-group"><label>' + t('apikeys.lifetimeCred') + ' (0 = ∞)</label><input type="number" id="' + prefix + 'KeyLifeCred" value="' + (v('lifetimeCredLimit', 0)) + '" min="0" step="0.01"></div>' +
                 '</div>' +
                 // Expiry
                 '<div style="' + sectionStyle + '">' + sectionTitle(t('apikeys.section.expiry')) +
-                '<div class="form-group"><label>' + t('apikeys.absoluteExpiry') + '</label><input type="datetime-local" id="' + prefix + 'KeyExpAbs" value="' + expiresAtIso + '"><small style="color:#64748b;font-size:12px">' + t('apikeys.absoluteHint') + '</small></div>' +
-                '<div class="form-group"><label>' + t('apikeys.lazyExpiry') + '</label><input type="number" id="' + prefix + 'KeyLazyDays" value="' + lazyDays + '" min="0" step="1" placeholder="0"><small style="color:#64748b;font-size:12px">' + t('apikeys.lazyHint') + '</small></div>' +
+                '<div class="form-group"><label>' + t('apikeys.absoluteExpiry') + '</label><input type="datetime-local" id="' + prefix + 'KeyExpAbs" value="' + expiresAtIso + '"><small class="field-hint">' + t('apikeys.absoluteHint') + '</small></div>' +
+                '<div class="form-group"><label>' + t('apikeys.lazyExpiry') + '</label><input type="number" id="' + prefix + 'KeyLazyDays" value="' + lazyDays + '" min="0" step="1" placeholder="0"><small class="field-hint">' + t('apikeys.lazyHint') + '</small></div>' +
                 '</div>'
             );
         }
@@ -3589,22 +3200,45 @@
             const d = await res.json();
             renderModelStats(d.models || {});
             renderKeyStats();
+            renderAnalyticsTrend();
+        }
+        // renderAnalyticsTrend draws the 14-day requests/credits sparklines on the
+        // Analytics tab, reusing the same history endpoint + sparkline helper the
+        // Overview uses. Theme-aware colors are read live so a theme toggle repaints.
+        async function renderAnalyticsTrend() {
+            const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#6366f1';
+            const success = getComputedStyle(document.documentElement).getPropertyValue('--success').trim() || '#22c55e';
+            try {
+                const res = await fetch('/admin/api/stats/history?scope=global&days=14', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                const entries = d.entries || [];
+                const reqs = entries.map(e => e.requests || 0);
+                const creds = entries.map(e => +(e.credits || 0));
+                const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                setText('anReqValue', formatNum(reqs.reduce((a, b) => a + b, 0)));
+                setText('anCredValue', creds.reduce((a, b) => a + b, 0).toFixed(1));
+                const rs = document.getElementById('anReqSpark'); if (rs) rs.innerHTML = sparkline(reqs, accent);
+                const cs = document.getElementById('anCredSpark'); if (cs) cs.innerHTML = sparkline(creds, success);
+                const first = entries[0]?.date || '', last = entries[entries.length - 1]?.date || '';
+                setText('anReqStart', first); setText('anReqEnd', last);
+                setText('anCredStart', first); setText('anCredEnd', last);
+            } catch (e) { /* leave charts empty on error */ }
         }
         function renderModelStats(models) {
             const container = document.getElementById('modelStatsList');
             if (!container) return;
             const entries = Object.entries(models).sort((a, b) => (b[1].credits || 0) - (a[1].credits || 0));
             if (entries.length === 0) {
-                container.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:30px 0">' + t('analytics.empty') + '</p>';
+                container.innerHTML = '<div class="empty">' + t('analytics.empty') + '</div>';
                 return;
             }
             const maxCredits = Math.max(...entries.map(e => e[1].credits || 0)) || 1;
             container.innerHTML = entries.map(([model, s]) => {
                 const pct = ((s.credits || 0) / maxCredits) * 100;
-                return '<div style="margin-bottom:12px">' +
-                    '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">' +
-                    '<span style="font-weight:500">' + model + '</span>' +
-                    '<span style="color:#64748b;font-variant-numeric:tabular-nums">' + (s.requests || 0) + ' req · ' + formatNum(s.tokens || 0) + ' tok · ' + (s.credits || 0).toFixed(2) + ' cr</span>' +
+                return '<div style="margin-bottom:14px">' +
+                    '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;gap:10px">' +
+                    '<span style="font-weight:540;font-family:var(--mono)">' + escapeHTML(model) + '</span>' +
+                    '<span style="color:var(--muted);font-variant-numeric:tabular-nums">' + (s.requests || 0) + ' req · ' + formatNum(s.tokens || 0) + ' tok · ' + (s.credits || 0).toFixed(2) + ' cr</span>' +
                     '</div>' +
                     '<div class="usage-bar"><div class="usage-fill" style="width:' + pct + '%"></div></div>' +
                     renderEffortBreakdown(s.effort) +
@@ -3626,16 +3260,17 @@
                 const e = effort[l];
                 const isDefault = l === 'default';
                 const label = isDefault ? t('analytics.effortDefault') : l;
-                const bg = isDefault ? '#1e293b' : '#0e2a47';
-                const fg = isDefault ? '#94a3b8' : '#7dd3fc';
+                const bg = isDefault ? 'var(--surface-3)' : 'var(--accent-soft)';
+                const fg = isDefault ? 'var(--muted)' : 'var(--accent)';
+                const bd = isDefault ? 'var(--border)' : 'var(--accent-border)';
                 return '<span title="' + (e.requests || 0) + ' req · ' + formatNum(e.tokens || 0) + ' tok · ' + (e.credits || 0).toFixed(2) + ' cr" ' +
-                    'style="display:inline-flex;gap:6px;align-items:center;background:' + bg + ';color:' + fg + ';border-radius:6px;padding:2px 8px;font-size:11px;font-variant-numeric:tabular-nums">' +
-                    '<b style="font-weight:600;text-transform:uppercase;letter-spacing:.3px">' + label + '</b>' +
-                    '<span style="color:#64748b">' + (e.requests || 0) + ' req · ' + formatNum(e.tokens || 0) + ' tok</span>' +
+                    'style="display:inline-flex;gap:6px;align-items:center;background:' + bg + ';color:' + fg + ';border:1px solid ' + bd + ';border-radius:999px;padding:2px 9px;font-size:11px;font-variant-numeric:tabular-nums">' +
+                    '<b style="font-weight:600;text-transform:uppercase;letter-spacing:.3px">' + escapeHTML(label) + '</b>' +
+                    '<span style="opacity:.75">' + (e.requests || 0) + ' req · ' + formatNum(e.tokens || 0) + ' tok</span>' +
                     '</span>';
             }).join('');
-            return '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">' +
-                '<span style="font-size:11px;color:#475569;align-self:center">' + t('analytics.effortLabel') + '</span>' + chips +
+            return '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">' +
+                '<span style="font-size:11px;color:var(--muted);align-self:center">' + t('analytics.effortLabel') + '</span>' + chips +
                 '</div>';
         }
         function renderKeyStats() {
@@ -3643,17 +3278,17 @@
             if (!container) return;
             const keys = (apikeysData || []).filter(k => (k.totalRequests || 0) > 0);
             if (keys.length === 0) {
-                container.innerHTML = '<p style="text-align:center;color:#94a3b8;padding:30px 0">' + t('analytics.noKeys') + '</p>';
+                container.innerHTML = '<div class="empty">' + t('analytics.noKeys') + '</div>';
                 return;
             }
             keys.sort((a, b) => (b.totalCredits || 0) - (a.totalCredits || 0));
             const maxCredits = Math.max(...keys.map(k => k.totalCredits || 0)) || 1;
             container.innerHTML = keys.map(k => {
                 const pct = ((k.totalCredits || 0) / maxCredits) * 100;
-                return '<div style="margin-bottom:12px">' +
-                    '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">' +
-                    '<span style="font-weight:500">' + (k.name || k.id) + '</span>' +
-                    '<span style="color:#64748b;font-variant-numeric:tabular-nums">' + (k.totalRequests || 0) + ' req · ' + formatNum(k.totalTokens || 0) + ' tok · ' + (k.totalCredits || 0).toFixed(2) + ' cr</span>' +
+                return '<div style="margin-bottom:14px">' +
+                    '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;gap:10px">' +
+                    '<span style="font-weight:540">' + escapeHTML(k.name || k.id) + '</span>' +
+                    '<span style="color:var(--muted);font-variant-numeric:tabular-nums">' + (k.totalRequests || 0) + ' req · ' + formatNum(k.totalTokens || 0) + ' tok · ' + (k.totalCredits || 0).toFixed(2) + ' cr</span>' +
                     '</div>' +
                     '<div class="usage-bar"><div class="usage-fill" style="width:' + pct + '%"></div></div>' +
                     '</div>';
@@ -4832,6 +4467,405 @@
             } catch (e) { }
             loadAccounts();
         }
+
+
+        // ====== renderAccounts (table) ======
+        // Client-side sort state for the accounts table. null = server order.
+        let acctSortKey = null, acctSortDir = -1;
+        function renderAccounts() {
+            const container = document.getElementById('accountsList');
+            if (!container) return;
+            let filtered = getFilteredAccounts();
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/></svg><div>' + t('accounts.empty') + '</div></div>';
+                return;
+            }
+            if (acctSortKey) {
+                filtered = filtered.slice().sort((a, b) => {
+                    const va = accountSortValue(a, acctSortKey), vb = accountSortValue(b, acctSortKey);
+                    if (va < vb) return -1 * acctSortDir;
+                    if (va > vb) return 1 * acctSortDir;
+                    return 0;
+                });
+            }
+            const ind = k => acctSortKey === k ? '<span class="sort-ind">' + (acctSortDir < 0 ? '▼' : '▲') + '</span>' : '<span class="sort-ind">⇅</span>';
+            const sc = k => acctSortKey === k ? ' sorted' : '';
+            const th = (k, label, extra) => '<th class="sortable' + sc(k) + (extra || '') + '" onclick="sortAccounts(\'' + k + '\')">' + label + ind(k) + '</th>';
+            const head = '<thead><tr>' +
+                '<th style="width:34px"><input type="checkbox" id="selectAllCheckboxTable" onchange="toggleSelectAll(this.checked)" style="width:15px;height:15px;cursor:pointer"></th>' +
+                th('email', t('accounts.title')) +
+                th('plan', t('detail.subscriptionType')) +
+                th('usage', t('accounts.mainQuota')) +
+                th('requests', t('accounts.requests'), ' cell-num') +
+                th('tokens', t('accounts.tokens'), ' cell-num') +
+                th('credits', t('accounts.credits'), ' cell-num') +
+                th('expiry', t('accounts.expiry')) +
+                th('weight', t('accounts.weight')) +
+                '<th style="text-align:right"> </th>' +
+                '</tr></thead>';
+
+            const body = filtered.map(a => {
+                const usagePercent = (a.usagePercent || 0) * 100;
+                const usageClass = usagePercent > 90 ? 'critical' : usagePercent > 70 ? 'high' : '';
+                const trialPercent = (a.trialUsagePercent || 0) * 100;
+                const trialClass = trialPercent > 90 ? 'critical' : trialPercent > 70 ? 'high' : '';
+                const isSelected = selectedAccounts.has(a.id);
+                const weightVal = a.weight || 0;
+                let rowCls = '';
+                if (!a.enabled) rowCls += ' is-disabled';
+                if (isSelected) rowCls += ' is-selected';
+
+                const weightBadge = weightVal >= 2 ? '<span class="badge badge-warning">W:' + weightVal + '</span>' : '';
+                const overageBadge = a.allowOverage ? '<span class="badge badge-warning">' + t('accounts.overage') + ':' + (a.overageWeight || 1) + '</span>' : '';
+                const metaBadges = getSubBadge(a.subscriptionType) + getTrialBadge(a) + getStatusBadge(a) + weightBadge + overageBadge;
+
+                let usageCell = '<span style="color:var(--faint)">—</span>';
+                if (a.usageLimit > 0) {
+                    usageCell = '<div class="mini-usage"><div class="usage-bar"><div class="usage-fill ' + usageClass + '" style="width:' + usagePercent + '%"></div></div>' +
+                        '<div class="usage-text"><span>' + (a.usageCurrent?.toFixed(1) || 0) + ' / ' + (a.usageLimit?.toFixed(0) || 0) + '</span><span>' + usagePercent.toFixed(0) + '%</span></div></div>';
+                }
+                if (a.trialUsageLimit > 0) {
+                    usageCell += '<div class="mini-usage" style="margin-top:6px"><div class="usage-label" style="font-size:10px">' + t('accounts.trialQuota') + ' ' + formatTrialExpiry(a.trialExpiresAt) + '</div><div class="usage-bar"><div class="usage-fill ' + trialClass + '" style="width:' + trialPercent + '%"></div></div></div>';
+                }
+
+                const weightSelect = '<select onchange="quickSetWeight(\'' + a.id + '\',this.value)" class="weight-select">' +
+                    [0, 1, 2, 3, 4, 5].map(w => '<option value="' + w + '"' + (weightVal === w ? ' selected' : '') + '>' + w + '</option>').join('') +
+                    '</select>';
+
+                const inflight = (a.inflight !== undefined) ? '<div class="acct-sub num" title="' + t('accounts.inflightHint') + '">' + t('accounts.inflight') + ' ' + (a.inflight || 0) + '/' + (a.concurrencyLimit || 0) + '</div>' : '';
+
+                const actions = '<div class="row-actions">' +
+                    '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccount(\'' + a.id + '\')" title="' + t('accounts.refresh') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
+                    '<button class="btn btn-sm btn-icon btn-secondary" onclick="showDetail(\'' + a.id + '\')" title="' + t('accounts.detail') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/></svg></button>' +
+                    '<button class="btn btn-sm btn-icon btn-secondary" onclick="copyAccountJSON(\'' + a.id + '\', this)" title="' + t('accounts.copyJSON') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>' +
+                    (a.banStatus && a.banStatus !== 'ACTIVE' ? '' :
+                        '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>') +
+                    '<button class="btn btn-sm ' + (a.allowOverage ? 'btn-warning' : 'btn-secondary') + '" onclick="toggleOverage(\'' + a.id + '\',' + !a.allowOverage + ')" title="' + t('accounts.overageToggleHint') + '">' + (a.allowOverage ? t('accounts.overageOn') : t('accounts.overageOff')) + '</button>' +
+                    '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff;border-color:#2563eb">' + t('accounts.test') + '</button>' +
+                    '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
+                    '</div>';
+
+                return '<tr class="' + rowCls.trim() + '">' +
+                    '<td><input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="toggleSelectAccount(\'' + a.id + '\')" style="cursor:pointer;width:15px;height:15px"></td>' +
+                    '<td><div class="acct-email">' + getDisplayEmail(a.email, a.id) + '</div><div class="row-meta"><span class="badge badge-info">' + formatAuthMethod(a.provider || a.authMethod) + '</span></div></td>' +
+                    '<td><div class="row-meta">' + metaBadges + '</div></td>' +
+                    '<td>' + usageCell + '</td>' +
+                    '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
+                    '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
+                    '<td class="cell-num">' + (a.totalCredits || 0).toFixed(1) + '</td>' +
+                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + '</td>' +
+                    '<td>' + weightSelect + '</td>' +
+                    '<td>' + actions + '</td>' +
+                    '</tr>';
+            }).join('');
+
+            container.innerHTML = '<div class="table-wrap"><table class="data-table">' + head + '<tbody>' + body + '</tbody></table></div>';
+
+            // Keep both "select all" checkboxes (toolbar + table header) in sync.
+            const all = filtered.length > 0 && filtered.every(x => selectedAccounts.has(x.id));
+            const cbTop = document.getElementById('selectAllCheckbox');
+            const cbTbl = document.getElementById('selectAllCheckboxTable');
+            if (cbTop) cbTop.checked = all;
+            if (cbTbl) cbTbl.checked = all;
+        }
+
+        // ============================================================
+        // UI overhaul layer — appended last so these function
+        // declarations override the originals in the shared script
+        // scope. All data-fetching / auth / websocket logic above is
+        // reused unchanged; only presentation is replaced here.
+        // ============================================================
+
+        // ---- Theme (auto / light / dark, persisted) ----
+        function applyStoredTheme() {
+            const saved = localStorage.getItem('kiro_theme');
+            if (saved === 'light' || saved === 'dark') {
+                document.documentElement.setAttribute('data-theme', saved);
+            } else {
+                document.documentElement.removeAttribute('data-theme');
+            }
+        }
+        function currentEffectiveTheme() {
+            const attr = document.documentElement.getAttribute('data-theme');
+            if (attr) return attr;
+            return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        function toggleTheme() {
+            const next = currentEffectiveTheme() === 'dark' ? 'light' : 'dark';
+            localStorage.setItem('kiro_theme', next);
+            document.documentElement.setAttribute('data-theme', next);
+            // Repaint charts so stroke colors match the new theme.
+            if (!document.getElementById('tabOverview').classList.contains('hidden')) loadOverview();
+        }
+
+        // ---- Section navigation (sidebar) ----
+        const SECTION_TITLE_KEY = {
+            overview: 'nav.overview', accounts: 'tabs.accounts', apikeys: 'tabs.apikeys',
+            analytics: 'tabs.analytics', settings: 'tabs.settings', api: 'tabs.api'
+        };
+        const VALID_TABS = ['overview', 'accounts', 'apikeys', 'analytics', 'settings', 'api'];
+        // updateHash controls whether switchTab writes location.hash. It's false
+        // only when switchTab is itself driven BY a hash change (so we don't
+        // recurse through the hashchange listener).
+        function switchTab(tab, updateHash) {
+            if (VALID_TABS.indexOf(tab) === -1) tab = 'overview';
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+            const target = document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1));
+            if (target) target.classList.remove('hidden');
+            const titleEl = document.getElementById('sectionTitle');
+            if (titleEl) { titleEl.setAttribute('data-i18n', SECTION_TITLE_KEY[tab] || 'nav.overview'); titleEl.textContent = t(SECTION_TITLE_KEY[tab] || 'nav.overview'); }
+            // Persist the section in the URL hash so a refresh (or a shared link)
+            // restores the same section instead of snapping back to Overview.
+            if (updateHash !== false && location.hash !== '#' + tab) {
+                try { history.replaceState(null, '', '#' + tab); } catch (e) { location.hash = tab; }
+            }
+            if (tab === 'overview') loadOverview();
+            else if (tab === 'apikeys') loadApiKeys();
+            else if (tab === 'analytics') {
+                // Ensure the per-key stats source is populated BEFORE rendering.
+                // On a fresh login restored to #analytics, apikeysData is empty
+                // and loadApiKeys() is async — awaiting it (vs. fire-and-forget)
+                // is what stops the key-stats panel rendering blank.
+                if (apikeysData.length === 0) { loadApiKeys().then(loadAnalytics); }
+                else { loadAnalytics(); }
+            }
+        }
+        // currentHashTab returns the tab named by the URL hash, or '' if none/invalid.
+        function currentHashTab() {
+            const raw = (location.hash || '').replace(/^#/, '');
+            return VALID_TABS.indexOf(raw) !== -1 ? raw : '';
+        }
+        // React to back/forward and manual hash edits while logged in.
+        window.addEventListener('hashchange', function () {
+            if (document.getElementById('mainPage').classList.contains('hidden')) return;
+            const tab = currentHashTab() || 'overview';
+            switchTab(tab, false);
+        });
+
+        // ---- Accounts table sorting ----
+        function accountSortValue(a, key) {
+            switch (key) {
+                case 'email': return (a.email || a.id || '').toLowerCase();
+                case 'plan': return (a.subscriptionType || '').toLowerCase();
+                case 'usage': return (a.usagePercent || 0);
+                case 'requests': return (a.requestCount || 0);
+                case 'tokens': return (a.totalTokens || 0);
+                case 'credits': return (a.totalCredits || 0);
+                case 'expiry': return (a.expiresAt || 0);
+                case 'weight': return (a.weight || 0);
+                default: return 0;
+            }
+        }
+        function sortAccounts(key) {
+            if (acctSortKey === key) { acctSortDir *= -1; }
+            else { acctSortKey = key; acctSortDir = (key === 'email' || key === 'plan') ? 1 : -1; }
+            renderAccounts();
+        }
+
+        // ---- API tab: copy-ready code samples ----
+        let apiLang = 'curl';
+        function setApiLang(lang) {
+            apiLang = lang;
+            document.querySelectorAll('#apiLangSeg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.lang === lang));
+            renderApiCode();
+        }
+        function renderApiCode() {
+            const pre = document.getElementById('apiCodeSample');
+            if (!pre) return;
+            const base = baseUrl;
+            const model = 'claude-sonnet-4-5';
+            const samples = {
+                curl:
+'curl ' + base + '/v1/messages \\\n' +
+'  -H "Content-Type: application/json" \\\n' +
+'  -H "anthropic-version: 2023-06-01" \\\n' +
+'  -H "Authorization: Bearer sk-kg-..." \\\n' +
+'  -d \'{\n' +
+'    "model": "' + model + '",\n' +
+'    "max_tokens": 1024,\n' +
+'    "messages": [{"role": "user", "content": "Hello!"}]\n' +
+'  }\'',
+                python:
+'import anthropic\n\n' +
+'client = anthropic.Anthropic(\n' +
+'    base_url="' + base + '",\n' +
+'    api_key="sk-kg-...",\n' +
+')\n\n' +
+'msg = client.messages.create(\n' +
+'    model="' + model + '",\n' +
+'    max_tokens=1024,\n' +
+'    messages=[{"role": "user", "content": "Hello!"}],\n' +
+')\n' +
+'print(msg.content[0].text)',
+                node:
+"import Anthropic from '@anthropic-ai/sdk';\n\n" +
+'const client = new Anthropic({\n' +
+"  baseURL: '" + base + "',\n" +
+"  apiKey: 'sk-kg-...',\n" +
+'});\n\n' +
+'const msg = await client.messages.create({\n' +
+"  model: '" + model + "',\n" +
+'  max_tokens: 1024,\n' +
+"  messages: [{ role: 'user', content: 'Hello!' }],\n" +
+'});\n' +
+'console.log(msg.content[0].text);',
+                openai:
+'from openai import OpenAI\n\n' +
+'client = OpenAI(\n' +
+'    base_url="' + base + '/v1",\n' +
+'    api_key="sk-kg-...",\n' +
+')\n\n' +
+'resp = client.chat.completions.create(\n' +
+'    model="gpt-4o",  # mapped to a Claude model upstream\n' +
+'    messages=[{"role": "user", "content": "Hello!"}],\n' +
+')\n' +
+'print(resp.choices[0].message.content)'
+            };
+            pre.textContent = samples[apiLang] || samples.curl;
+        }
+        function copyCode() {
+            const pre = document.getElementById('apiCodeSample');
+            if (pre) copyValue(pre.textContent);
+        }
+
+        // ---- Settings search: filter the setting cards by their text ----
+        function filterSettings() {
+            const q = (document.getElementById('settingsSearch').value || '').trim().toLowerCase();
+            const tab = document.getElementById('tabSettings');
+            if (!tab) return;
+            // Each direct .card child is one settings group. Show/hide by whether
+            // its visible text contains the query. The search box itself is not a
+            // .card, so it's never hidden.
+            tab.querySelectorAll(':scope > .card').forEach(card => {
+                if (!q) { card.classList.remove('filtered-out'); return; }
+                const text = (card.textContent || '').toLowerCase();
+                card.classList.toggle('filtered-out', text.indexOf(q) === -1);
+            });
+        }
+
+        // ---- Sparkline SVG ----
+        function sparkline(values, color) {
+            const w = 320, h = 72, pad = 4;
+            if (!values || values.length === 0) values = [0];
+            if (values.length === 1) values = [values[0], values[0]];
+            const max = Math.max(...values, 1), min = Math.min(...values, 0);
+            const range = (max - min) || 1;
+            const n = values.length;
+            const x = i => pad + (i * (w - 2 * pad)) / (n - 1);
+            const y = v => (h - pad) - ((v - min) / range) * (h - 2 * pad);
+            let line = '', area = '';
+            values.forEach((v, i) => {
+                const px = x(i).toFixed(1), py = y(v).toFixed(1);
+                line += (i === 0 ? 'M' : 'L') + px + ' ' + py + ' ';
+            });
+            area = line + 'L' + x(n - 1).toFixed(1) + ' ' + (h - pad) + ' L' + x(0).toFixed(1) + ' ' + (h - pad) + ' Z';
+            const gid = 'g' + Math.random().toString(36).slice(2, 8);
+            return '<svg class="chart-svg" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' +
+                '<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
+                '<stop offset="0%" stop-color="' + color + '" stop-opacity="0.22"/>' +
+                '<stop offset="100%" stop-color="' + color + '" stop-opacity="0"/></linearGradient></defs>' +
+                '<path d="' + area + '" fill="url(#' + gid + ')"/>' +
+                '<path d="' + line + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>' +
+                '</svg>';
+        }
+
+        // ---- Overview section ----
+        async function loadOverview() {
+            const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#6366f1';
+            const success = getComputedStyle(document.documentElement).getPropertyValue('--success').trim() || '#22c55e';
+            // Trend sparklines from persisted daily history.
+            try {
+                const res = await fetch('/admin/api/stats/history?scope=global&days=14', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                const entries = (d.entries || []);
+                const reqs = entries.map(e => e.requests || 0);
+                const creds = entries.map(e => +(e.credits || 0));
+                const reqSum = reqs.reduce((a, b) => a + b, 0);
+                const credSum = creds.reduce((a, b) => a + b, 0);
+                document.getElementById('ovReqValue').textContent = formatNum(reqSum);
+                document.getElementById('ovCredValue').textContent = credSum.toFixed(1);
+                document.getElementById('ovReqSpark').innerHTML = sparkline(reqs, accent);
+                document.getElementById('ovCredSpark').innerHTML = sparkline(creds, success);
+                const first = entries[0]?.date || '', last = entries[entries.length - 1]?.date || '';
+                document.getElementById('ovReqStart').textContent = first;
+                document.getElementById('ovReqEnd').textContent = last;
+                document.getElementById('ovCredStart').textContent = first;
+                document.getElementById('ovCredEnd').textContent = last;
+            } catch (e) {
+                document.getElementById('ovReqSpark').innerHTML = '<div class="empty" style="padding:18px">' + t('analytics.empty') + '</div>';
+                document.getElementById('ovCredSpark').innerHTML = '';
+            }
+            // Top models by credits.
+            try {
+                const res = await fetch('/admin/api/modelstats', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                const entries = Object.entries(d.models || {}).sort((a, b) => (b[1].credits || 0) - (a[1].credits || 0)).slice(0, 5);
+                const host = document.getElementById('ovTopModels');
+                if (entries.length === 0) { host.innerHTML = '<div class="empty" style="padding:18px">' + t('analytics.empty') + '</div>'; }
+                else {
+                    const maxC = Math.max(...entries.map(e => e[1].credits || 0)) || 1;
+                    host.innerHTML = entries.map(([m, s]) => {
+                        const pct = ((s.credits || 0) / maxC) * 100;
+                        return '<div class="toplist-row"><span class="toplist-name">' + escapeHTML(m) + '</span>' +
+                            '<span class="toplist-val">' + (s.requests || 0) + ' req · ' + (s.credits || 0).toFixed(1) + ' cr</span>' +
+                            '<div class="usage-bar" style="grid-column:1/3;margin-top:3px"><div class="usage-fill" style="width:' + pct + '%"></div></div></div>';
+                    }).join('');
+                }
+            } catch (e) { }
+            // Pool health from the in-memory accounts list + last status snapshot.
+            renderOverviewHealth();
+        }
+        let lastStatusSnapshot = {};
+        function renderOverviewHealth() {
+            const host = document.getElementById('ovHealth');
+            if (!host) return;
+            const accts = Array.isArray(accountsData) ? accountsData : [];
+            const total = accts.length;
+            const enabled = accts.filter(a => a.enabled).length;
+            const banned = accts.filter(a => a.banStatus && a.banStatus !== 'ACTIVE').length;
+            const noToken = accts.filter(a => !a.hasToken).length;
+            const d = lastStatusSnapshot || {};
+            const totalReq = d.totalRequests || 0, ok = d.successRequests || 0;
+            const rate = totalReq > 0 ? (ok / totalReq * 100) : 0;
+            let limitSum = 0, usedSum = 0;
+            for (const a of accts) { if (a.enabled) { limitSum += (a.usageLimit || 0); usedSum += (a.usageCurrent || 0); } }
+            const quotaPct = limitSum > 0 ? (usedSum / limitSum * 100) : 0;
+            const row = (label, val, tone) => '<div class="toplist-row"><span class="toplist-name">' + label + '</span>' +
+                '<span class="toplist-val" style="color:' + (tone || 'var(--text)') + '">' + val + '</span></div>';
+            host.innerHTML =
+                row(t('stats.available'), enabled + ' / ' + total, enabled > 0 ? 'var(--success)' : 'var(--danger)') +
+                row(t('stats.successRate'), totalReq > 0 ? rate.toFixed(1) + '%' : '—', rate >= 90 ? 'var(--success)' : rate >= 70 ? 'var(--warning)' : 'var(--danger)') +
+                row(t('accounts.banned'), String(banned), banned > 0 ? 'var(--danger)' : 'var(--muted)') +
+                row(t('accounts.noToken'), String(noToken), noToken > 0 ? 'var(--warning)' : 'var(--muted)') +
+                row(t('stats.creditsTotal'), limitSum > 0 ? usedSum.toFixed(0) + ' / ' + limitSum.toFixed(0) + ' (' + quotaPct.toFixed(0) + '%)' : '—');
+        }
+
+        // Capture each status snapshot so the health panel can reflect it.
+        (function () {
+            const origRender = renderStatusFromObject;
+            renderStatusFromObject = function (d) {
+                lastStatusSnapshot = d || {};
+                origRender(d);
+                if (!document.getElementById('tabOverview').classList.contains('hidden')) renderOverviewHealth();
+            };
+        })();
+
+        // showMain override: keep WS bootstrap, restore the section from the URL
+        // hash so a refresh stays on the same page instead of snapping to
+        // Overview. Falls back to Overview when there's no (valid) hash.
+        (function () {
+            const orig = showMain;
+            showMain = function () {
+                orig();
+                applyStoredTheme();
+                const tab = currentHashTab() || 'overview';
+                switchTab(tab, false);
+            };
+        })();
+
+        applyStoredTheme();
+
     </script>
 </body>
 
