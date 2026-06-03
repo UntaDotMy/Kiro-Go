@@ -256,6 +256,7 @@ func (h *Handler) dashboardSnapshot() []byte {
 			activeRequests += a.RequestCount
 		}
 		st := poolStats[a.ID]
+		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
 		accountList = append(accountList, map[string]interface{}{
 			"id":                a.ID,
 			"enabled":           a.Enabled,
@@ -274,6 +275,8 @@ func (h *Handler) dashboardSnapshot() []byte {
 			"totalCredits":      st.TotalCredits,
 			"lastUsed":          st.LastUsed,
 			"lastRefresh":       a.LastRefresh,
+			"inflight":          inflight,
+			"concurrencyLimit":  concurrencyLimit,
 		})
 	}
 	payload := map[string]interface{}{

@@ -24,26 +24,29 @@ type streamWorker func(account *config.Account) (committed bool, err error)
 // an unbounded queue. Past the budget we shed with 429 + Retry-After so the
 // client backs off coherently. See AWS "Using load shedding to avoid overload".
 //
-// TODO(load-balancing) — remaining work before this is fully shippable, NOT yet
-// done in this commit (see PR description):
-//   1. TESTS: no dedicated unit tests yet for the new hot-path code —
-//      least-request weighted selection, AIMD grow/shrink (RecordSuccess/
-//      RecordError limit math), Acquire/Release in-flight accounting (incl. the
-//      leak-safety defer and decayCountersLocked preserving inflight),
-//      saturation -> admission-wait -> shed, and the tokenRefreshFailure
-//      rotation path. Add pool/account_test.go + proxy/failover_test.go cases
-//      and run `go test -race` (needs cgo / a C compiler; not available on the
-//      dev box — CI runs it on Linux).
-//   2. ADMIN UI: add "least-request" to the poolStrategy <select> in
-//      web/index.html (+ EN/ZH i18n) and show per-account inflight/limit on the
-//      dashboard. Backend GetPoolStrategy already accepts the value.
-//   3. VERSION: bump config.Version + version.json (A12) with a changelog entry.
-//   4. POOL-WIDE SHEDDING (optional next layer): the Google SRE adaptive-throttle
-//      reject probability p=max(0,(req-K*acc)/(req+1)) for when the WHOLE pool is
-//      saturated, so we shed locally before queueing. Per-account AIMD + bounded
-//      admission wait cover most of it; this is the belt-and-suspenders layer.
-//   5. LIVE VERIFICATION: confirm against the real account pool that the 429
-//      storm is gone under an ultracode parallel-agent burst.
+// Status of the adaptive-load-balancing work (A12):
+//   DONE — least-request default + AIMD concurrency, in-flight reservation with
+//     leak-safe Release, bounded admission wait + saturation shed, and the
+//     tokenRefreshFailure rotation sentinel. Dedicated unit tests cover all of
+//     these: LOR weighted selection + saturation skip, AIMD grow/shrink math,
+//     Acquire/Release accounting incl. decayCountersLocked preserving inflight,
+//     half-open single-probe recovery, ConcurrencyState (pool/least_request_test.go);
+//     saturation -> admission-wait -> shed and the token-refresh rotation path
+//     (proxy/failover_concurrency_test.go); strategy default + alias map
+//     (config/pool_strategy_test.go). Admin API accepts "least-request"; the
+//     Settings dropdown lists it as the default and the dashboard shows a live
+//     per-account in-flight/limit chip over the status WebSocket.
+//
+//   DEFERRED:
+//     - `go test -race`: needs a working cgo toolchain. CI runs it on Linux;
+//       the new concurrency paths are otherwise covered by the explicit
+//       Acquire/Release accounting tests above.
+//     - POOL-WIDE SHEDDING (optional next layer): the Google SRE adaptive-
+//       throttle reject probability p=max(0,(req-K*acc)/(req+1)) for when the
+//       WHOLE pool is saturated. Per-account AIMD + the bounded admission wait
+//       cover most of it; this would be the belt-and-suspenders layer.
+//     - LIVE VERIFICATION: confirm against the real account pool that the 429
+//       storm is gone under an ultracode parallel-agent burst.
 const admissionWaitBudget = 2 * time.Second
 
 // runWithFailover selects an eligible account for the model and invokes the

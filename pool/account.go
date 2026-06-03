@@ -517,6 +517,24 @@ func (p *AccountPool) InflightCount(id string) int {
 	return 0
 }
 
+// ConcurrencyState reports an account's live in-flight count and its current
+// AIMD concurrency limit under a single lock, for the dashboard's per-account
+// realtime display. The limit reflects what the picker would enforce right now:
+// an account with no entry yet reports the initial limit. Exposed for admin
+// diagnostics and tests.
+func (p *AccountPool) ConcurrencyState(id string) (inflight, limit int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if cd, ok := p.cooldowns[id]; ok {
+		limit = cd.limit
+		if limit <= 0 {
+			limit = aimdInitialLimit
+		}
+		return cd.inflight, limit
+	}
+	return 0, aimdInitialLimit
+}
+
 // pick is the shared selection core. reserve=true applies the AIMD concurrency
 // gate and increments the winner's in-flight counter (least-request only).
 func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) (*config.Account, time.Duration, bool) {

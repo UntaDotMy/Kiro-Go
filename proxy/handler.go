@@ -4540,10 +4540,10 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 
 	if req.PoolStrategy != nil {
 		strat := strings.ToLower(strings.TrimSpace(*req.PoolStrategy))
-		validStrats := map[string]bool{"": true, "swr": true, "least-used": true, "random": true}
+		validStrats := map[string]bool{"": true, "least-request": true, "swr": true, "least-used": true, "random": true}
 		if !validStrats[strat] {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid poolStrategy, must be: swr, least-used, or random"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid poolStrategy, must be: least-request, swr, least-used, or random"})
 			return
 		}
 		if err := config.UpdatePoolStrategy(strat); err != nil {
