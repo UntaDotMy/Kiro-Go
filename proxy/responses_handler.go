@@ -34,6 +34,18 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		req.Model = "claude-sonnet-4.5"
 	}
 
+	// We are a stateless passthrough — we do not persist Responses to disk or
+	// reconstruct history from a previous_response_id chain. Accepting the field
+	// and silently dropping it would make the model lose all prior context with
+	// no signal to the client. Reject it explicitly so callers know to re-send
+	// the full input each turn (the OpenAI/Codex default) instead of getting
+	// silently degraded answers.
+	if strings.TrimSpace(req.PreviousResponseID) != "" {
+		h.sendResponsesError(w, 400, "invalid_request_error",
+			"previous_response_id is not supported: this server is stateless and does not store prior responses. Resend the full conversation in 'input' each turn.")
+		return
+	}
+
 	if h.enforceAPIKeyLimit(w, r, req.Model) {
 		return
 	}

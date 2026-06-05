@@ -1095,13 +1095,86 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 
 // getContextWindowSize returns the context window size (in tokens) for a model.
 func getContextWindowSize(model string) int {
-	m := strings.ToLower(model)
-	// sonnet-4.6, opus-4.6, opus-4.7 all have 1M context windows
-	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") ||
-		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") {
+	if isLargeContextModel(model) {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+// isLargeContextModel reports whether a Claude model has the 1M-token context
+// window. Claude Opus/Sonnet/Haiku >= 4.6 (and any major >= 5) are 1M; earlier
+// versions are 200K.
+//
+// We version-PARSE rather than substring-match a fixed "4.6"/"4.7" list so new
+// minors (4.8, 4.9, 4.10) and majors (5.x) are classified correctly without a
+// code change. The previous fixed-list form under-reported 4.8+ as 200K — a ~5x
+// under-count of input tokens — even though our model router resolves those ids.
+// A substring fallback covers non-standard identifiers that don't parse cleanly.
+func isLargeContextModel(model string) bool {
+	m := strings.ToLower(model)
+	if major, minor, ok := parseClaudeVersion(m); ok {
+		if major > 4 {
+			return true
+		}
+		if major == 4 && minor >= 6 {
+			return true
+		}
+		return false
+	}
+	// Fallback for ids that don't match the family-version shape.
+	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
+		if strings.Contains(m, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseClaudeVersion extracts the major.minor version from a
+// "claude-<family>-<major>.<minor>" (dot or dash) id without a regexp
+// dependency. Returns ok=false if the id doesn't match that shape.
+func parseClaudeVersion(m string) (major, minor int, ok bool) {
+	const prefix = "claude-"
+	if !strings.HasPrefix(m, prefix) {
+		return 0, 0, false
+	}
+	rest := m[len(prefix):]
+	for _, fam := range []string{"opus", "sonnet", "haiku"} {
+		famPrefix := fam + "-"
+		if !strings.HasPrefix(rest, famPrefix) {
+			continue
+		}
+		ver := rest[len(famPrefix):]
+		// Locate the major/minor separator ('.' or '-').
+		sep := -1
+		for i := 0; i < len(ver); i++ {
+			if ver[i] == '.' || ver[i] == '-' {
+				sep = i
+				break
+			}
+		}
+		if sep < 1 {
+			return 0, 0, false
+		}
+		majStr := ver[:sep]
+		// Minor is the run of digits after the separator (stop at next non-digit).
+		rem := ver[sep+1:]
+		end := 0
+		for end < len(rem) && rem[end] >= '0' && rem[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return 0, 0, false
+		}
+		minStr := rem[:end]
+		maj, errMaj := strconv.Atoi(majStr)
+		min, errMin := strconv.Atoi(minStr)
+		if errMaj != nil || errMin != nil {
+			return 0, 0, false
+		}
+		return maj, min, true
+	}
+	return 0, 0, false
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {

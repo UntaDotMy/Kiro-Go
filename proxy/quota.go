@@ -6,6 +6,8 @@ package proxy
 import (
 	"context"
 	"errors"
+	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,8 +43,76 @@ func (h *Handler) recordPoolError(accountID string, err error) {
 		h.pool.RecordQuotaExhaustion(accountID)
 		return
 	}
+	// Terminal per-account conditions (suspension / revoked-or-invalid auth)
+	// can't be fixed by a cooldown or a peer retry — the account is dead until
+	// the operator intervenes (or, for a transient token issue, the next
+	// background refresh re-validates it). Disable it on THIS request instead of
+	// leaving the picker to keep selecting it until the next refresh tick. The
+	// background RefreshAccountInfo path still auto-clears BanStatus back to
+	// ACTIVE on a later healthy refresh, so a transient blip self-heals.
+	if isSuspensionErrorMessage(msg) {
+		h.disableAccountByID(accountID, "AWS temporarily suspended - unusual user activity detected")
+		h.pool.RecordError(accountID, false, 0)
+		return
+	}
+	if isAuthErrorMessage(msg) {
+		h.disableAccountByID(accountID, "Authentication failed - token invalid or expired")
+		h.pool.RecordError(accountID, false, 0)
+		return
+	}
 	isQuota := strings.Contains(msg, "429") || strings.Contains(msg, "quota")
 	h.pool.RecordError(accountID, isQuota, 0)
+}
+
+// isSuspensionErrorMessage reports whether an upstream error indicates AWS has
+// suspended the account (a terminal, operator-must-intervene condition).
+func isSuspensionErrorMessage(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "temporarily_suspended") ||
+		strings.Contains(m, "temporarily is suspended") ||
+		strings.Contains(m, "account suspended")
+}
+
+// isAuthErrorMessage reports whether an upstream error indicates the account's
+// credentials are no longer valid (401/403, invalid/expired token, bad grant).
+func isAuthErrorMessage(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "http 401") ||
+		strings.Contains(m, "http 403") ||
+		strings.Contains(m, "unauthorized") ||
+		strings.Contains(m, "forbidden") ||
+		strings.Contains(m, "authentication failed") ||
+		strings.Contains(m, "token invalid") ||
+		strings.Contains(m, "token expired") ||
+		strings.Contains(m, "invalid_grant") ||
+		strings.Contains(m, "access token expired") ||
+		strings.Contains(m, "refresh token expired")
+}
+
+// disableAccountByID disables an account on the request path (BanStatus=BANNED,
+// Enabled=false) and reloads the pool so the picker stops selecting it
+// immediately. Idempotent: a no-op if the account is already disabled with the
+// same ban reason, so a burst of failing requests doesn't thrash config.Save or
+// the pool reload. The next healthy background RefreshAccountInfo re-enables it.
+func (h *Handler) disableAccountByID(accountID, banReason string) {
+	acc := h.pool.GetByID(accountID)
+	if acc == nil {
+		return
+	}
+	if !acc.Enabled && acc.BanStatus == "BANNED" && acc.BanReason == banReason {
+		return // already disabled for this reason — avoid Save/Reload thrash
+	}
+	updated := *acc
+	updated.Enabled = false
+	updated.BanStatus = "BANNED"
+	updated.BanReason = banReason
+	updated.BanTime = time.Now().Unix()
+	if err := config.UpdateAccount(accountID, updated); err != nil {
+		logger.Warnf("[Failover] failed to disable %s: %v", redactForLog(acc.Email), err)
+		return
+	}
+	logger.Warnf("[Failover] disabled %s on request path: %s", redactForLog(acc.Email), banReason)
+	h.pool.Reload()
 }
 
 // handleUpstreamError records a failed CallKiroAPI invocation against the

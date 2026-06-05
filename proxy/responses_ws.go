@@ -114,6 +114,19 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		req.Model = "claude-sonnet-4.5"
 	}
 
+	// Stateless passthrough: previous_response_id is unsupported (no server-side
+	// store). Reject it explicitly instead of silently dropping context.
+	if strings.TrimSpace(req.PreviousResponseID) != "" {
+		_ = conn.WriteJSON(map[string]interface{}{
+			"event": "error",
+			"data": map[string]interface{}{
+				"type":    "invalid_request_error",
+				"message": "previous_response_id is not supported: this server is stateless and does not store prior responses. Resend the full conversation in 'input' each turn.",
+			},
+		})
+		return
+	}
+
 	apiKeyID := matchedAPIKeyID(r)
 	if apiKeyID != "" {
 		if rejected, reason := config.CheckAPIKeyLimit(apiKeyID, req.Model); rejected {

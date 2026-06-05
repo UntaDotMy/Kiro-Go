@@ -70,6 +70,19 @@ type Account struct {
 	AllowOverage  bool `json:"allowOverage,omitempty"`  // Whether to keep using the account after UsageLimit is reached
 	OverageWeight int  `json:"overageWeight,omitempty"` // 1-10, lower values reduce overage request frequency
 
+	// Cached snapshot of the REAL AWS user-level Overages switch + billing
+	// figures, synced from GET /getUsageLimits and flipped via POST
+	// /setUserPreference (see proxy/kiro_overage.go). These are ADDITIVE and
+	// informational: AllowOverage/OverageWeight above still drive pool routing.
+	// They let the dashboard show accumulated overage $ and toggle the actual
+	// AWS billing switch. Empty/zero until the first successful upstream sync.
+	OverageStatus     string  `json:"overageStatus,omitempty"`     // "ENABLED" | "DISABLED" | "UNKNOWN" (AWS switch)
+	OverageCapability string  `json:"overageCapability,omitempty"` // "OVERAGE_CAPABLE" / "NOT_OVERAGE_CAPABLE"
+	OverageCap        float64 `json:"overageCap,omitempty"`        // Hard upper bound (USD)
+	OverageRate       float64 `json:"overageRate,omitempty"`       // Per-invocation rate (USD)
+	CurrentOverages   float64 `json:"currentOverages,omitempty"`   // Cumulative overage charges (USD)
+	OverageCheckedAt  int64   `json:"overageCheckedAt,omitempty"`  // Last successful upstream sync (Unix seconds)
+
 	// Account status
 	Enabled   bool   `json:"enabled"`             // Whether account is active in the pool
 	BanStatus string `json:"banStatus,omitempty"` // Ban status: "ACTIVE", "BANNED", "SUSPENDED"
@@ -324,7 +337,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A13"
+const Version = "1.0.10-A14"
 
 var (
 	cfg     *Config
@@ -678,6 +691,35 @@ func DisableAccountOverage(id string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].AllowOverage = false
+			return Save()
+		}
+	}
+	return nil
+}
+
+// UpdateAccountOverageStatus persists the cached snapshot of the REAL AWS
+// user-level Overages switch + billing figures (synced via
+// proxy.FetchOverageStatus / flipped via proxy.SetOverageStatus). Additive
+// cache only — it does NOT change AllowOverage/OverageWeight routing. Empty
+// status/capability and non-positive checkedAt are left untouched so a partial
+// snapshot can't wipe good cached values.
+func UpdateAccountOverageStatus(id, status, capability string, cap, rate, current float64, checkedAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			if status != "" {
+				cfg.Accounts[i].OverageStatus = status
+			}
+			if capability != "" {
+				cfg.Accounts[i].OverageCapability = capability
+			}
+			cfg.Accounts[i].OverageCap = cap
+			cfg.Accounts[i].OverageRate = rate
+			cfg.Accounts[i].CurrentOverages = current
+			if checkedAt > 0 {
+				cfg.Accounts[i].OverageCheckedAt = checkedAt
+			}
 			return Save()
 		}
 	}
