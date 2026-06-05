@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"fmt"
+	"kiro-go/config"
 	"strings"
 	"testing"
 )
@@ -68,20 +70,76 @@ func TestKiroRESTBaseSwitchesByRegion(t *testing.T) {
 	}
 }
 
-// TestEndpointChainCapped enforces the maxEndpointChain ceiling so a
-// misconfigured many-region failover list cannot produce arbitrarily
-// long per-request stalls.
+// TestEndpointChainCapped enforces the maxEndpointChain ceiling and the
+// per-account region-pinning contract: one account's chain covers ONLY
+// its pinned region's service actions (3), never a multi-region
+// expansion. Cross-region spreading happens across ACCOUNTS, not within
+// a single identity, so no one OAuth identity ever crosses regions.
 func TestEndpointChainCapped(t *testing.T) {
 	prev := kiroEndpointsOverride
 	kiroEndpointsOverride = nil
 	t.Cleanup(func() { kiroEndpointsOverride = prev })
 	t.Setenv("KIRO_API_REGIONS", "us-east-1,us-west-2,eu-west-1,eu-central-1,ap-northeast-1")
 
-	chain := getSortedEndpoints("auto")
+	acct := &config.Account{ID: "acct-chain-cap"}
+	chain := getSortedEndpoints("auto", acct)
 	if len(chain) > maxEndpointChain {
 		t.Fatalf("chain length %d exceeds cap %d", len(chain), maxEndpointChain)
 	}
-	if len(chain) <= 3 {
-		t.Fatalf("expected multi-region expansion, got only %d entries", len(chain))
+	// One identity is pinned to ONE region: exactly that region's 3
+	// service actions, not a multi-region chain.
+	if len(chain) != 3 {
+		t.Fatalf("expected exactly one region's 3 endpoints (per-account pinning), got %d", len(chain))
+	}
+}
+
+// TestResolveAccountRegionStableAndSpreads verifies the two core
+// properties of per-account region pinning:
+//  1. STABLE — the same account always resolves to the same region, so an
+//     identity never hops regions request-to-request (no impossible-travel
+//     signal).
+//  2. SPREAD — different accounts deterministically land on different
+//     regions across the configured list, so pool traffic is distributed
+//     over regional rate buckets without any single identity moving.
+func TestResolveAccountRegionStableAndSpreads(t *testing.T) {
+	t.Setenv("KIRO_API_REGIONS", "us-east-1,eu-west-1,ap-northeast-1")
+
+	// Stability: many resolutions of the same id must be identical.
+	first := resolveAccountRegion(&config.Account{ID: "stable-acct"})
+	for i := 0; i < 50; i++ {
+		if got := resolveAccountRegion(&config.Account{ID: "stable-acct"}); got != first {
+			t.Fatalf("region must be stable per account; got %q then %q", first, got)
+		}
+	}
+
+	// Spread: across many distinct ids we must touch more than one region.
+	seen := map[string]bool{}
+	for i := 0; i < 60; i++ {
+		seen[resolveAccountRegion(&config.Account{ID: fmt.Sprintf("acct-%d", i)})] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected accounts to spread across multiple regions, only saw %v", seen)
+	}
+	for r := range seen {
+		if r != "us-east-1" && r != "eu-west-1" && r != "ap-northeast-1" {
+			t.Fatalf("resolved region %q outside the configured list", r)
+		}
+	}
+}
+
+// TestResolveAccountRegionFallback confirms the safe fallbacks: with no
+// KIRO_API_REGIONS configured, or a nil/empty-id account, resolution
+// returns the single global region (never panics, never empty).
+func TestResolveAccountRegionFallback(t *testing.T) {
+	t.Setenv("KIRO_API_REGIONS", "")
+
+	if got := resolveAccountRegion(&config.Account{ID: "any"}); got == "" {
+		t.Fatal("expected a non-empty global region when no list is configured")
+	}
+	if got := resolveAccountRegion(nil); got == "" {
+		t.Fatal("nil account must fall back to the global region, not empty")
+	}
+	if got := resolveAccountRegion(&config.Account{ID: ""}); got == "" {
+		t.Fatal("empty-id account must fall back to the global region, not empty")
 	}
 }

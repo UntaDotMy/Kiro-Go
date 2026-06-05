@@ -22,5 +22,6 @@ go.work.sum
 
 # Local research / scratch artifacts (cloned competitor repos, analysis output)
 kiro2api/
+kiro-gateway/
 research/
 .uirebuild/

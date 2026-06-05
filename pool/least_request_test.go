@@ -247,10 +247,15 @@ func TestAIMDNoShrinkOnNonQuotaError(t *testing.T) {
 	}
 }
 
-// TestHalfOpenSingleProbeAfterCooldown verifies the "half-open" recovery: after
-// a 429 drives the limit to the floor (1), only a single request is admitted
-// (the probe); a second concurrent acquire is shed until the first frees.
-func TestHalfOpenSingleProbeAfterCooldown(t *testing.T) {
+// TestFloorAfterCooldown verifies the post-storm behavior: after a 429
+// storm drives the AIMD limit to the floor (aimdMinLimit, currently 2),
+// the account admits up to the floor of concurrent requests before
+// shedding further acquires with the saturation hint. The floor exists
+// to keep a recovered account productive immediately under a small
+// burst; the prior 1-slot floor (single-probe pattern) starved a
+// recovered account of any parallelism and compounded the dispatcher's
+// admission-wait budget into a client-visible stall.
+func TestFloorAfterCooldown(t *testing.T) {
 	withLeastRequest(t)
 	p := newTestPool()
 	p.setAccounts([]config.Account{{ID: "a"}})
@@ -265,15 +270,20 @@ func TestHalfOpenSingleProbeAfterCooldown(t *testing.T) {
 		t.Fatalf("expected limit floored at %d after storm, got %d", aimdMinLimit, limit)
 	}
 
-	// First acquire admits the single probe.
-	acc, _, ok := p.AcquireForModelExcluding("", nil)
-	if !ok || acc == nil {
-		t.Fatal("expected the single probe to be admitted")
+	// First two acquires succeed — the account now admits up to
+	// aimdMinLimit (= 2) concurrent in-flight before shedding.
+	acc1, _, ok1 := p.AcquireForModelExcluding("", nil)
+	if !ok1 || acc1 == nil {
+		t.Fatal("expected the first probe to be admitted")
 	}
-	// Second acquire is shed: the only account is at its limit of 1.
-	acc2, retryAfter, ok2 := p.AcquireForModelExcluding("", nil)
-	if ok2 || acc2 != nil {
-		t.Fatalf("expected second acquire to be shed (half-open single probe), got %v", acc2)
+	acc2, _, ok2 := p.AcquireForModelExcluding("", nil)
+	if !ok2 || acc2 == nil {
+		t.Fatal("expected the second probe to be admitted at the floor")
+	}
+	// Third acquire is shed: the only account is at its limit of 2.
+	acc3, retryAfter, ok3 := p.AcquireForModelExcluding("", nil)
+	if ok3 || acc3 != nil {
+		t.Fatalf("expected third acquire to be shed (floor=%d, inflight=2), got %v", aimdMinLimit, acc3)
 	}
 	if retryAfter != saturationPollInterval {
 		t.Fatalf("expected saturation hint %s, got %s", saturationPollInterval, retryAfter)

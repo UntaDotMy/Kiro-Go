@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -238,12 +239,17 @@ func ResolveAccountProxyURL(account *config.Account) string {
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
 		MaxIdleConns: 200,
-		// Nearly all traffic targets a single host (q.<region>.kiro.dev or
-		// codewhisperer.<region>.amazonaws.com), so the per-host idle pool is
-		// what actually bounds connection reuse. The Go default of 2 forced a
-		// fresh TLS dial for every concurrent stream beyond the second;
-		// matching it to MaxIdleConns keeps warm keep-alive connections for
-		// the whole concurrent working set instead of churning handshakes.
+		// With per-account region pinning (resolveAccountRegion), every
+		// request from one account targets the SAME host (q.<region> or
+		// the regional REST host), so the per-host idle pool is what
+		// bounds keep-alive reuse. A generous per-host pool keeps warm
+		// connections for the whole concurrent working set
+		// (≈ accounts-sharing-a-region × aimdMaxLimit) instead of forcing
+		// a fresh TLS dial per stream. NOTE: this is also why the earlier
+		// per-request endpoint rotation hurt latency — it alternated the
+		// destination host every request, so keep-alive reuse never
+		// happened and each call paid a fresh handshake. Pinning fixed
+		// that. The Go default of 2 would reintroduce the churn.
 		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		DisableCompression:    false,
@@ -465,32 +471,51 @@ type KiroStreamCallback struct {
 // outer limit of "client will tolerate" for a single API call.
 const maxEndpointChain = 12
 
-// getSortedEndpoints returns endpoints ordered by user preference, with
-// optional fallback. When config.KiroAPIRegions is non-empty, the chain
-// expands across all listed regions in order: every endpoint in region[0]
-// is tried before any endpoint in region[1]. With auto-fallback off, only
-// the preferred endpoint in the primary region is used. The total chain
-// is capped at maxEndpointChain to prevent a misconfigured multi-region
-// list from producing per-request timeouts that exceed reasonable client
-// tolerance.
-func getSortedEndpoints(preferred string) []kiroEndpoint {
-	fallback := config.GetEndpointFallback()
+// resolveAccountRegion returns the ONE stable AWS region an account talks
+// to, every request, for the life of that account. This is the key to
+// clean cross-account load spreading WITHOUT making any single OAuth
+// identity look anomalous: each identity is pinned to one region and never
+// hops, while different accounts deterministically land on different
+// regions so the pool's traffic is spread across regional rate buckets.
+//
+// Resolution precedence:
+//
+//  1. An explicit per-account override (account.KiroRegion, if you ever
+//     add one) — not used today; the account.Region field holds the OIDC
+//     login region, which is NOT always a valid streaming-API region
+//     (e.g. us-east-2 IdC accounts: runtime.us-east-2.kiro.dev may not
+//     resolve), so we deliberately do NOT route by it.
+//  2. If the operator configured KIRO_API_REGIONS, pick one
+//     deterministically by hashing the account ID: crc32(id) % N. Stable
+//     per account (same account → same region every time), and spreads
+//     accounts evenly across the configured regions.
+//  3. Otherwise the single global region (GetKiroAPIRegion, default
+//     us-east-1).
+//
+// A nil account or empty ID falls back to the global region so callers
+// that don't have an account (REST cold-start paths) keep working.
+func resolveAccountRegion(account *config.Account) string {
 	regions := config.GetKiroAPIRegions()
-	if len(regions) == 0 {
-		regions = []string{config.GetKiroAPIRegion()}
+	if len(regions) == 0 || account == nil || account.ID == "" {
+		return config.GetKiroAPIRegion()
 	}
+	idx := crc32.ChecksumIEEE([]byte(account.ID)) % uint32(len(regions))
+	return regions[idx]
+}
 
-	var all []kiroEndpoint
-	for _, region := range regions {
-		regional := kiroEndpointsForRegion(region)
-		all = append(all, sortRegionalEndpoints(regional, preferred, fallback)...)
-		if !fallback {
-			break
-		}
-		if len(all) >= maxEndpointChain {
-			break
-		}
-	}
+// getSortedEndpoints returns the endpoint chain for a single account,
+// pinned to that account's stable region (resolveAccountRegion). The
+// chain covers ONLY that one region's service actions in preference
+// order; a healthy request uses the primary action, and the others are
+// reactive 429-only fallback WITHIN the same region. One identity never
+// crosses regions — cross-region spreading happens across ACCOUNTS, not
+// within an account. The chain is capped at maxEndpointChain.
+func getSortedEndpoints(preferred string, account *config.Account) []kiroEndpoint {
+	fallback := config.GetEndpointFallback()
+	region := resolveAccountRegion(account)
+
+	regional := kiroEndpointsForRegion(region)
+	all := sortRegionalEndpoints(regional, preferred, fallback)
 	if len(all) > maxEndpointChain {
 		all = all[:maxEndpointChain]
 	}
@@ -512,7 +537,11 @@ func sortRegionalEndpoints(endpoints []kiroEndpoint, preferred string, fallback 
 	case "amazonq":
 		primary = 2
 	default:
-		// "auto" — try in declared order.
+		// "auto" — try in declared order. A healthy request always
+		// executes endpoint[0] (Kiro IDE generateAssistantResponse, no
+		// X-Amz-Target); endpoints 1/2 stay REACTIVE 429-only fallback.
+		// This keeps a single, consistent service action per request
+		// rather than rotating the X-Amz-Target every call.
 		out := make([]kiroEndpoint, len(endpoints))
 		copy(out, endpoints)
 		return out
@@ -560,8 +589,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	// Build the endpoint list for THIS account, pinned to its stable
+	// region (see resolveAccountRegion). One identity never crosses
+	// regions; load spreads across accounts.
+	endpoints := getSortedEndpoints(config.GetPreferredEndpoint(), account)
 
 	// All currently configured endpoints share Origin="AI_EDITOR", so the
 	// marshaled bytes are identical per iteration. We re-marshal inside the
@@ -633,8 +664,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
 			reqCancel()
-			lastErr = err
-			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+			// Classify HTTP/2 RST_STREAM / GOAWAY at the transport layer
+			// so the dispatcher's retryable check (and the post-commit
+			// SSE error event, when the chain finally gives up) sees
+			// *ErrUpstreamStreamReset rather than the raw *url.Error
+			// wrapping a *http2.StreamError.
+			lastErr = classifyStreamError(err)
+			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, lastErr)
 			continue
 		}
 
@@ -680,7 +716,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		err = parseEventStream(body, callback)
 		resp.Body.Close()
 		reqCancel()
-		return err
+		return classifyStreamError(err)
 	}
 
 	// Every endpoint returned 429: surface a single QuotaError carrying the
@@ -818,7 +854,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			break
 		}
 		if err != nil {
-			return err
+			return classifyStreamError(err)
 		}
 
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
@@ -849,7 +885,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		msgBuf := buf
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
-			return err
+			return classifyStreamError(err)
 		}
 
 		if headersLength > len(msgBuf)-4 {

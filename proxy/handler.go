@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -2083,9 +2084,22 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		// committed request failed mid-stream) and surface it inline as an
 		// SSE error event so the client sees it.
 		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
-		emit("error", map[string]interface{}{
-			"type":  "error",
-			"error": map[string]string{"type": "api_error", "message": err.Error()},
+		emitError := map[string]string{"type": "api_error", "message": err.Error()}
+		eventType := "error"
+		// HTTP/2 RST_STREAM / GOAWAY: emit a stable, friendly
+		// overloaded_error so the client never sees the raw Go string
+		// (e.g. "stream error: stream ID 7; INTERNAL_ERROR; received
+		// from peer"). The original cause is logged for operators.
+		var sre *ErrUpstreamStreamReset
+		if errors.As(err, &sre) {
+			logger.Warnf("[StreamReset] post-commit upstream stream reset: %v", err)
+			emitError["type"] = "overloaded_error"
+			emitError["message"] = upstreamStreamResetMessage
+			eventType = "overloaded_error"
+		}
+		emit(eventType, map[string]interface{}{
+			"type":  eventType,
+			"error": emitError,
 		})
 		return true, nil
 	}
@@ -3139,6 +3153,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	for i, a := range accounts {
 		// 获取运行时统计
 		stats := statsMap[a.ID]
+		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -3177,6 +3192,10 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			"inflight":          inflight,
+			"concurrencyLimit":  concurrencyLimit,
+			"cooldownSecs":      int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds()),
+			"overQuota":         a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit,
 		}
 	}
 	json.NewEncoder(w).Encode(result)

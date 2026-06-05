@@ -97,11 +97,14 @@ const (
 	// aimdInitialLimit is where a fresh / just-recovered account starts. 2 lets
 	// a little parallelism through immediately without spraying a burst.
 	aimdInitialLimit = 2
-	// aimdMinLimit is the floor — never drop below 1 or the account is stuck.
-	// After a 429 the limit collapses toward here, which doubles as the
-	// "half-open single probe" on recovery (only ~1 request admitted until it
-	// succeeds).
-	aimdMinLimit = 1
+	// aimdMinLimit is the floor — never drop below this on a 429. With
+	// multiple accounts pooled, a 1-slot floor left no headroom: any
+	// concurrent burst on a recovered account immediately re-throttled,
+	// and the dispatcher's admission-wait budget turned into a stall.
+	// A 2-slot floor keeps a recovered account productive immediately
+	// while still letting it self-tune down toward AWS's actual bucket
+	// size on the multiplicative-decrease path.
+	aimdMinLimit = 2
 	// aimdMaxLimit caps how far additive-increase can climb, so one account
 	// can't absorb the entire burst and re-trigger the storm we're fixing.
 	aimdMaxLimit = 12
