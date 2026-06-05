@@ -1623,6 +1623,18 @@
                 'detail.overage': '超额调用设置',
                 'detail.allowOverage': '配额耗尽后继续调用',
                 'detail.overageHint': '超额后调用频率权重（1~10），值越大频率越高',
+                'detail.awsOverage': 'AWS 超额开关（真实计费）',
+                'detail.awsOverageStatus': 'AWS 开关状态',
+                'detail.awsOverageCurrent': '已产生超额费用',
+                'detail.awsOverageCap': '超额上限',
+                'detail.awsOverageRate': '每次调用费率',
+                'detail.awsOverageChecked': '最后同步时间',
+                'detail.awsOverageNeverSynced': '尚未同步',
+                'detail.awsOverageRefresh': '从 AWS 刷新',
+                'detail.awsOverageEnable': '开启真实超额',
+                'detail.awsOverageDisable': '关闭真实超额',
+                'detail.awsOverageHint': '直接读取/切换 AWS 账户级超额开关。开启后会产生真实超额费用（按上方费率计费），与上面的本地路由开关不同。',
+                'detail.awsOverageConfirm': '开启 AWS 超额会产生真实费用。确定要开启吗？',
                 'detail.proxyURL': '独立代理',
                 'detail.proxyHint': '留空则使用全局代理，格式: socks5://host:port 或 http://host:port',
                 'detail.proxySaved': '代理已保存',
@@ -2031,6 +2043,18 @@
                 'detail.overage': 'Overage Settings',
                 'detail.allowOverage': 'Continue calling after quota is exhausted',
                 'detail.overageHint': 'Call frequency weight when over quota (1–10); higher = more frequent',
+                'detail.awsOverage': 'AWS Overage Switch (real billing)',
+                'detail.awsOverageStatus': 'AWS switch status',
+                'detail.awsOverageCurrent': 'Accrued overage charges',
+                'detail.awsOverageCap': 'Overage cap',
+                'detail.awsOverageRate': 'Per-invocation rate',
+                'detail.awsOverageChecked': 'Last synced',
+                'detail.awsOverageNeverSynced': 'Never synced',
+                'detail.awsOverageRefresh': 'Refresh from AWS',
+                'detail.awsOverageEnable': 'Enable real overage',
+                'detail.awsOverageDisable': 'Disable real overage',
+                'detail.awsOverageHint': 'Reads/flips the real AWS account-level Overages switch. Enabling incurs real overage charges (billed at the rate above). This is separate from the local routing toggle above.',
+                'detail.awsOverageConfirm': 'Enabling AWS overage incurs real charges. Are you sure you want to enable it?',
                 'detail.proxyURL': 'Account Proxy',
                 'detail.proxyHint': 'Leave empty to use global proxy. Format: socks5://host:port or http://host:port',
                 'detail.proxySaved': 'Proxy saved',
@@ -2546,6 +2570,32 @@
         async function showDetail(id) {
             const a = accountsData.find(x => x.id === id);
             if (!a) return;
+            // Real-AWS overage tile: shows the cached upstream Overages switch
+            // state + live billing $ (cap/rate/accumulated) and lets the operator
+            // re-sync from AWS or flip the actual billing switch. Distinct from
+            // the local AllowOverage routing knob above.
+            const ovStatus = (a.overageStatus || 'UNKNOWN');
+            const ovEnabled = ovStatus === 'ENABLED';
+            const ovStatusCls = ovEnabled ? 'badge-warning' : (ovStatus === 'DISABLED' ? 'badge-info' : 'badge');
+            const ovChecked = a.overageCheckedAt ? new Date(a.overageCheckedAt * 1000).toLocaleString() : t('detail.overageNeverSynced');
+            const fmtUsd = (n) => '$' + (Number(n) || 0).toFixed(2);
+            const AWS_OVERAGE_SECTION_PLACEHOLDER =
+                '<div class="detail-section"><h4>' + t('detail.awsOverage') + '</h4>' +
+                '<div class="detail-grid">' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.awsOverageStatus') + '</div><div class="detail-value"><span class="badge ' + ovStatusCls + '">' + ovStatus + '</span></div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.awsOverageCurrent') + '</div><div class="detail-value">' + fmtUsd(a.currentOverages) + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.awsOverageCap') + '</div><div class="detail-value">' + fmtUsd(a.overageCap) + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.awsOverageRate') + '</div><div class="detail-value">' + fmtUsd(a.overageRate) + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.awsOverageChecked') + '</div><div class="detail-value">' + ovChecked + '</div></div>' +
+                '</div>' +
+                '<div class="machine-id-row" style="margin-top:10px">' +
+                '<button class="btn btn-sm btn-secondary" onclick="refreshAwsOverage(\'' + id + '\')">' + t('detail.awsOverageRefresh') + '</button>' +
+                (ovEnabled
+                    ? '<button class="btn btn-sm btn-secondary" onclick="setAwsOverage(\'' + id + '\',false)">' + t('detail.awsOverageDisable') + '</button>'
+                    : '<button class="btn btn-sm btn-warning" onclick="setAwsOverage(\'' + id + '\',true)">' + t('detail.awsOverageEnable') + '</button>') +
+                '</div>' +
+                '<small style="color:#64748b;font-size:12px;margin-top:6px;display:block">' + t('detail.awsOverageHint') + '</small>' +
+                '</div>';
             document.getElementById('detailBody').innerHTML =
                 '<div class="detail-section"><h4>' + t('detail.basicInfo') + '</h4><div class="detail-grid">' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.email') + '</div><div class="detail-value">' + getDisplayEmail(a.email, null) + '</div></div>' +
@@ -2576,6 +2626,7 @@
                 '</div>' +
                 '<button class="btn btn-sm btn-primary" onclick="saveOverageSettings(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div>' +
+                AWS_OVERAGE_SECTION_PLACEHOLDER +
                 '<div class="detail-section"><h4>' + t('detail.proxyURL') + '</h4><div class="machine-id-row">' +
                 '<input type="text" id="proxyURLInput" value="' + (a.proxyURL || '') + '" placeholder="socks5://host:port" style="flex:1">' +
                 '<button class="btn btn-sm btn-primary" onclick="saveProxyURL(\'' + id + '\')">' + t('detail.save') + '</button>' +
@@ -3553,6 +3604,36 @@
                 });
             } catch (e) { /* fall through to reload */ }
             loadAccounts();
+        }
+        // refreshAwsOverage re-reads the REAL AWS Overages switch + live billing
+        // $ for one account and re-opens the detail panel with fresh values.
+        async function refreshAwsOverage(id) {
+            try {
+                const res = await fetch('/admin/api/accounts/' + id + '/overage', {
+                    headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                if (!res.ok) { alert((d && d.error) || t('common.saveFailed')); return; }
+                await loadAccounts();
+                showDetail(id);
+            } catch (e) { alert(t('common.saveFailed') + ': ' + e); }
+        }
+        // setAwsOverage flips the REAL AWS billing switch. Enabling authorizes
+        // real overage charges, so it requires an explicit confirm both in the
+        // UI and via the confirm=true flag the backend enforces.
+        async function setAwsOverage(id, enabled) {
+            if (enabled && !confirm(t('detail.awsOverageConfirm'))) return;
+            try {
+                const res = await fetch('/admin/api/accounts/' + id + '/overage', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ enabled: enabled, confirm: true })
+                });
+                const d = await res.json();
+                if (!res.ok) { alert((d && d.error) || t('common.saveFailed')); return; }
+                await loadAccounts();
+                showDetail(id);
+            } catch (e) { alert(t('common.saveFailed') + ': ' + e); }
         }
         async function deleteAccount(id) {
             if (!confirm(t('accounts.confirmDelete'))) return;

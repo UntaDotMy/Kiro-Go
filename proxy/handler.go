@@ -3049,6 +3049,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/test") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/test")
 		h.apiTestAccount(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
+		h.apiGetAccountOverage(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
+		h.apiSetAccountOverage(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
 		h.apiGetAccountModelsCached(w, r, id)
@@ -3173,6 +3179,12 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"weight":            a.Weight,
 			"allowOverage":      a.AllowOverage,
 			"overageWeight":     a.OverageWeight,
+			"overageStatus":     a.OverageStatus,
+			"overageCapability": a.OverageCapability,
+			"overageCap":        a.OverageCap,
+			"overageRate":       a.OverageRate,
+			"currentOverages":   a.CurrentOverages,
+			"overageCheckedAt":  a.OverageCheckedAt,
 			"proxyURL":          a.ProxyURL,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
@@ -4236,7 +4248,105 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	})
 }
 
-// apiRefreshAccount 刷新账户信息（使用量、订阅等）
+// apiGetAccountOverage GET /admin/api/accounts/{id}/overage — reads the REAL
+// AWS user-level Overages switch + live billing figures (cap/rate/accumulated
+// $) from upstream, persists the snapshot, and returns it. Read-only: this does
+// NOT change any billing behavior.
+func (h *Handler) apiGetAccountOverage(w http.ResponseWriter, r *http.Request, id string) {
+	account := h.findAccountByID(id)
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if err := h.ensureValidToken(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		return
+	}
+	snap, err := FetchOverageStatus(account)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Fetch overage status failed: " + err.Error()})
+		return
+	}
+	if err := PersistOverageSnapshot(id, snap); err != nil {
+		logger.Warnf("[Overage] persist snapshot for %s failed: %v", redactForLog(account.Email), err)
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":           true,
+		"status":            snap.Status,
+		"capability":        snap.Capability,
+		"subscriptionTitle": snap.SubscriptionTitle,
+		"overageCap":        snap.OverageCap,
+		"overageRate":       snap.OverageRate,
+		"currentOverages":   snap.CurrentOverages,
+		"checkedAt":         snap.CheckedAt,
+	})
+}
+
+// apiSetAccountOverage POST /admin/api/accounts/{id}/overage — flips the REAL
+// AWS user-level Overages billing switch. Body: {"enabled":true|false}.
+// Enabling authorizes real overage billing, so the body must also carry
+// {"confirm":true} as a guard against accidental clicks.
+func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, id string) {
+	account := h.findAccountByID(id)
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	var req struct {
+		Enabled bool `json:"enabled"`
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	// Enabling spends real money — require an explicit confirm flag.
+	if req.Enabled && !req.Confirm {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Enabling overage authorizes real AWS overage billing; resend with confirm=true"})
+		return
+	}
+	if err := h.ensureValidToken(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		return
+	}
+	snap, err := SetOverageStatus(account, req.Enabled)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Set overage status failed: " + err.Error()})
+		return
+	}
+	if err := PersistOverageSnapshot(id, snap); err != nil {
+		logger.Warnf("[Overage] persist snapshot for %s failed: %v", redactForLog(account.Email), err)
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"status":          snap.Status,
+		"overageCap":      snap.OverageCap,
+		"overageRate":     snap.OverageRate,
+		"currentOverages": snap.CurrentOverages,
+		"checkedAt":       snap.CheckedAt,
+	})
+}
+
+// findAccountByID returns a pointer to a copy of the named account, or nil.
+func (h *Handler) findAccountByID(id string) *config.Account {
+	accounts := config.GetAccounts()
+	for i := range accounts {
+		if accounts[i].ID == id {
+			return &accounts[i]
+		}
+	}
+	return nil
+}
 func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id string) {
 	accounts := config.GetAccounts()
 	var account *config.Account
