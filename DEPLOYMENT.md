@@ -175,3 +175,77 @@ curl -s -H 'Authorization: Bearer sk-kg-nope' https://api.example.com/v1/key-sta
 
 Run your config through [securityheaders.com](https://securityheaders.com) and
 [Mozilla Observatory](https://observatory.mozilla.org) after deploy.
+
+## 9. Throughput & avoiding 429s (read this if it's slow)
+
+**The #1 cause of slowness and constant 429s is account capacity, not the
+balancer.** Kiro bills per-account monthly *credits*. Once an account's
+`usageCurrent` reaches its `usageLimit`, every further request is **overage**
+traffic, which AWS throttles far more aggressively. An over-quota account shows
+an **Over quota** badge in the admin Accounts table; a throttled one shows a
+**Cooling** badge with a countdown.
+
+If most of your accounts are over quota, no scheduler can make them fast — the
+upstream is rate-limiting them on purpose. The fixes, in order of impact:
+
+### 9.1 Add more healthy accounts (biggest lever)
+
+The pool scales near-linearly. With the default `least-request` strategy each
+new request is steered to the least-busy account, and failover rotates off a
+just-throttled one to a healthy peer. Two exhausted accounts give the dispatcher
+nothing to fail over to; 4-6 in-quota accounts changes everything. Watch the
+**Over quota** / **Cooling** badges and replace or rest exhausted accounts.
+
+### 9.2 Give each account its own egress IP (per-account proxy)
+
+AWS appears to layer a **per-IP** throttle on top of the per-identity one, so
+running every account out of one VPS IP correlates their throttling — they trip
+together. Each account has a `proxyURL` you can set in the admin **account
+detail** panel (or via `PUT /admin/api/accounts/{id}`), e.g.
+`socks5://user:pass@host:1080` or `http://host:8080`. Route each account through
+a different egress IP to decorrelate the IP-level throttle. Leave it blank to use
+the global proxy (Settings → Proxy) or a direct connection.
+
+> The proxy URL is SSRF-validated (scheme + link-local guard). HTTP/2 is
+> auto-disabled for proxied connections (they can't negotiate h2); the direct
+> path keeps HTTP/2 with active PING health-checks.
+
+### 9.3 Pool strategy & multi-region
+
+- **Strategy** (Settings → Pool Strategy): keep **`least-request`** (default). It
+  is concurrency-aware and applies a per-account AIMD concurrency limit that
+  self-tunes toward AWS's hidden token-bucket size — additive +1 on success,
+  ×3/4 on a 429. The alternatives (`swr`, `least-used`, `random`) do **not**
+  reserve in-flight slots and will burst harder into 429s under parallel load.
+- **Multi-region (per-account pinning)**: set `KIRO_API_REGIONS=us-east-1,eu-west-1`
+  (comma separated) to spread accounts across regions. Each account is pinned to
+  **one** region for its whole life — chosen deterministically by hashing the
+  account ID across the list — so different accounts land on different regional
+  rate buckets while **no single account ever changes region**. This spreads load
+  the safe way: across accounts, not within one identity. Within its pinned
+  region an account still tries the 3 AWS service actions (Kiro IDE /
+  CodeWhisperer / AmazonQ) in order, using the primary and falling back to the
+  others only on a 429. Leave the variable unset to keep every account on the
+  single default region (`KIRO_API_REGION`, default `us-east-1`).
+
+  > Why per-account pinning instead of a per-request region chain: one identity
+  > hopping regions request-to-request (or cascading across regions on a 429) is
+  > implausible for a single real client. Pinning keeps each account's traffic
+  > consistent — one region, one host, stable keep-alive connections — while the
+  > pool as a whole still uses every configured region's rate buckets.
+
+### 9.4 What's already tuned for you (no action needed)
+
+- Cross-account **failover** up to 3 accounts per request, honoring upstream
+  `Retry-After`.
+- **Decorrelated-jitter cooldowns** so accounts sharing an AWS identity don't
+  recover in lockstep and re-stampede.
+- **Connection reuse**: 100 idle keep-alive conns/host, HTTP/2 PINGs on the
+  direct path, OS TCP keep-alive on the proxied path.
+- **Proactive token refresh** (120s before expiry, single-flight per account) so
+  OAuth refresh almost never sits on the request hot path.
+
+If after adding healthy accounts + per-account proxies you still see 429s, you
+are simply asking for more throughput than your Kiro plans allow — upgrade the
+plans (higher `usageLimit`) or add accounts.
+

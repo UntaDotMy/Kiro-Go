@@ -17,13 +17,26 @@ import (
 // kiroRestBase resolves the REST base URL for the active region. Read at
 // call time so a runtime region change (admin UI / env reload) takes effect
 // on the next request without restart.
+//
+// Prefer kiroRestBaseForAccount on any path that has an account: it pins
+// the REST call to the SAME stable region the account's streaming traffic
+// uses (resolveAccountRegion), so one identity's usage/profile/model
+// lookups and its inference calls never split across regions. This bare
+// form (global region) is only for cold-start paths with no account.
 func kiroRestBase() string {
 	return kiroRESTBaseForRegion(config.GetKiroAPIRegion())
 }
 
+// kiroRestBaseForAccount resolves the REST base URL pinned to the account's
+// stable region, matching where its streaming requests go. Falls back to
+// the global region for a nil account.
+func kiroRestBaseForAccount(account *config.Account) string {
+	return kiroRESTBaseForRegion(resolveAccountRegion(account))
+}
+
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
-	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestBase())
+	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestBaseForAccount(account))
 	url = withProfileArnQuery(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -53,7 +66,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 
 // GetUserInfo 获取用户信息
 func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
-	url := fmt.Sprintf("%s/GetUserInfo", kiroRestBase())
+	url := fmt.Sprintf("%s/GetUserInfo", kiroRestBaseForAccount(account))
 
 	payload := `{"origin":"KIRO_IDE"}`
 	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
@@ -84,7 +97,7 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 
 // ListAvailableModels 获取可用模型列表
 func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
-	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestBase())
+	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestBaseForAccount(account))
 	url = withProfileArnQuery(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -151,7 +164,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 }
 
 func listAvailableProfiles(account *config.Account) (string, error) {
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/ListAvailableProfiles", kiroRestBase()), strings.NewReader(`{"maxResults":10}`))
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/ListAvailableProfiles", kiroRestBaseForAccount(account)), strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return "", err
 	}

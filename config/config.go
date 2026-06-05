@@ -324,7 +324,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A12"
+const Version = "1.0.10-A13"
 
 var (
 	cfg     *Config

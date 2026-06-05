@@ -47,7 +47,12 @@ type streamWorker func(account *config.Account) (committed bool, err error)
 //       cover most of it; this would be the belt-and-suspenders layer.
 //     - LIVE VERIFICATION: confirm against the real account pool that the 429
 //       storm is gone under an ultracode parallel-agent burst.
-const admissionWaitBudget = 2 * time.Second
+//
+// 750ms is enough for a typical 3-4 poll cycles against saturationPollInterval
+// (100ms) under healthy load, while keeping a sustained-overload shed below
+// 1s end-to-end. A longer budget (the prior 2s) compounded with a low AIMD
+// floor into a client-visible stall — shed quickly and let the client retry.
+const admissionWaitBudget = 750 * time.Millisecond
 
 // runWithFailover selects an eligible account for the model and invokes the
 // worker, rotating to a different account when the worker reports a

@@ -490,7 +490,7 @@
         }
         .badge-success { background: var(--success-soft); color: var(--success); border-color: var(--success-border); }
         .badge-warning { background: var(--warning-soft); color: var(--warning); border-color: var(--warning-border); }
-        .badge-error, .badge-banned { background: var(--danger-soft); color: var(--danger); border-color: var(--danger-border); }
+        .badge-error, .badge-banned, .badge-danger { background: var(--danger-soft); color: var(--danger); border-color: var(--danger-border); }
         .badge-info { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
         .badge-pro, .badge-proplus, .badge-power, .badge-trial {
             background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border);
@@ -1614,6 +1614,10 @@
                 'accounts.weight': '权重',
                 'accounts.inflight': '并发',
                 'accounts.inflightHint': '当前在途请求数 / 自适应并发上限（仅 least-request 策略）。上限在成功时 +1、遇到 429 时减为 3/4，自动逼近 AWS 的限流阈值。',
+                'accounts.cooldown': '冷却中',
+                'accounts.cooldownHint': '该账号最近遇到 429/错误，正在冷却，调度器会跳过它，倒计时结束后自动恢复。',
+                'accounts.overQuota': '超额',
+                'accounts.overQuotaHint': '本月用量已超过配额（usageCurrent ≥ usageLimit）。仅在开启“超额调用”时仍可服务，但 AWS 会更频繁地限流。请添加更多账号或升级套餐。',
                 'detail.weight': '请求权重',
                 'detail.weightHint': '0-1=普通, 2+=高优先级',
                 'detail.overage': '超额调用设置',
@@ -2018,6 +2022,10 @@
                 'accounts.weight': 'Weight',
                 'accounts.inflight': 'In-flight',
                 'accounts.inflightHint': 'Current outstanding requests / adaptive concurrency limit (least-request strategy only). The limit grows by 1 on success and drops to 3/4 on a 429, self-tuning toward the AWS throttle threshold.',
+                'accounts.cooldown': 'Cooling',
+                'accounts.cooldownHint': 'This account recently hit a 429/error and is in cooldown. The scheduler skips it until the countdown ends, then it auto-recovers.',
+                'accounts.overQuota': 'Over quota',
+                'accounts.overQuotaHint': 'Monthly usage has exceeded the quota (usageCurrent ≥ usageLimit). It only keeps serving while "overage" is on, and AWS throttles it harder. Add more accounts or upgrade the plan.',
                 'detail.weight': 'Request Weight',
                 'detail.weightHint': '0-1=normal, 2+=higher priority',
                 'detail.overage': 'Overage Settings',
@@ -3556,6 +3564,17 @@
             if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
             return n.toString();
         }
+        // fmtCooldown renders remaining cooldown seconds compactly: 45s, 3m, 1h12m.
+        function fmtCooldown(secs) {
+            secs = Math.max(0, Math.round(secs || 0));
+            if (secs < 60) return secs + 's';
+            if (secs < 3600) {
+                const m = Math.floor(secs / 60), s = secs % 60;
+                return s ? m + 'm' + s + 's' : m + 'm';
+            }
+            const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+            return m ? h + 'h' + m + 'm' : h + 'h';
+        }
         function copy(id) {
             navigator.clipboard.writeText(document.getElementById(id).textContent);
             alert(t('common.copied'));
@@ -3929,7 +3948,8 @@
                     'usageCurrent','usageLimit','usagePercent',
                     'trialUsageCurrent','trialUsageLimit','trialUsagePercent',
                     'requestCount','errorCount','totalTokens','totalCredits',
-                    'lastUsed','lastRefresh','inflight','concurrencyLimit'];
+                    'lastUsed','lastRefresh','inflight','concurrencyLimit',
+                    'cooldownSecs','overQuota'];
                 for (const f of fields) {
                     if (s[f] !== undefined && a[f] !== s[f]) { a[f] = s[f]; changed = true; }
                 }
@@ -4517,7 +4537,9 @@
 
                 const weightBadge = weightVal >= 2 ? '<span class="badge badge-warning">W:' + weightVal + '</span>' : '';
                 const overageBadge = a.allowOverage ? '<span class="badge badge-warning">' + t('accounts.overage') + ':' + (a.overageWeight || 1) + '</span>' : '';
-                const metaBadges = getSubBadge(a.subscriptionType) + getTrialBadge(a) + getStatusBadge(a) + weightBadge + overageBadge;
+                const overQuotaBadge = a.overQuota ? '<span class="badge badge-danger" title="' + t('accounts.overQuotaHint') + '">' + t('accounts.overQuota') + '</span>' : '';
+                const cooldownBadge = (a.cooldownSecs > 0) ? '<span class="badge badge-danger" title="' + t('accounts.cooldownHint') + '">' + t('accounts.cooldown') + ' ' + fmtCooldown(a.cooldownSecs) + '</span>' : '';
+                const metaBadges = getSubBadge(a.subscriptionType) + getTrialBadge(a) + getStatusBadge(a) + overQuotaBadge + cooldownBadge + weightBadge + overageBadge;
 
                 let usageCell = '<span style="color:var(--faint)">—</span>';
                 if (a.usageLimit > 0) {

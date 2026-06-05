@@ -122,6 +122,15 @@ func isRetryableUpstreamError(err error) bool {
 	if errors.As(err, &qe) {
 		return true
 	}
+	// HTTP/2 stream reset (RST_STREAM / GOAWAY) from the upstream — a
+	// fresh transport on a peer account may skip the bad stream. The
+	// context-canceled check below still runs first via the substring
+	// fallback in the rare case the cause is itself a context error,
+	// but typed *context.Canceled never reaches this branch.
+	var sre *ErrUpstreamStreamReset
+	if errors.As(err, &sre) {
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
