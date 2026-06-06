@@ -2,8 +2,10 @@ package config
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"kiro-go/logger"
 	"strings"
 	"time"
 )
@@ -95,10 +97,17 @@ func generateAPIKeySecret() (string, error) {
 	return "sk-kg-" + hex.EncodeToString(buf), nil
 }
 
-// generateAPIKeyID returns a 16-byte hex identifier.
+// generateAPIKeyID returns a 16-byte hex identifier. crypto/rand.Read
+// effectively never fails, but on a broken entropy source it would otherwise
+// silently yield an all-zero buffer (and a duplicate id across keys). On the
+// rare error we log it and fall back to a nanosecond-timestamp seed so the id
+// stays unique and non-zero rather than colliding.
 func generateAPIKeyID() string {
 	buf := make([]byte, 8)
-	rand.Read(buf)
+	if _, err := rand.Read(buf); err != nil {
+		logger.Warnf("[apikeys] crypto/rand unavailable for key id, using time fallback: %v", err)
+		binary.BigEndian.PutUint64(buf, uint64(time.Now().UnixNano()))
+	}
 	return hex.EncodeToString(buf)
 }
 

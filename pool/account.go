@@ -149,6 +149,27 @@ type cooldownEntry struct {
 	// so an account with no cooldownEntry yet behaves as a fresh limit.
 	inflight int
 	limit    int
+
+	// Adaptive RATE pacing (least-request strategy). See rate_pacer.go for the
+	// full design. These implement a per-account GCRA pacer whose rate is learned
+	// by AIMD ("discover then pace"): unpaced until the first 429, then paced just
+	// below the observed achieved rate and probed back up on sustained success.
+	//
+	//   rateEstimate  — learned paced rate (req/sec); 0 means UNPACED (run full
+	//                   speed, gated only by concurrency).
+	//   tat           — GCRA Theoretical Arrival Time; the pacer admits a request
+	//                   only when now >= tat - τ. Zero until first advance.
+	//   observedRate  — EWMA of achieved success throughput, used to seed the
+	//                   snap-down on a 429.
+	//   lastSuccessAt — timestamp of the previous success, for the inter-success
+	//                   interval that feeds observedRate.
+	//   lastProbeAt   — last time the paced rate was probed upward, to rate-limit
+	//                   probing to rateProbeInterval.
+	rateEstimate  float64
+	tat           time.Time
+	observedRate  float64
+	lastSuccessAt time.Time
+	lastProbeAt   time.Time
 }
 
 // AccountPool 账号池
@@ -520,6 +541,20 @@ func (p *AccountPool) InflightCount(id string) int {
 	return 0
 }
 
+// RateState reports an account's adaptive RATE-pacer state under a single lock,
+// for the dashboard's realtime display and for tests. pacedRate is the learned
+// GCRA rate in requests/sec (0 = UNPACED, running full speed gated only by
+// concurrency); observedRate is the EWMA of achieved success throughput
+// (req/sec) used to seed the snap-down on a 429. See rate_pacer.go.
+func (p *AccountPool) RateState(id string) (pacedRate, observedRate float64) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if cd, ok := p.cooldowns[id]; ok {
+		return cd.rateEstimate, cd.observedRate
+	}
+	return 0, 0
+}
+
 // ConcurrencyState reports an account's live in-flight count and its current
 // AIMD concurrency limit under a single lock, for the dashboard's per-account
 // realtime display. The limit reflects what the picker would enforce right now:
@@ -649,15 +684,32 @@ func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) 
 		candidates := eligible
 		if reserve {
 			admittable := candidates[:0:0] // fresh slice; don't alias eligible
+			rateSaturated := false
 			for _, i := range eligible {
-				if p.inflightLocked(p.accounts[i].ID) < p.limitLocked(p.accounts[i].ID) {
-					admittable = append(admittable, i)
+				id := p.accounts[i].ID
+				// Concurrency gate: skip accounts already at their AIMD in-flight
+				// limit so a burst can't pile onto a saturated identity.
+				if p.inflightLocked(id) >= p.limitLocked(id) {
+					continue
 				}
+				// Rate gate (GCRA): skip accounts whose paced bucket says "too
+				// early". Unpaced accounts (rateEstimate==0) always pass — we only
+				// pace an account after it has taught us its rate via a 429.
+				if !p.rateAdmitLocked(id, now) {
+					rateSaturated = true
+					continue
+				}
+				admittable = append(admittable, i)
 			}
 			if len(admittable) == 0 {
-				// Every eligible account is at its concurrency limit (busy, not
-				// cooling). Ask the caller to retry shortly; a slot frees as
-				// in-flight requests complete.
+				// Every eligible account is busy — either at its concurrency limit
+				// or rate-paced (not cooling). Ask the caller to retry shortly; a
+				// concurrency slot frees as requests complete, and a paced bucket
+				// refills within an emission interval. Either way the existing
+				// admission-wait budget in the dispatcher smooths this into a short
+				// delay instead of a 429. rateSaturated is folded in implicitly:
+				// the same saturationPollInterval hint applies.
+				_ = rateSaturated
 				return nil, saturationPollInterval, false
 			}
 			candidates = admittable
@@ -674,6 +726,9 @@ func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) 
 		}
 		if reserve {
 			p.reserveLocked(p.accounts[winner].ID)
+			// Advance the GCRA TAT for the paced account so the next pick sees the
+			// consumed token. No-op for an unpaced account (rateEstimate==0).
+			p.rateAdvanceLocked(p.accounts[winner].ID, now)
 		}
 	}
 
@@ -714,6 +769,39 @@ func (p *AccountPool) reserveLocked(id string) {
 	cd.inflight++
 }
 
+// rateAdmitLocked reports whether the GCRA pacer admits a request for this
+// account at `now`. An account with no learned rate (rateEstimate <= 0) is
+// UNPACED and always admitted — we only pace after a 429 has taught us the
+// rate. Caller must hold p.mu.
+func (p *AccountPool) rateAdmitLocked(id string, now time.Time) bool {
+	cd := p.cooldowns[id]
+	if cd == nil || cd.rateEstimate <= 0 {
+		return true
+	}
+	emission := emissionInterval(cd.rateEstimate)
+	tau := time.Duration(rateBurstTolerance * float64(emission))
+	return gcraAdmit(now, cd.tat, tau)
+}
+
+// rateAdvanceLocked steps the GCRA TAT forward by one emission interval for a
+// paced account, recording that a token was consumed. A per-account phase
+// offset is applied on the FIRST advance (when tat is zero) so two accounts'
+// pacing cycles are staggered and a synchronized client burst doesn't drain
+// both buckets at the same instant. No-op for an unpaced account. Caller must
+// hold p.mu.
+func (p *AccountPool) rateAdvanceLocked(id string, now time.Time) {
+	cd := p.cooldowns[id]
+	if cd == nil || cd.rateEstimate <= 0 {
+		return
+	}
+	emission := emissionInterval(cd.rateEstimate)
+	if cd.tat.IsZero() {
+		// Seed the cycle at a staggered phase so peers don't fire in lockstep.
+		cd.tat = now.Add(phaseOffset(id, emission))
+	}
+	cd.tat = gcraAdvance(now, cd.tat, emission)
+}
+
 // decayCountersLocked drops cooldown state for accounts whose last error is
 // older than errorCounterDecay AND whose cooldown timer has already expired.
 // Without this, an account that flaps with intermittent 429s separated by
@@ -737,6 +825,19 @@ func (p *AccountPool) decayCountersLocked(now time.Time) {
 		// age out the error history instead so backoff resets but the live
 		// concurrency state survives.
 		if cd.inflight > 0 {
+			cd.lastErrorAt = time.Time{}
+			cd.lastSleep = 0
+			cd.consecutiveErrs = 0
+			continue
+		}
+		// Don't drop an entry that carries a LEARNED PACED RATE. Deleting it
+		// would reset the account to unpaced (full-speed), so the next burst
+		// would re-trip the 429 we already learned to avoid — a sawtooth at the
+		// decay period. The probe-up path (RecordSuccess) keeps climbing the
+		// rate back toward the true ceiling at +5%/probe, so a stale-but-low
+		// estimate self-corrects without ever needing to re-discover via a 429.
+		// Age out only the error history.
+		if cd.rateEstimate > 0 {
 			cd.lastErrorAt = time.Time{}
 			cd.lastSleep = 0
 			cd.consecutiveErrs = 0
@@ -767,16 +868,38 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 // quota state (UsageCurrent ≥ UsageLimit) is unaffected and continues to be
 // enforced by computeEffectiveWeight on the next Reload.
 //
+// It also feeds the RATE pacer (see rate_pacer.go): every success folds the
+// inter-success interval into the achieved-throughput EWMA (used to seed the
+// snap-down on a future 429), and — if the account is currently paced — probes
+// the paced rate upward by +5% once per rateProbeInterval so it climbs back
+// toward the true ceiling instead of staying pinned at half.
+//
 // We preserve the cooldown entry (rather than deleting it) so the AIMD limit
-// survives across requests; the soft-cooldown fields are cleared instead.
+// AND the learned paced rate survive across requests; the soft-cooldown fields
+// are cleared instead.
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cd := p.cooldowns[id]
 	if cd == nil {
 		// No prior state: nothing to clear, and a fresh account starts at the
-		// initial limit implicitly (limitLocked treats absent as initial).
-		return
+		// initial limit implicitly (limitLocked treats absent as initial). We
+		// create an entry to begin observing throughput so a later 429 has a
+		// measured rate to snap down from instead of falling to the floor blind.
+		cd = &cooldownEntry{limit: aimdInitialLimit}
+		p.cooldowns[id] = cd
+	}
+	now := time.Now()
+	// Observe achieved throughput: fold the inter-success interval into the EWMA.
+	if !cd.lastSuccessAt.IsZero() {
+		cd.observedRate = updateObservedRate(cd.observedRate, now.Sub(cd.lastSuccessAt))
+	}
+	cd.lastSuccessAt = now
+	// Probe the paced rate upward on sustained success (AIMD additive-increase),
+	// rate-limited to once per rateProbeInterval. Only when actually paced.
+	if cd.rateEstimate > 0 && now.Sub(cd.lastProbeAt) >= rateProbeInterval {
+		cd.rateEstimate = aimdRateProbe(cd.rateEstimate)
+		cd.lastProbeAt = now
 	}
 	// Clear soft-cooldown / error state.
 	cd.until = time.Time{}
@@ -792,9 +915,14 @@ func (p *AccountPool) RecordSuccess(id string) {
 		limit++
 	}
 	cd.limit = limit
-	// If the entry now carries no useful state (no inflight, default limit,
-	// no error history), drop it to keep the map small.
-	if cd.inflight == 0 && cd.limit == aimdInitialLimit && cd.lastErrorAt.IsZero() {
+	// Drop the entry only when it carries NO useful state at all. A
+	// lastSuccessAt measurement must survive so the NEXT success can compute the
+	// inter-success interval that feeds observedRate (the foundation of "discover
+	// then pace") — deleting it here was silently resetting the measurement
+	// between every pair of successes. Idle measurement-only entries are reaped
+	// later by decayCountersLocked.
+	if cd.inflight == 0 && cd.limit == aimdInitialLimit && cd.lastErrorAt.IsZero() &&
+		cd.rateEstimate == 0 && cd.observedRate == 0 && cd.lastSuccessAt.IsZero() {
 		delete(p.cooldowns, id)
 	}
 }
@@ -847,6 +975,7 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 		cd.lastSleep = clamped
 		cd.consecutiveErrs = 0
 		p.aimdDecreaseLocked(cd)
+		p.rateDecreaseLocked(cd)
 
 	case isQuotaError:
 		// Decorrelated jitter: sleep = random(base, min(cap, prev × 3)).
@@ -869,6 +998,7 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 		cd.lastSleep = jittered
 		cd.consecutiveErrs = 0
 		p.aimdDecreaseLocked(cd)
+		p.rateDecreaseLocked(cd)
 
 	default:
 		cd.consecutiveErrs++
@@ -901,6 +1031,25 @@ func (p *AccountPool) aimdDecreaseLocked(cd *cooldownEntry) {
 		limit = aimdMinLimit
 	}
 	cd.limit = limit
+}
+
+// rateDecreaseLocked applies the AIMD multiplicative-decrease to the learned
+// PACED RATE on a quota error: rate = max(rateMinPaced, observedRate × 0.5).
+// This is the "discover then pace" snap-down — the first 429 AFTER we have
+// measured throughput turns an unpaced account into a paced one at half the
+// rate it was actually achieving; a subsequent 429 cuts further. When no
+// throughput was ever measured (observedRate == 0) aimdRateDecrease returns 0
+// and the account stays UNPACED — the cooldown + concurrency AIMD handle that
+// case, exactly as before the pacer existed. The TAT is reset so pacing starts
+// cleanly from the new rate on the next pick. Caller must hold p.mu.
+func (p *AccountPool) rateDecreaseLocked(cd *cooldownEntry) {
+	newRate := aimdRateDecrease(cd.observedRate)
+	if newRate <= 0 {
+		return // unmeasured: stay unpaced
+	}
+	cd.rateEstimate = newRate
+	cd.tat = time.Time{}
+	cd.lastProbeAt = time.Now()
 }
 
 // cooldownExpiryJitterDuration returns a random duration in [0, cooldownExpiryJitter)
@@ -1013,7 +1162,15 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			totalTokens := p.accounts[i].TotalTokens
 			totalCredits := p.accounts[i].TotalCredits
 			lastUsed := p.accounts[i].LastUsed
-			go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+			// Synchronous: UpdateAccountStats now only takes cfgLock and sets a
+			// dirty flag (the background StatsSaver does the actual disk write),
+			// so there is no I/O to offload. Spawning a goroutine per successful
+			// request bought nothing and was un-recovered — a panic there would
+			// crash the process (net/http only recovers the request goroutine).
+			// The pool.mu -> cfgLock order here matches the established ordering
+			// (Reload -> GetEnabledAccounts), so no deadlock; config never calls
+			// back into the pool.
+			_ = config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 			return
 		}
 	}

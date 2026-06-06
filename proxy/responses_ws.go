@@ -149,7 +149,12 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 	thinking := resolveThinkingWithEffort(suffixThinking, effort)
 
-	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
+	// Reserve an in-flight slot via the AIMD-aware picker so the Codex WS path
+	// participates in the same per-account concurrency gate as every other path
+	// (it previously used the non-reserving picker and bypassed the gate). No
+	// failover on this path, so a single Acquire/Release pair is correct; the
+	// slot is released when the handler returns.
+	account, retryAfter, ok := h.pool.AcquireForModelExcluding(mappedModel, nil)
 	if !ok {
 		errMsg := "No available accounts"
 		errType := "server_error"
@@ -163,10 +168,11 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
+	defer h.pool.Release(account.ID)
 	if err := h.ensureValidToken(account); err != nil {
 		_ = conn.WriteJSON(map[string]interface{}{
 			"event": "error",
-			"data":  map[string]interface{}{"type": "server_error", "message": "Token refresh failed: " + err.Error()},
+			"data":  map[string]interface{}{"type": "server_error", "message": safeUpstreamError("responses-ws token refresh", err)},
 		})
 		return
 	}
@@ -242,7 +248,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	if err := CallKiroAPI(account, kiroPayload, callback); err != nil {
+	if err := CallKiroAPIContext(r.Context(), account, kiroPayload, callback); err != nil {
 		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID, kiroPayload.ResolvedEffort)
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",

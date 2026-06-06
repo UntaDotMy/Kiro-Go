@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"kiro-go/config"
@@ -65,7 +66,14 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	thinking := resolveThinkingWithEffort(suffixThinking, effort)
 
-	account, retryAfter, ok := h.pool.GetNextForModel(mappedModel)
+	// Reserve an in-flight slot via the AIMD-aware picker so Responses/Codex
+	// traffic participates in the same per-account concurrency gate as the
+	// Claude/OpenAI paths. Without this, Responses requests didn't increment
+	// inflight and could pile onto an account on top of the reserved main-path
+	// requests, defeating the saturation protection for mixed Codex+Claude load.
+	// The slot is released once the synchronous stream/non-stream call below
+	// returns (no failover here, so a single Acquire/Release pair is correct).
+	account, retryAfter, ok := h.pool.AcquireForModelExcluding(mappedModel, nil)
 	if !ok {
 		if retryAfter > 0 {
 			setRetryAfter(w, retryAfter)
@@ -75,8 +83,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		h.sendResponsesError(w, 503, "server_error", "No available accounts")
 		return
 	}
+	defer h.pool.Release(account.ID)
 	if err := h.ensureValidToken(account); err != nil {
-		h.sendResponsesError(w, 503, "server_error", "Token refresh failed: "+err.Error())
+		h.sendResponsesError(w, 503, "server_error", safeUpstreamError("responses token refresh", err))
 		return
 	}
 
@@ -107,15 +116,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// path emits a response.created skeleton up front, so a mid-flight
 	// switch would require replaying that handshake. We keep it simple here.
 	if req.Stream {
-		h.handleResponsesStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
+		h.handleResponsesStream(r.Context(), w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
 	} else {
-		h.handleResponsesNonStream(w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
+		h.handleResponsesNonStream(r.Context(), w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
 	}
 }
 
 // handleResponsesNonStream blocks until upstream is done, then returns one
 // JSON Responses payload.
-func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
+func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
 	var content, reasoning string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
@@ -140,9 +149,9 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	if err := CallKiroAPI(account, payload, callback); err != nil {
+	if err := CallKiroAPIContext(ctx, account, payload, callback); err != nil {
 		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
-		h.sendResponsesError(w, 500, "server_error", err.Error())
+		h.sendResponsesError(w, 500, "server_error", safeUpstreamError("responses upstream call", err))
 		return
 	}
 
@@ -192,7 +201,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, account *confi
 // Reasoning, when present, is emitted as a separate output_item BEFORE the
 // message item, with reasoning_summary_text deltas. Function calls are emitted
 // as their own output_items with function_call_arguments deltas.
-func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
+func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -509,7 +518,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, account *config.A
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	if err := CallKiroAPI(account, payload, callback); err != nil {
+	if err := CallKiroAPIContext(ctx, account, payload, callback); err != nil {
 		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
 		// Emit failure events Codex understands.
 		h.sendResponsesEvent(w, flusher, "response.failed", map[string]interface{}{

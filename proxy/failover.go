@@ -92,14 +92,28 @@ const admissionWaitBudget = 750 * time.Millisecond
 //     so the caller can emit a real Retry-After with its 429.
 //   - err: the last upstream error when no attempt committed; nil on success.
 func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamWorker) (committed bool, retryAfter time.Duration, err error) {
+	return h.runWithFailoverCounted(model, apiKeyID, effort, worker, true)
+}
+
+// runWithFailoverCounted is the implementation behind runWithFailover. When
+// countGlobalFailure is false, the terminal "all attempts failed" path does NOT
+// bump the global failed-request counter — used by the agentic loops
+// (runKiroCollect), which run several buffered rounds per client request and
+// own the single global success/failure accounting themselves. Without this, a
+// round failure inside the loop double-counted: one global failure here PLUS the
+// loop's own once-per-request success bump. Per-account cooldown bookkeeping
+// (recordAttemptError, inside the worker) runs regardless and is always correct.
+func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker streamWorker, countGlobalFailure bool) (committed bool, retryAfter time.Duration, err error) {
 	tried := make(map[string]bool, maxFailoverAttempts)
 	var lastErr error
 	var lastRetryAfter time.Duration
 
 	// recordTerminal bumps the single global failed-request counter once, for
 	// the request as a whole, when we're about to give up without committing.
+	// Suppressed when an outer aggregator (the agentic loops) owns global
+	// accounting for the whole client request.
 	recordTerminal := func() {
-		if lastErr != nil {
+		if lastErr != nil && countGlobalFailure {
 			h.recordFailure(model, apiKeyID, effort)
 		}
 	}

@@ -12,8 +12,10 @@ import (
 )
 
 // TestIsRetryableUpstreamError pins the failover classifier contract: 429 /
-// quota / 5xx / connection errors are retryable on a peer account; auth (401/
-// 403), payment (402/OVERAGE), and client cancellation are terminal.
+// quota / 5xx / connection errors AND auth (401/403) are retryable on a PEER
+// account (tokens are per-account, and the dead account is already disabled +
+// excluded, so failover rotates to a healthy peer rather than 503-ing). Payment
+// (402/OVERAGE) and client cancellation stay terminal.
 func TestIsRetryableUpstreamError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -31,8 +33,8 @@ func TestIsRetryableUpstreamError(t *testing.T) {
 		{"connection reset", errors.New("read tcp: connection reset by peer"), true},
 		{"eof", errors.New("unexpected EOF"), true},
 		{"timeout", errors.New("net/http: request timeout"), true},
-		{"401 auth terminal", errors.New("HTTP 401 from Kiro IDE: unauthorized"), false},
-		{"403 auth terminal", errors.New("HTTP 403 from Kiro IDE: forbidden"), false},
+		{"401 retryable on peer", errors.New("HTTP 401 from Kiro IDE: unauthorized"), true},
+		{"403 retryable on peer", errors.New("HTTP 403 from Kiro IDE: forbidden"), true},
 		{"402 payment terminal", errors.New("HTTP 402 from Kiro IDE: payment required"), false},
 		{"overage terminal", errors.New("HTTP 402 OVERAGE limit reached"), false},
 		{"context canceled", context.Canceled, false},

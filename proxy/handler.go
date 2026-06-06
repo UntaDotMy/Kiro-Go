@@ -358,6 +358,9 @@ func NewHandler() *Handler {
 	safeGo("backgroundRefresh", h.backgroundRefresh)
 	// 启动后台统计保存 (每30秒保存一次)
 	safeGo("backgroundStatsSaver", h.backgroundStatsSaver)
+	// Periodic sweep of the admin brute-force map so a distributed attack from
+	// many distinct single-attempt IPs can't grow it without bound.
+	h.startAdminFailSweeper()
 	return h
 }
 
@@ -789,6 +792,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// (SSE streaming) or a WebSocket upgrade — Codex CLI's experimental
 		// "responses_websockets" feature flag uses the WS variant.
 		if isWebSocketUpgrade(r) {
+			// Apply the same global rate-limit backstop as the HTTP path BEFORE
+			// the upgrade — otherwise a WS client could open unbounded long-lived
+			// streaming connections that never consume a global token. A 429
+			// before the handshake cleanly fails the upgrade.
+			if h.enforceGlobalRateLimit(w, "responses") {
+				return
+			}
 			h.handleResponsesWebSocket(w, r)
 			return
 		}
@@ -1742,9 +1752,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		// previous failed one.
 		kiroPayload.ProfileArn = ""
 		if req.Stream {
-			return h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
+			return h.handleClaudeStream(r.Context(), w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
 		}
-		return h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
+		return h.handleClaudeNonStream(r.Context(), w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
 	}
 
 	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
@@ -1768,7 +1778,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 429, "rate_limit_error", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
 		return
 	}
-	h.sendClaudeError(w, 503, "api_error", err.Error())
+	h.sendClaudeError(w, 503, "api_error", safeUpstreamError("claude messages failover", err))
 }
 
 // handleClaudeStream Claude 流式响应. Returns (committed, err). It defers the
@@ -1777,7 +1787,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 // (false, err) and lets the dispatcher fail over to another account without
 // the client ever seeing a partial stream. Once any frame is flushed,
 // committed=true and a later error is surfaced inline as an SSE error event.
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) (bool, error) {
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) (bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
@@ -2068,7 +2078,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := CallKiroAPIContext(ctx, account, payload, callback)
 	// Upstream is done (or failed). Stop the heartbeat BEFORE writing any
 	// terminal/error frame so a ping can never land after message_stop.
 	stopHB()
@@ -2358,7 +2368,7 @@ func (h *Handler) checkOverageError(err error, accountID string) {
 // is true once the response has been written to the client. On a pre-commit
 // upstream failure it returns (false, err) so the dispatcher can fail over
 // to another account; the dispatcher (not this function) records the error.
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) (bool, error) {
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile, apiKeyID string) (bool, error) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
@@ -2391,7 +2401,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := CallKiroAPIContext(ctx, account, payload, callback)
 	if err != nil {
 		// Nothing written to the client yet — let the dispatcher fail over.
 		// Cool this account (+ overage flip) now; the dispatcher records the
@@ -2466,6 +2476,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	return true, nil
 }
 
+// safeUpstreamError logs the real upstream error server-side and returns a
+// generic, non-revealing message for the client. Raw upstream (AWS / Kiro)
+// error strings routinely embed the profile ARN, endpoint host, account region,
+// and other backend identifiers; surfacing err.Error() verbatim to a client who
+// can deliberately trigger a failure leaks that infrastructure detail. Operators
+// still get the full cause in the logs.
+func safeUpstreamError(context string, err error) string {
+	logger.Errorf("[upstream] %s: %v", context, err)
+	return "Upstream service temporarily unavailable"
+}
+
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -2536,9 +2557,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	worker := func(account *config.Account) (bool, error) {
 		kiroPayload.ProfileArn = "" // re-resolve per attempt account
 		if req.Stream {
-			return h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+			return h.handleOpenAIStream(r.Context(), w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
 		}
-		return h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+		return h.handleOpenAINonStream(r.Context(), w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
 	}
 
 	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
@@ -2559,12 +2580,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 429, "rate_limit_exceeded", "All accounts are rate limited; retry after "+strconv.Itoa(retryAfterSeconds(retryAfter))+"s")
 		return
 	}
-	h.sendOpenAIError(w, 503, "server_error", err.Error())
+	h.sendOpenAIError(w, 503, "server_error", safeUpstreamError("openai chat failover", err))
 }
 
 // handleOpenAIStream OpenAI 流式响应. Returns (committed, err): defers the
 // first chunk so a pre-commit failure can fail over to another account.
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
+func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
@@ -2592,8 +2613,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	// the single choke point for streaming bytes: it sets the SSE headers +
 	// committed on first use, then writes & flushes one data frame. Before
 	// the first emit, a failure can be retried on a peer account.
+	//
+	// writeMu serializes every write to the client so the downstream heartbeat
+	// goroutine (below) can never interleave a half-written frame with a
+	// callback-driven chunk. All client writes — chunks, heartbeats, the [DONE]
+	// frame — go through emit/emitRaw under this lock.
+	var writeMu sync.Mutex
 	committed := false
-	emit := func(data []byte) {
+	emitLocked := func(data []byte) {
 		if !committed {
 			committed = true
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -2603,6 +2630,30 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		writeOpenAIDataFrame(w, data)
 		flusher.Flush()
 	}
+	emit := func(data []byte) {
+		writeMu.Lock()
+		emitLocked(data)
+		writeMu.Unlock()
+	}
+
+	// Downstream heartbeat: once committed, emit an SSE comment every
+	// streamHeartbeatInterval while the upstream is silent. A comment line
+	// (": ...\n\n") is ignored by OpenAI SSE clients but keeps a quiet
+	// generation (a long thinking pause, a slow tool gap) from looking like a
+	// dead connection to the client's idle timer — matching the Claude path.
+	// The tick writes under writeMu and only after commit, and the returned
+	// stop joins the goroutine before any terminal frame is written, so a
+	// heartbeat can never follow [DONE].
+	stopHB := startSSEHeartbeat(streamHeartbeatInterval, func() {
+		writeMu.Lock()
+		if committed {
+			rollWriteDeadline(w)
+			w.Write([]byte(": ping\n\n"))
+			flusher.Flush()
+		}
+		writeMu.Unlock()
+	})
+	defer stopHB()
 
 	// Thinking 标签解析状态由 thinkingTextProcessor 内部管理。
 
@@ -2774,7 +2825,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := CallKiroAPIContext(ctx, account, payload, callback)
+	// Upstream is done (or failed). Stop the heartbeat BEFORE reading committed
+	// or writing any terminal frame so a ping can never land after [DONE].
+	stopHB()
 	if err != nil {
 		if !committed {
 			// Nothing reached the client — let the dispatcher fail over.
@@ -2855,7 +2909,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 
 // handleOpenAINonStream OpenAI 非流式响应. Returns (committed, err); on a
 // pre-commit upstream failure returns (false, err) for dispatcher failover.
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
+func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
 	var content string
 	var reasoningContent string
 	var toolUses []KiroToolUse
@@ -2881,7 +2935,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := CallKiroAPIContext(ctx, account, payload, callback)
 	if err != nil {
 		// Nothing written yet — cool this account and let the dispatcher
 		// fail over (it records the single global failure on giving up).
@@ -3160,6 +3214,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		// 获取运行时统计
 		stats := statsMap[a.ID]
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
+		pacedRate, observedRate := h.pool.RateState(a.ID)
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -3206,6 +3261,8 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"lastUsed":          stats.LastUsed,
 			"inflight":          inflight,
 			"concurrencyLimit":  concurrencyLimit,
+			"pacedRate":         pacedRate,
+			"observedRate":      observedRate,
 			"cooldownSecs":      int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds()),
 			"overQuota":         a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit,
 		}
@@ -4846,10 +4903,50 @@ func validateProxyURL(raw string) string {
 		return "proxyURL is not a valid URL: " + err.Error()
 	}
 	host := u.Hostname()
+	if host == "" {
+		return "proxyURL has no host"
+	}
+	// A literal IP is checked directly. A hostname is resolved and EVERY
+	// resolved address is checked, because net.ParseIP returns nil for a
+	// hostname — so without resolution a name like "metadata.internal" (or an
+	// attacker-controlled name that resolves to 169.254.169.254) would slip
+	// past the link-local guard and the AWS bearer token would be routed
+	// through it. Resolution is BEST-EFFORT: a host that doesn't resolve at
+	// validation time is allowed through (the original permissive behavior for
+	// hostnames — the proxy host may legitimately not resolve from this machine,
+	// and a hard DNS gate would be flaky and itself a probe vector). DNS
+	// rebinding between this check and connect time is the residual risk, best
+	// closed at dial time; this blocks the straightforward hostname→metadata case.
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			return "proxyURL points at a link-local address (e.g. cloud metadata 169.254.169.254); refused. Set KIRO_ALLOW_LINKLOCAL_PROXY=1 to override."
+		if msg := proxyIPDisallowed(ip); msg != "" {
+			return msg
 		}
+		return ""
+	}
+	if addrs, err := net.LookupHost(host); err == nil {
+		for _, addr := range addrs {
+			ip := net.ParseIP(addr)
+			if ip == nil {
+				continue
+			}
+			if msg := proxyIPDisallowed(ip); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+// proxyIPDisallowed reports why an outbound-proxy IP is refused, or "" when it
+// is allowed. Link-local (the cloud instance-metadata range, 169.254.0.0/16 and
+// fe80::/10) is never a legitimate forward-proxy target and is the SSRF vector
+// that could exfiltrate the AWS bearer token. Private/LAN and loopback addresses
+// stay allowed — a local SOCKS5 or corporate proxy is the common legitimate
+// case (preserving the pre-existing policy; only the hostname-resolution gap is
+// being closed here).
+func proxyIPDisallowed(ip net.IP) string {
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return "proxyURL resolves to a link-local address (e.g. cloud metadata 169.254.169.254); refused. Set KIRO_ALLOW_LINKLOCAL_PROXY=1 to override."
 	}
 	return ""
 }

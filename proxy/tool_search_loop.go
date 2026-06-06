@@ -129,7 +129,11 @@ func (h *Handler) handleClaudeToolSearch(w http.ResponseWriter, req *ClaudeReque
 		res, err := h.runKiroCollect(model, apiKeyID, payload)
 		if err != nil {
 			if roundsRun == 0 {
-				h.sendClaudeError(w, 502, "api_error", "Upstream call failed: "+err.Error())
+				// runKiroCollect suppresses the global failure count (this loop
+				// owns once-per-request accounting), so record the single failure
+				// here for a total round-0 failure.
+				h.recordFailure(model, apiKeyID, payload.ResolvedEffort)
+				h.sendClaudeError(w, 502, "api_error", safeUpstreamError("tool-search upstream call", err))
 				return
 			}
 			break

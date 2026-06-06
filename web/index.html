@@ -1614,6 +1614,8 @@
                 'accounts.weight': '权重',
                 'accounts.inflight': '并发',
                 'accounts.inflightHint': '当前在途请求数 / 自适应并发上限（仅 least-request 策略）。上限在成功时 +1、遇到 429 时减为 3/4，自动逼近 AWS 的限流阈值。',
+                'accounts.paced': '限速',
+                'accounts.pacedHint': '该账号的自适应请求速率（次/秒，仅 least-request 策略）。空/0 = 不限速（全速）。遇到 429 后开始学习：速率降为实测吞吐的一半，随后在持续成功时每次 +5% 逐步探升，使账号稳定运行在隐藏令牌桶阈值之下，而不是反复撞上 429。',
                 'accounts.cooldown': '冷却中',
                 'accounts.cooldownHint': '该账号最近遇到 429/错误，正在冷却，调度器会跳过它，倒计时结束后自动恢复。',
                 'accounts.overQuota': '超额',
@@ -2034,6 +2036,8 @@
                 'accounts.weight': 'Weight',
                 'accounts.inflight': 'In-flight',
                 'accounts.inflightHint': 'Current outstanding requests / adaptive concurrency limit (least-request strategy only). The limit grows by 1 on success and drops to 3/4 on a 429, self-tuning toward the AWS throttle threshold.',
+                'accounts.paced': 'Paced',
+                'accounts.pacedHint': 'Adaptive request RATE for this account (req/sec, least-request strategy only). Blank/0 = unpaced (full speed). After a 429 the rate is learned: it snaps to half the measured throughput, then probes back up +5% on sustained success, so the account stays just below its hidden token bucket instead of bouncing off 429s.',
                 'accounts.cooldown': 'Cooling',
                 'accounts.cooldownHint': 'This account recently hit a 429/error and is in cooldown. The scheduler skips it until the countdown ends, then it auto-recovers.',
                 'accounts.overQuota': 'Over quota',
@@ -2475,6 +2479,7 @@
                     [0,1,2,3,4,5].map(w => '<option value="' + w + '"' + (weightVal === w ? ' selected' : '') + '>' + w + '</option>').join('') +
                     '</select></div><div class="account-stat-label">' + t('accounts.weight') + '</div></div>' +
                     (a.inflight !== undefined ? '<div class="account-stat" title="' + t('accounts.inflightHint') + '"><div class="account-stat-value">' + (a.inflight || 0) + ' / ' + (a.concurrencyLimit || 0) + '</div><div class="account-stat-label">' + t('accounts.inflight') + '</div></div>' : '') +
+                    (a.pacedRate ? '<div class="account-stat" title="' + t('accounts.pacedHint') + '"><div class="account-stat-value">' + a.pacedRate.toFixed(1) + '/s</div><div class="account-stat-label">' + t('accounts.paced') + '</div></div>' : '') +
                     '</div>' +
                     '</div>';
             }).join('');
@@ -4030,6 +4035,7 @@
                     'trialUsageCurrent','trialUsageLimit','trialUsagePercent',
                     'requestCount','errorCount','totalTokens','totalCredits',
                     'lastUsed','lastRefresh','inflight','concurrencyLimit',
+                    'pacedRate','observedRate',
                     'cooldownSecs','overQuota'];
                 for (const f of fields) {
                     if (s[f] !== undefined && a[f] !== s[f]) { a[f] = s[f]; changed = true; }
@@ -4094,9 +4100,12 @@
                 const url = proto + '//' + location.host + '/admin/ws/status';
                 // Subprotocol must be a token (no comma, no whitespace).
                 // We pass the admin password after the prefix; the server
-                // verifies it with constant-time compare and echoes the
-                // matching subprotocol back to complete the handshake.
-                const ws = new WebSocket(url, ['admin-password.' + password]);
+                // verifies it with constant-time compare and echoes back a
+                // STATIC non-sensitive token ('kiro-admin-v1') to complete the
+                // handshake — never the password-bearing token, so the password
+                // can't leak into the 101 response header / proxy logs. Both are
+                // offered here so the server's echoed choice is one we offered.
+                const ws = new WebSocket(url, ['admin-password.' + password, 'kiro-admin-v1']);
                 dashboardWS = ws;
                 ws.onmessage = (ev) => {
                     if (document.getElementById('mainPage').classList.contains('hidden')) return;
@@ -4636,6 +4645,7 @@
                     '</select>';
 
                 const inflight = (a.inflight !== undefined) ? '<div class="acct-sub num" title="' + t('accounts.inflightHint') + '">' + t('accounts.inflight') + ' ' + (a.inflight || 0) + '/' + (a.concurrencyLimit || 0) + '</div>' : '';
+                const pacedSub = a.pacedRate ? '<div class="acct-sub num" title="' + t('accounts.pacedHint') + '">' + t('accounts.paced') + ' ' + a.pacedRate.toFixed(1) + '/s</div>' : '';
 
                 const actions = '<div class="row-actions">' +
                     '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccount(\'' + a.id + '\')" title="' + t('accounts.refresh') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
@@ -4656,7 +4666,7 @@
                     '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
                     '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
                     '<td class="cell-num">' + (a.totalCredits || 0).toFixed(1) + '</td>' +
-                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + '</td>' +
+                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + pacedSub + '</td>' +
                     '<td>' + weightSelect + '</td>' +
                     '<td>' + actions + '</td>' +
                     '</tr>';
