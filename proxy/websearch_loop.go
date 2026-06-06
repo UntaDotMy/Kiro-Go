@@ -112,7 +112,12 @@ func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (
 		return false, nil
 	}
 
-	_, _, err := h.runWithFailover(model, apiKeyID, payload.ResolvedEffort, worker)
+	// countGlobalFailure=false: the agentic loop (handleClaudeWebSearch /
+	// handleClaudeToolSearch) records exactly one global success or failure for
+	// the whole client request after all rounds finish, so a per-round terminal
+	// failure here must NOT also bump the global counter (that double-counted a
+	// request that succeeded one round then failed a later one).
+	_, _, err := h.runWithFailoverCounted(model, apiKeyID, payload.ResolvedEffort, worker, false)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +170,11 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 			// rather than discarding it; the partial usage is still debited
 			// below. Only a round-0 failure (nothing produced) is a hard error.
 			if roundsRun == 0 {
-				h.sendClaudeError(w, 502, "api_error", "Upstream call failed: "+err.Error())
+				// runKiroCollect suppresses the global failure count (this loop
+				// owns once-per-request accounting), so record the single failure
+				// here for a total round-0 failure.
+				h.recordFailure(model, apiKeyID, payload.ResolvedEffort)
+				h.sendClaudeError(w, 502, "api_error", safeUpstreamError("web-search upstream call", err))
 				return
 			}
 			break

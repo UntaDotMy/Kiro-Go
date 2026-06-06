@@ -142,6 +142,29 @@ func sweepAdminFailsLocked() {
 	}
 }
 
+// startAdminFailSweeper periodically sweeps expired records independent of the
+// failure path. The opportunistic sweep in recordAdminFailure only fires when
+// SOME IP fails again, so a distributed attack from many distinct single-attempt
+// IPs would accumulate entries that are never swept (each IP never retries). A
+// background ticker bounds the map to entries from the last adminFailureWindow
+// regardless of attack pattern. Stops on the handler's shutdown signal.
+func (h *Handler) startAdminFailSweeper() {
+	safeGo("adminFailSweeper", func() {
+		ticker := time.NewTicker(adminFailureWindow)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				adminFailMu.Lock()
+				sweepAdminFailsLocked()
+				adminFailMu.Unlock()
+			case <-h.stopRefresh:
+				return
+			}
+		}
+	})
+}
+
 // resetAdminFailures clears the failure counter for the IP after a successful
 // auth, so a previously-suspect IP that gets the password right doesn't stay
 // rate-limited.

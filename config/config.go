@@ -245,10 +245,20 @@ type Config struct {
 	// deferred tool descriptions, and expands only the matched tools — reshaping
 	// the result into native server_tool_use + tool_search_tool_result blocks.
 	// This keeps both the client context AND the upstream CodeWhisperer context
-	// small. ON by default like WebSearchEnabled, but completely inert unless a
-	// request actually carries a tool_search tool with deferred tools (which only
-	// happens when the client opts in), so the default is safe. A nil pointer
-	// means "use the default (on)"; set it explicitly to false to opt out.
+	// small WHEN it works.
+	//
+	// OFF by default. The emulation depends on the upstream CodeWhisperer/Kiro
+	// model reliably CALLING the synthetic search tool to discover its deferred
+	// tools, and that indirection is unreliable: the model often narrates an
+	// action and ends the turn without ever calling the search tool, so its real
+	// tools never become visible and it emits no tool_use ("narrate then stop").
+	// With this OFF, a tool_search request falls through to the normal path,
+	// which drops the unsupported search server tool and forwards every real tool
+	// eagerly (defer_loading ignored) so the model calls tools directly — the same
+	// fallback Claude Code itself uses on a non-first-party ANTHROPIC_BASE_URL,
+	// and what the sibling kiro2api / kiro-gateway relays do. A nil pointer means
+	// "use the default (off)"; set it explicitly to true to opt into the emulation
+	// (trades reliability for tool-definition token savings).
 	ToolSearchEnabled *bool `json:"toolSearchEnabled,omitempty"`
 
 	// GlobalRateLimitPerMinute caps the proxy's TOTAL inbound request rate
@@ -337,7 +347,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A14"
+const Version = "1.0.10-A16"
 
 var (
 	cfg     *Config
@@ -525,6 +535,13 @@ func writeConfigBytes(data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	// Restrict the file to the owning user before the rename. NOTE: on Windows
+	// os.Chmod only maps the read-only bit — NTFS permissions are governed by
+	// ACLs, not POSIX mode, so 0600 does NOT restrict who can read the file
+	// there. config.json holds AWS tokens, the bcrypt admin hash, and API-key
+	// secrets, so on a multi-user Windows host the data directory must be
+	// ACL-restricted to the service account out of band (documented in the
+	// README). On Linux/macOS this enforces 0600 as intended.
 	if err := os.Chmod(tmpPath, 0600); err != nil {
 		return err
 	}
@@ -1411,16 +1428,20 @@ func UpdateWebSearchEnabled(enabled bool) error {
 }
 
 // GetToolSearchEnabled reports whether proxy-side tool-search emulation is on.
-// Default TRUE, mirroring GetWebSearchEnabled: a nil pointer (fresh install or
-// a config predating this field) means "use the default", which is on. The
-// feature stays inert unless an inbound request actually carries a tool_search
-// server tool with deferred tools, so defaulting on costs nothing for clients
-// that never opt in. Only an explicit false hard-disables it.
+// Default FALSE: a nil pointer (fresh install or a config predating an explicit
+// toggle) means "use the default", which is OFF. The emulation depends on the
+// upstream CodeWhisperer/Kiro model reliably calling a synthetic search tool to
+// discover its deferred tools; that indirection is unreliable (the model often
+// narrates then ends the turn without calling it, so it never sees its real
+// tools and emits no tool_use). With this OFF, a tool_search request falls
+// through to the normal path, which drops the unsupported search server tool
+// and forwards every real tool eagerly so the model calls tools directly. Only
+// an explicit true opts into the emulation.
 func GetToolSearchEnabled() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg == nil || cfg.ToolSearchEnabled == nil {
-		return true
+		return false
 	}
 	return *cfg.ToolSearchEnabled
 }

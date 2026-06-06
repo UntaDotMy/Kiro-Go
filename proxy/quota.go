@@ -205,12 +205,20 @@ func isRetryableUpstreamError(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	// Auth / payment are terminal for this account — do not fail over.
-	if strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403") || strings.Contains(msg, "HTTP 402") {
+	// Payment / overage is terminal: a 402 or OVERAGE is a billing state that a
+	// peer retry should not burn more accounts trying to beat. Keep it terminal.
+	if strings.Contains(msg, "HTTP 402") || strings.Contains(msg, "OVERAGE") {
 		return false
 	}
-	if strings.Contains(msg, "OVERAGE") {
-		return false
+	// Auth (401/403) is terminal for the FAILED account but retryable across
+	// accounts: tokens are per-account, so a revoked/expired token on account A
+	// says nothing about account B. recordPoolError has already disabled the
+	// dead account (disableAccountByID on isAuthErrorMessage) and it's in the
+	// dispatcher's `tried` set, so failover rotates to a healthy peer instead of
+	// returning a 503 while other accounts are fine — it cannot loop back onto
+	// the dead one, and maxFailoverAttempts bounds the rotation.
+	if strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403") {
+		return true
 	}
 	// 429 throttles and 5xx server errors are retryable on a peer account.
 	if strings.Contains(msg, "429") || strings.Contains(msg, "quota") {

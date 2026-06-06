@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -561,8 +562,23 @@ func sortRegionalEndpoints(endpoints []kiroEndpoint, preferred string, fallback 
 	return result
 }
 
-// CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
+// CallKiroAPI calls the Kiro streaming API with a background context. Retained
+// for callers without a request context (admin warmup/probe, agentic-loop
+// buffered rounds, tests). Request handlers should prefer CallKiroAPIContext so
+// a client disconnect cancels the upstream call.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIContext(context.Background(), account, payload, callback)
+}
+
+// CallKiroAPIContext calls the Kiro streaming API, trying each configured
+// endpoint with automatic fallback. The supplied ctx is the parent of each
+// per-endpoint attempt context, so cancelling it (e.g. the client disconnected)
+// aborts the in-flight upstream call instead of letting it run to completion and
+// burn account credits + hold an AIMD in-flight slot for nothing.
+func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Wrap OnToolUse to restore original tool names for the client.
 	if callback != nil && callback.OnToolUse != nil && len(payload.ToolNameMap) > 0 {
 		originalOnToolUse := callback.OnToolUse
@@ -622,10 +638,18 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 				continue
 			}
 			reqBody = body
-			// Debug dump only after a fresh marshal, gated on level so
-			// production INFO/WARN runs avoid the string conversion.
+			// At DEBUG, log only a non-sensitive summary by default. The full
+			// payload carries the entire conversation history + profileArn, so
+			// dumping it on every request silently persists user conversations to
+			// whatever sink DEBUG is wired to (file, stdout shipper, cloud logs)
+			// for as long as the level stays on. The raw dump is available behind
+			// an explicit opt-in (KIRO_DUMP_PAYLOADS=1) for deliberate debugging.
 			if logger.GetLevel() <= logger.LevelDebug {
-				logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
+				if os.Getenv("KIRO_DUMP_PAYLOADS") == "1" {
+					logger.Debugf("[KiroAPI] Request payload: %s", string(reqBody))
+				} else {
+					logger.Debugf("[KiroAPI] Request payload: %d bytes (set KIRO_DUMP_PAYLOADS=1 to log full body)", len(reqBody))
+				}
 			}
 		}
 
@@ -635,13 +659,14 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		// Each endpoint attempt gets its own cancellable context. Cancel is
-		// invoked either from idleTimeoutReader (no body activity for
-		// streamIdleTimeout) or from the deferred cleanup at end of attempt.
-		// Without this, a stuck stream would either hang indefinitely (since
-		// we removed Client.Timeout) or, with the old wall-clock cap, drop
-		// a still-progressing slow stream.
-		reqCtx, reqCancel := context.WithCancel(context.Background())
+		// Each endpoint attempt gets its own cancellable context derived from the
+		// caller's ctx. Cancel fires from idleTimeoutReader (no body activity for
+		// streamIdleTimeout), from the deferred cleanup at end of attempt, OR when
+		// the parent ctx is cancelled (client disconnect) — so a stuck or
+		// abandoned stream no longer runs to completion burning credits and an
+		// AIMD slot. Without this, a slow-but-progressing stream still runs
+		// indefinitely (the idle reader only trips on a stall), which is intended.
+		reqCtx, reqCancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
 
 		host := ""
@@ -711,12 +736,18 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// Wrap body in idleTimeoutReader so a stalled stream cancels the
 		// request context, but a slow-but-progressing stream is allowed to
 		// run indefinitely. parseEventStream reads frame-by-frame so any
-		// real progress resets the timer.
-		body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, reqCancel)
-		err = parseEventStream(body, callback)
-		resp.Body.Close()
-		reqCancel()
-		return classifyStreamError(err)
+		// real progress resets the timer. The Close + cancel are deferred inside
+		// a closure so they run even if a callback panics mid-parse (callbacks
+		// write to the client ResponseWriter and json.Marshal) — otherwise a
+		// panic would unwind past the inline cleanup and leak the connection and
+		// the context's supervisor goroutine.
+		streamErr := func() error {
+			defer resp.Body.Close()
+			defer reqCancel()
+			body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, reqCancel)
+			return parseEventStream(body, callback)
+		}()
+		return classifyStreamError(streamErr)
 	}
 
 	// Every endpoint returned 429: surface a single QuotaError carrying the

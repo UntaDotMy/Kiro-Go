@@ -124,6 +124,15 @@ var dashboardWsUpgrader = websocket.Upgrader{
 // 101 response, which is required to complete the handshake.
 const dashboardWSAuthSubprotocolPrefix = "admin-password."
 
+// dashboardWSAcceptSubprotocol is the non-sensitive value the server echoes in
+// the 101 Sec-WebSocket-Protocol response. We must NOT echo the password-bearing
+// "admin-password.<pw>" token: response headers land in reverse-proxy access
+// logs (nginx/ALB) and browser DevTools, which would leak the plaintext admin
+// password. The browser only requires the echoed subprotocol to be one it
+// offered, so the client offers this static token alongside the auth token and
+// the server selects this one.
+const dashboardWSAcceptSubprotocol = "kiro-admin-v1"
+
 // handleDashboardWS upgrades an admin dashboard WebSocket and starts a
 // goroutine that pumps hub broadcasts to the client. Heartbeat ping every
 // 30s; missed pong within 60s closes the connection.
@@ -132,13 +141,11 @@ func (h *Handler) handleDashboardWS(w http.ResponseWriter, r *http.Request) {
 	// comma-separated list per RFC 6455; we accept any element with the
 	// expected prefix.
 	var password string
-	var matchedProto string
 	for _, v := range r.Header.Values("Sec-WebSocket-Protocol") {
 		for _, raw := range strings.Split(v, ",") {
 			tok := strings.TrimSpace(raw)
 			if strings.HasPrefix(tok, dashboardWSAuthSubprotocolPrefix) {
 				password = strings.TrimPrefix(tok, dashboardWSAuthSubprotocolPrefix)
-				matchedProto = tok
 				break
 			}
 		}
@@ -153,10 +160,12 @@ func (h *Handler) handleDashboardWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Echo the matched subprotocol back so the browser handshake
-	// completes. Without this, browsers reject the upgrade.
+	// Echo a STATIC, non-sensitive subprotocol back so the browser handshake
+	// completes without leaking the password in the 101 response header. The
+	// client offers this token alongside the password-bearing auth token; the
+	// browser only requires the echoed value to be one it offered.
 	upgrader := dashboardWsUpgrader
-	upgrader.Subprotocols = []string{matchedProto}
+	upgrader.Subprotocols = []string{dashboardWSAcceptSubprotocol}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Warnf("[DashboardWS] upgrade failed: %v", err)
@@ -268,6 +277,7 @@ func (h *Handler) dashboardSnapshot() []byte {
 		}
 		st := poolStats[a.ID]
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
+		pacedRate, observedRate := h.pool.RateState(a.ID)
 		cooldownSecs := int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds())
 		overQuota := a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit
 		accountList = append(accountList, map[string]interface{}{
@@ -290,6 +300,8 @@ func (h *Handler) dashboardSnapshot() []byte {
 			"lastRefresh":       a.LastRefresh,
 			"inflight":          inflight,
 			"concurrencyLimit":  concurrencyLimit,
+			"pacedRate":         pacedRate,
+			"observedRate":      observedRate,
 			"cooldownSecs":      cooldownSecs,
 			"overQuota":         overQuota,
 		})
