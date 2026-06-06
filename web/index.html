@@ -2206,10 +2206,29 @@
                 password = '';
                 return;
             }
+            // Optimistic restore: a saved, non-expired password means the operator
+            // was logged in, so show the dashboard IMMEDIATELY instead of flashing
+            // the login page during the async verify. We then verify in the
+            // background and only fall back to login if the password is actually
+            // rejected (revoked / changed). This removes the login flash on every
+            // refresh while still re-authenticating each session.
+            showMain();
+            loadData();
             try {
                 const res = await fetch('/admin/api/status', { headers: { 'X-Admin-Password': password } });
-                if (res.ok) { showMain(); loadData(); }
-            } catch (e) { }
+                if (!res.ok) {
+                    // Password no longer valid — drop it and return to login.
+                    localStorage.removeItem('admin_password');
+                    localStorage.removeItem('admin_login_time');
+                    password = '';
+                    document.getElementById('mainPage').classList.add('hidden');
+                    document.getElementById('loginPage').classList.remove('hidden');
+                }
+            } catch (e) {
+                // Network blip — keep the optimistic view; the WS + poll fallback
+                // will recover when connectivity returns. Don't bounce to login on
+                // a transient error.
+            }
         }
         async function login() {
             password = document.getElementById('pwdField').value;
@@ -2419,70 +2438,6 @@
             } catch (e) {
                 alert(t('common.failed'));
             }
-        }
-        function renderAccounts() {
-            const container = document.getElementById('accountsList');
-            if (!container) return;
-            const filtered = getFilteredAccounts();
-            if (filtered.length === 0) {
-                container.innerHTML = '<p style="text-align:center;color:#64748b;padding:30px">' + t('accounts.empty') + '</p>';
-                return;
-            }
-            container.innerHTML = filtered.map(a => {
-                const usagePercent = (a.usagePercent || 0) * 100;
-                const usageClass = usagePercent > 90 ? 'critical' : usagePercent > 70 ? 'high' : '';
-                const trialUsagePercent = (a.trialUsagePercent || 0) * 100;
-                const trialUsageClass = trialUsagePercent > 90 ? 'critical' : trialUsagePercent > 70 ? 'high' : '';
-                const isSelected = selectedAccounts.has(a.id);
-                const weightVal = a.weight || 0;
-                const weightBadge = weightVal >= 2 ? '<span class="badge" style="background:#f59e0b;color:#fff">W:' + weightVal + '</span>' : '';
-                const overageBadge = a.allowOverage ? '<span class="badge badge-warning">' + t('accounts.overage') + ':' + (a.overageWeight || 1) + '</span>' : '';
-                let statusClass = '';
-                if (a.banStatus === 'BANNED') statusClass = ' is-banned';
-                else if (a.banStatus === 'SUSPENDED') statusClass = ' is-suspended';
-                else if (!a.enabled) statusClass = ' is-disabled';
-                return '<div class="account-card' + statusClass + '" style="' + (isSelected ? 'border-color:#7c3aed;background:#faf5ff' : '') + '">' +
-                    '<div class="account-header">' +
-                    '<div class="account-info" style="display:flex;align-items:center;gap:8px">' +
-                    '<input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="toggleSelectAccount(\'' + a.id + '\')" style="cursor:pointer;width:16px;height:16px;flex-shrink:0">' +
-                    '<div>' +
-                    '<div class="account-email">' + getDisplayEmail(a.email, a.id) + '</div>' +
-                    '<div class="account-meta">' +
-                    getSubBadge(a.subscriptionType) +
-                    getTrialBadge(a) +
-                    weightBadge +
-                    overageBadge +
-                    '<span class="badge badge-info">' + formatAuthMethod(a.provider || a.authMethod) + '</span>' +
-                    getStatusBadge(a) +
-                    '</div>' +
-                    '</div>' +
-                    '</div>' +
-                    '<div class="account-actions">' +
-                    '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccount(\'' + a.id + '\')" title="' + t('accounts.refresh') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
-                    '<button class="btn btn-sm btn-icon btn-secondary" onclick="showDetail(\'' + a.id + '\')" title="' + t('accounts.detail') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></button>' +
-                    '<button class="btn btn-sm btn-icon btn-secondary" onclick="copyAccountJSON(\'' + a.id + '\', this)" title="' + t('accounts.copyJSON') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>' +
-                    (a.banStatus && a.banStatus !== 'ACTIVE' ? '' :
-                        '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>') +
-                    '<button class="btn btn-sm ' + (a.allowOverage ? 'btn-warning' : 'btn-secondary') + '" onclick="toggleOverage(\'' + a.id + '\',' + !a.allowOverage + ')" title="' + t('accounts.overageToggleHint') + '">' + (a.allowOverage ? t('accounts.overageOn') : t('accounts.overageOff')) + '</button>' +
-                    '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff">' + t('accounts.test') + '</button>' +
-                    '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
-                    '</div>' +
-                    '</div>' +
-                    (a.usageLimit > 0 ? '<div class="account-usage"><div class="usage-label">' + t('accounts.mainQuota') + '</div><div class="usage-bar"><div class="usage-fill ' + usageClass + '" style="width:' + usagePercent + '%"></div></div><div class="usage-text"><span>' + (a.usageCurrent?.toFixed(1) || 0) + ' / ' + (a.usageLimit?.toFixed(0) || 0) + '</span><span>' + usagePercent.toFixed(1) + '%</span></div></div>' : '') +
-                    (a.trialUsageLimit > 0 ? '<div class="account-usage"><div class="usage-label">' + t('accounts.trialQuota') + ' ' + formatTrialExpiry(a.trialExpiresAt) + '</div><div class="usage-bar"><div class="usage-fill ' + trialUsageClass + '" style="width:' + trialUsagePercent + '%"></div></div><div class="usage-text"><span>' + (a.trialUsageCurrent?.toFixed(1) || 0) + ' / ' + (a.trialUsageLimit?.toFixed(0) || 0) + '</span><span>' + trialUsagePercent.toFixed(1) + '%</span></div></div>' : '') +
-                    '<div class="account-stats">' +
-                    '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + t('accounts.requests') + '</div></div>' +
-                    '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + t('accounts.tokens') + '</div></div>' +
-                    '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + t('accounts.credits') + '</div></div>' +
-                    '<div class="account-stat"><div class="account-stat-value">' + formatTokenExpiry(a.expiresAt) + '</div><div class="account-stat-label">' + t('accounts.expiry') + '</div></div>' +
-                    '<div class="account-stat"><div class="account-stat-value"><select onchange="quickSetWeight(\'' + a.id + '\',this.value)" style="width:52px;padding:1px 2px;border:1px solid #e2e8f0;border-radius:4px;font-size:12px;text-align:center;cursor:pointer;background:#fff">' +
-                    [0,1,2,3,4,5].map(w => '<option value="' + w + '"' + (weightVal === w ? ' selected' : '') + '>' + w + '</option>').join('') +
-                    '</select></div><div class="account-stat-label">' + t('accounts.weight') + '</div></div>' +
-                    (a.inflight !== undefined ? '<div class="account-stat" title="' + t('accounts.inflightHint') + '"><div class="account-stat-value">' + (a.inflight || 0) + ' / ' + (a.concurrencyLimit || 0) + '</div><div class="account-stat-label">' + t('accounts.inflight') + '</div></div>' : '') +
-                    (a.pacedRate ? '<div class="account-stat" title="' + t('accounts.pacedHint') + '"><div class="account-stat-value">' + a.pacedRate.toFixed(1) + '/s</div><div class="account-stat-label">' + t('accounts.paced') + '</div></div>' : '') +
-                    '</div>' +
-                    '</div>';
-            }).join('');
         }
         function getSubBadge(type) {
             const subType = (type || '').toUpperCase();
@@ -3574,18 +3529,6 @@
             await fetch('/admin/api/stats/reset', { method: 'POST', headers: { 'X-Admin-Password': password } });
             loadStats();
         }
-        function switchTab(tab) {
-            document.querySelectorAll('.tab').forEach(tabEl => tabEl.classList.toggle('active', tabEl.dataset.tab === tab));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
-            document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
-            // Lazy-load tab data so we don't pay the fetch cost until the user
-            // opens the tab.
-            if (tab === 'apikeys') loadApiKeys();
-            else if (tab === 'analytics') {
-                if (apikeysData.length === 0) loadApiKeys();
-                loadAnalytics();
-            }
-        }
         async function toggleAccount(id, enabled) {
             await fetch('/admin/api/accounts/' + id, {
                 method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
@@ -4142,6 +4085,30 @@
         // healthy, so any state-change the push path forgets (rare) still
         // surfaces within 10 s.
         setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
+
+        // Live-refresh the currently-visible tab whose data is NOT carried by the
+        // status WebSocket. Overview + Accounts already update in realtime via the
+        // WS push (renderStatusFromObject + mergeAccountStats), but API Keys and
+        // Analytics are fetched once on tab open and would otherwise go stale until
+        // the operator hit refresh. A light 5s re-fetch of just the active one of
+        // those two keeps them live without bloating the broadcast snapshot. We
+        // skip while a modal is open (a re-render under an open create/detail modal
+        // is wasteful) and while the page is hidden (a backgrounded tab shouldn't
+        // poll).
+        function anyModalOpen() {
+            return !!document.querySelector('.modal.active');
+        }
+        function activeDashboardTab() {
+            const el = document.querySelector('.nav-item.active');
+            return el ? el.dataset.tab : '';
+        }
+        setInterval(() => {
+            if (document.getElementById('mainPage').classList.contains('hidden')) return;
+            if (document.hidden || anyModalOpen()) return;
+            const tab = activeDashboardTab();
+            if (tab === 'apikeys') loadApiKeys();
+            else if (tab === 'analytics') loadAnalytics();
+        }, 5000);
 
         // ==================== 版本检查 ====================
         let currentVersion = '';
