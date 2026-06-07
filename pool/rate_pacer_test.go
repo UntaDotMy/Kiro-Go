@@ -68,9 +68,10 @@ func TestGcraAdvance(t *testing.T) {
 }
 
 func TestAimdRateDecrease(t *testing.T) {
-	// Half the observed rate.
-	if got := aimdRateDecrease(10); got != 5 {
-		t.Fatalf("decrease(10) = %v, want 5", got)
+	// Snap down to rateDecreaseFactor (0.85) of the observed rate — the
+	// "balanced ~90-95%" run-hot target, not a blind halving.
+	if got := aimdRateDecrease(10); got != 10*rateDecreaseFactor {
+		t.Fatalf("decrease(10) = %v, want %v", got, 10*rateDecreaseFactor)
 	}
 	// Unmeasured (0) stays UNPACED — a 429 before we measured anything tells us
 	// nothing about the rate, so we don't guess; the account stays full-speed.
@@ -78,8 +79,8 @@ func TestAimdRateDecrease(t *testing.T) {
 		t.Fatalf("decrease(0) = %v, want 0 (stay unpaced)", got)
 	}
 	// A measured-but-tiny rate floors instead of going to zero.
-	if got := aimdRateDecrease(0.4); got != rateMinPaced {
-		t.Fatalf("decrease(0.4) = %v, want floor %v", got, rateMinPaced)
+	if got := aimdRateDecrease(0.1); got != rateMinPaced {
+		t.Fatalf("decrease(0.1) = %v, want floor %v", got, rateMinPaced)
 	}
 	// Capped at max.
 	if got := aimdRateDecrease(rateMaxPaced * 4); got != rateMaxPaced {
@@ -89,8 +90,9 @@ func TestAimdRateDecrease(t *testing.T) {
 
 func TestAimdRateProbe(t *testing.T) {
 	got := aimdRateProbe(10)
-	if got <= 10 || got > 10.6 {
-		t.Fatalf("probe(10) = %v, want ~10.5 (+5%%)", got)
+	want := 10 * rateProbeFactor
+	if got <= 10 || got > want+0.01 || got < want-0.01 {
+		t.Fatalf("probe(10) = %v, want %v (×%v)", got, want, rateProbeFactor)
 	}
 	if got := aimdRateProbe(rateMaxPaced); got != rateMaxPaced {
 		t.Fatalf("probe at max must stay capped, got %v", got)
@@ -166,14 +168,15 @@ func TestRatePacerUnpacedUntilFirst429(t *testing.T) {
 		t.Fatalf("success alone must not pace the account, got paced=%v", paced)
 	}
 
-	// First quota error → account becomes paced at half the observed rate.
+	// First quota error → account becomes paced at rateDecreaseFactor of the
+	// observed rate (the balanced run-hot snap-down).
 	p.RecordError("a", true, 0)
 	paced, observed := p.RateState("a")
 	if paced <= 0 {
 		t.Fatalf("after 429 account must be paced, got paced=%v (observed=%v)", paced, observed)
 	}
-	if observed > 0 && paced > observed*0.5+0.01 {
-		t.Fatalf("paced rate %v should be ~half observed %v", paced, observed)
+	if observed > 0 && paced > observed*rateDecreaseFactor+0.01 {
+		t.Fatalf("paced rate %v should be ~%v× observed %v", paced, rateDecreaseFactor, observed)
 	}
 }
 

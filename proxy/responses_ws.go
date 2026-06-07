@@ -253,7 +253,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
 			"sequence_number": nextSeq(),
-			"response":        map[string]interface{}{"id": respID, "status": "failed", "error": map[string]interface{}{"type": "server_error", "message": err.Error()}},
+			"response":        map[string]interface{}{"id": respID, "status": "failed", "error": map[string]interface{}{"type": "server_error", "message": safeStreamErrorMessage(err)}},
 		})
 		return
 	}

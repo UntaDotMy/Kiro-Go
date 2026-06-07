@@ -516,6 +516,16 @@
         .tab-content { animation: fade 0.18s ease; }
         @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
         .hidden { display: none !important; }
+        /* Pre-paint auth hint: when a fresh admin session exists in
+           localStorage, an inline head script adds .pre-authed to <html> BEFORE
+           first paint, so the dashboard shows and the login page is hidden
+           without the ~0.1s login flash on refresh. !important + the higher
+           specificity of `html.pre-authed #mainPage` beats `.hidden`
+           (display:none !important). If no valid session exists the class is
+           never added and the default markup (login visible) paints — the safe
+           logged-out fallback. */
+        html.pre-authed #loginPage { display: none !important; }
+        html.pre-authed #mainPage { display: flex !important; }
 
         /* ---------- Messages ---------- */
         .message { padding: 11px 14px; border-radius: var(--r-sm); margin-bottom: 12px; font-size: 13px; border: 1px solid transparent; }
@@ -785,6 +795,24 @@
         .modal code[style*="background"] { background: var(--surface-3) !important; color: var(--text) !important; }
     </style>
 
+    <script>
+        // Pre-paint auth hint (runs before <body> parses, so it beats first
+        // paint and removes the login-page flash on refresh). If a fresh,
+        // non-expired admin session is in localStorage, mark <html> so the
+        // dashboard shows immediately instead of the login page flashing for
+        // ~0.1s. Mirrors tryAutoLogin's 72h expiry check. Any error (storage
+        // blocked / private mode) falls through to the default login view —
+        // the correct logged-out fallback. tryAutoLogin still verifies in the
+        // background and clears this class if the session is actually rejected.
+        (function () {
+            try {
+                var pw = localStorage.getItem('admin_password');
+                var t = parseInt(localStorage.getItem('admin_login_time') || '0', 10);
+                var fresh = pw && (!t || (Date.now() - t) <= 72 * 3600 * 1000);
+                if (fresh) document.documentElement.classList.add('pre-authed');
+            } catch (e) { /* no storage -> paint login (safe default) */ }
+        })();
+    </script>
 </head>
 
 <body>
@@ -2221,14 +2249,23 @@
                     localStorage.removeItem('admin_password');
                     localStorage.removeItem('admin_login_time');
                     password = '';
-                    document.getElementById('mainPage').classList.add('hidden');
-                    document.getElementById('loginPage').classList.remove('hidden');
+                    showLogin();
                 }
             } catch (e) {
                 // Network blip — keep the optimistic view; the WS + poll fallback
                 // will recover when connectivity returns. Don't bounce to login on
                 // a transient error.
             }
+        }
+        // showLogin returns to the login view. It MUST clear the pre-authed class
+        // on <html> as well as toggling the element .hidden classes: the
+        // `html.pre-authed #mainPage { display:flex !important }` rule (set
+        // pre-paint to kill the login flash) otherwise overrides the element
+        // classes and would keep a revoked session stuck on the dashboard.
+        function showLogin() {
+            try { document.documentElement.classList.remove('pre-authed'); } catch (e) { }
+            document.getElementById('mainPage').classList.add('hidden');
+            document.getElementById('loginPage').classList.remove('hidden');
         }
         async function login() {
             password = document.getElementById('pwdField').value;
@@ -2852,10 +2889,16 @@
 
         // ==================== API Keys tab ====================
         let apikeysData = [];
-        async function loadApiKeys() {
+        // loadApiKeysData fetches the API keys into the shared apikeysData
+        // WITHOUT rendering — so the Analytics per-key breakdown can refresh the
+        // underlying totals on its own poll without touching the API Keys list.
+        async function loadApiKeysData() {
             const res = await fetch('/admin/api/apikeys', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
             apikeysData = d.keys || [];
+        }
+        async function loadApiKeys() {
+            await loadApiKeysData();
             renderApiKeys();
         }
         function renderApiKeys() {
@@ -3218,6 +3261,12 @@
             const res = await fetch('/admin/api/modelstats', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
             renderModelStats(d.models || {});
+            // Refresh the per-key totals the breakdown renders from. renderKeyStats
+            // reads the global apikeysData, which only the API Keys tab otherwise
+            // refreshes — without this the per-key panel re-renders every 5s from
+            // stale numbers while sitting on Analytics. Best-effort: a failed key
+            // fetch just leaves the prior data and still renders.
+            try { await loadApiKeysData(); } catch (e) { /* keep prior key data */ }
             renderKeyStats();
             renderAnalyticsTrend();
         }
@@ -4086,14 +4135,16 @@
         // surfaces within 10 s.
         setInterval(() => { if (!document.getElementById('mainPage').classList.contains('hidden')) loadStats(); }, 10000);
 
-        // Live-refresh the currently-visible tab whose data is NOT carried by the
-        // status WebSocket. Overview + Accounts already update in realtime via the
-        // WS push (renderStatusFromObject + mergeAccountStats), but API Keys and
-        // Analytics are fetched once on tab open and would otherwise go stale until
-        // the operator hit refresh. A light 5s re-fetch of just the active one of
-        // those two keeps them live without bloating the broadcast snapshot. We
-        // skip while a modal is open (a re-render under an open create/detail modal
-        // is wasteful) and while the page is hidden (a backgrounded tab shouldn't
+        // Live-refresh the currently-visible tab whose data is NOT fully carried
+        // by the status WebSocket push. The WS push (renderStatusFromObject +
+        // mergeAccountStats) keeps the Overview STAT CARDS and the Accounts cards
+        // realtime, but three things are fetched per-tab and would otherwise go
+        // stale until a manual refresh: the Overview trend sparklines + top-models
+        // (loadOverview, history/modelstats endpoints), the API Keys usage, and
+        // the Analytics breakdown/trend. A light 5s re-fetch of just the active
+        // tab keeps them live without bloating the broadcast snapshot. We skip
+        // while a modal is open (a re-render under an open create/detail modal is
+        // wasteful) and while the page is hidden (a backgrounded tab shouldn't
         // poll).
         function anyModalOpen() {
             return !!document.querySelector('.modal.active');
@@ -4108,6 +4159,7 @@
             const tab = activeDashboardTab();
             if (tab === 'apikeys') loadApiKeys();
             else if (tab === 'analytics') loadAnalytics();
+            else if (tab === 'overview') loadOverview();
         }, 5000);
 
         // ==================== 版本检查 ====================

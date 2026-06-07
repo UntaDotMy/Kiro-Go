@@ -350,3 +350,34 @@ func (h *Handler) broadcastDashboardUpdate() {
 		h.dashboardHub.broadcast(snapshot)
 	}
 }
+
+// dashboardPusher periodically broadcasts a fresh snapshot so the dashboard's
+// purely-LIVE fields update in realtime, not just on request completion.
+//
+// The event-driven broadcasts (recordSuccess / recordFailure / account refresh)
+// fire only AFTER a request finishes — by which point the failover dispatcher's
+// deferred Release has already decremented the account's in-flight count. So a
+// rising `inflight` (incremented at request START, in pick→reserveLocked) was
+// never pushed while requests were actually in flight, and the same was true
+// for the cooldown countdown, paced rate, and AIMD limit — all of which only
+// move between completion events. A single shared ~1s tick covers every such
+// live-only field at once.
+//
+// Cost: broadcastDashboardUpdate's hasSubscribers() fast-path makes each tick a
+// single RLock+len check when no dashboard is connected (the common production
+// case), so this is effectively free when nobody is watching. It coexists with
+// the event-driven broadcasts (both are kept): completions still push instantly;
+// this fills the gaps. Exactly one goroutine for the process lifetime, torn down
+// via stopDashboardPusher in Stop().
+func (h *Handler) dashboardPusher() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stopDashboardPusher:
+			return
+		case <-ticker.C:
+			h.broadcastDashboardUpdate()
+		}
+	}
+}

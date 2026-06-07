@@ -48,20 +48,25 @@ import (
 // ============================================================================
 
 const (
-	// rateDecreaseFactor is the AIMD multiplicative-decrease applied to the
-	// observed achieved rate on a 429: paced rate = observedRate × 0.5. A token
-	// bucket is a hard wall, so we cut to half (TCP-style) to land clearly below
-	// it, then probe back up.
-	rateDecreaseFactor = 0.5
+	// rateDecreaseFactor is the multiplicative-decrease applied to the observed
+	// achieved rate on a 429: paced rate = observedRate × 0.85. The 429 fires at
+	// roughly the observed rate, so pacing at 0.85× lands at the "balanced
+	// ~90-95% of the limit" target — hot enough to stay fast, with enough margin
+	// that the gentle probe-up doesn't immediately re-trip. (Was 0.5, which
+	// halved throughput on every 429 and then took ~43s of +5% probing to
+	// recover — the dominant "too slow after a blip" complaint.)
+	rateDecreaseFactor = 0.85
 
-	// rateProbeFactor is the AIMD additive-increase: +5% per probe interval of
-	// sustained success. Gentle so we approach the ceiling cautiously (overshoot
-	// costs a 429 + cooldown).
-	rateProbeFactor = 1.05
+	// rateProbeFactor is the multiplicative-increase: +15% per probe interval of
+	// sustained success. Fast enough to recover from a snap-down in ~1-2 probes,
+	// gentle enough that it approaches the ceiling without stampeding into it.
+	// (Was 1.05 — a 14-probe / ~43s climb.)
+	rateProbeFactor = 1.15
 
 	// rateProbeInterval is how often a paced account may probe its rate upward
-	// while it keeps succeeding. Matches the literature's "every few seconds".
-	rateProbeInterval = 3 * time.Second
+	// while it keeps succeeding. (Was 3s — combined with the slow factor that
+	// made recovery glacial; 1.5s with the faster factor recovers in ~2s.)
+	rateProbeInterval = 1500 * time.Millisecond
 
 	// rateMinPaced / rateMaxPaced bound the learned paced rate (requests/sec).
 	// The floor keeps a heavily-throttled account from pacing itself to a
@@ -70,15 +75,17 @@ const (
 	rateMaxPaced = 1000.0
 
 	// rateBurstTolerance is the GCRA τ as a MULTIPLE of the emission interval T.
-	// τ = burstFactor × T allows a small burst above the steady rate before
-	// pacing kicks in (bucket depth ≈ 1 + τ/T ≈ 1 + burstFactor). A factor of 1
-	// permits a ~2-deep burst, absorbing normal jitter without spraying.
-	rateBurstTolerance = 1.0
+	// τ = burstFactor × T allows a burst above the steady rate before pacing
+	// kicks in (bucket depth ≈ 1 + τ/T ≈ 1 + burstFactor). A factor of 2 permits
+	// a ~3-deep burst so a small fan-out fires immediately instead of being
+	// paced from the first request. (Was 1.0 → only ~2-deep.)
+	rateBurstTolerance = 2.0
 
 	// rateObservedEWMA is the smoothing factor for the achieved-throughput EWMA
-	// (weight on the newest sample). 0.3 tracks recent throughput while damping
-	// the spikiness of individual inter-success intervals.
-	rateObservedEWMA = 0.3
+	// (weight on the newest sample). 0.5 tracks recent throughput closely so the
+	// snap-down on a 429 is seeded from a current estimate, not a lagging-low one
+	// that would over-cut the rate. (Was 0.3.)
+	rateObservedEWMA = 0.5
 
 	// rateObservedMaxSample caps a single inter-success instantaneous-rate
 	// sample (requests/sec) so two completions landing microseconds apart can't

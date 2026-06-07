@@ -94,20 +94,22 @@ const (
 	// successes, multiplicative-decrease on a 429. The request handler reserves
 	// a slot before the upstream call (Acquire) and releases it after (Release).
 	//
-	// aimdInitialLimit is where a fresh / just-recovered account starts. 2 lets
-	// a little parallelism through immediately without spraying a burst.
-	aimdInitialLimit = 2
-	// aimdMinLimit is the floor — never drop below this on a 429. With
-	// multiple accounts pooled, a 1-slot floor left no headroom: any
-	// concurrent burst on a recovered account immediately re-throttled,
-	// and the dispatcher's admission-wait budget turned into a stall.
-	// A 2-slot floor keeps a recovered account productive immediately
-	// while still letting it self-tune down toward AWS's actual bucket
-	// size on the multiplicative-decrease path.
-	aimdMinLimit = 2
-	// aimdMaxLimit caps how far additive-increase can climb, so one account
-	// can't absorb the entire burst and re-trigger the storm we're fixing.
-	aimdMaxLimit = 12
+	// aimdInitialLimit is where a fresh / just-recovered account starts. 4 lets
+	// a real fan-out through immediately (a small pool of 2-3 accounts otherwise
+	// admits almost nothing on cold start and dumps the overflow into the
+	// admission wait). The rate pacer is the proactive 429-avoider; this
+	// concurrency limit is the burst gate, so it can afford to start higher.
+	aimdInitialLimit = 4
+	// aimdMinLimit is the floor — never drop below this on a 429. A 3-slot floor
+	// keeps a recovered account productive immediately under a burst while still
+	// letting it self-tune down on the multiplicative-decrease path.
+	aimdMinLimit = 3
+	// aimdMaxLimit caps how far the increase can climb. Raised to 32 because on a
+	// SMALL pool the old cap of 12 throttled total concurrency hard (2 accounts ×
+	// 12 = 24); the per-account rate pacer is what actually keeps us under the
+	// hidden bucket, so the concurrency ceiling can be generous without causing a
+	// storm. Larger pools rarely reach this because load spreads across accounts.
+	aimdMaxLimit = 32
 	// aimdDecreaseNum/Den is the multiplicative-decrease factor on a 429 (×3/4).
 	// A token bucket is a wall, not TCP congestion, so we cut harder than
 	// Netflix's 0.9 default but softer than TCP's 0.5 to avoid over-shrinking a
@@ -123,8 +125,11 @@ const (
 	// saturationPollInterval is the "try again very soon" hint the picker
 	// returns when every eligible account is at its concurrency limit (not
 	// cooling, just busy). The failover dispatcher waits this long for a slot to
-	// free before re-selecting, up to its admission budget.
-	saturationPollInterval = 100 * time.Millisecond
+	// free before re-selecting, up to its admission budget. 25ms (was 100ms)
+	// shrinks the quantization waste — a slot that frees just after a poll is
+	// reused ~4× sooner. Phase B replaces this poll with an event-driven wakeup
+	// on Release; until then, a tighter poll is the cheap latency win.
+	saturationPollInterval = 25 * time.Millisecond
 )
 
 // accountSlot is one entry in the SWRR scheduler. The slot is keyed
@@ -905,14 +910,22 @@ func (p *AccountPool) RecordSuccess(id string) {
 	cd.until = time.Time{}
 	cd.consecutiveErrs = 0
 	cd.lastSleep = 0
-	// AIMD additive increase, gated on actually using the limit so an idle
-	// account doesn't accumulate headroom for the next burst to overshoot.
+	// AIMD increase, gated on actually using the limit so an idle account
+	// doesn't accumulate headroom for the next burst to overshoot. Grows by 2
+	// (was 1) so a small pool reaches a useful concurrency ceiling in half the
+	// successful requests; the rate pacer remains the proactive 429-guard, so a
+	// faster concurrency climb doesn't itself induce throttling. The gate is
+	// relaxed to inflight >= limit-1 so growth keeps up under a steady burst that
+	// sits just below the ceiling.
 	limit := cd.limit
 	if limit <= 0 {
 		limit = aimdInitialLimit
 	}
-	if cd.inflight >= limit && limit < aimdMaxLimit {
-		limit++
+	if cd.inflight >= limit-1 && limit < aimdMaxLimit {
+		limit += 2
+		if limit > aimdMaxLimit {
+			limit = aimdMaxLimit
+		}
 	}
 	cd.limit = limit
 	// Drop the entry only when it carries NO useful state at all. A
