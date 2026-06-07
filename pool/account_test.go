@@ -12,6 +12,7 @@ func newTestPool() *AccountPool {
 	return &AccountPool{
 		cooldowns:  make(map[string]*cooldownEntry),
 		modelLists: make(map[string]map[string]bool),
+		releaseCh:  make(chan struct{}, 1),
 	}
 }
 

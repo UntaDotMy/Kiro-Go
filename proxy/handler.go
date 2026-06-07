@@ -3237,6 +3237,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		stats := statsMap[a.ID]
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
 		pacedRate, observedRate := h.pool.RateState(a.ID)
+		ttft := h.pool.TTFTState(a.ID)
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -3285,6 +3286,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"concurrencyLimit":  concurrencyLimit,
 			"pacedRate":         pacedRate,
 			"observedRate":      observedRate,
+			"ttftMs":            ttft,
 			"cooldownSecs":      int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds()),
 			"overQuota":         a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit,
 		}

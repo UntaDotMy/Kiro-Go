@@ -11,6 +11,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net"
 	"net/http"
 	"net/url"
@@ -603,6 +604,47 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 				tu.Name = original
 			}
 			originalOnToolUse(tu)
+		}
+		callback = &wrapped
+	}
+
+	// Measure TIME-TO-FIRST-TOKEN for latency-aware "smart laning" selection.
+	// We record the elapsed time from request dispatch to the FIRST content
+	// callback (text or tool_use), per account, into the pool's TTFT EWMA. TTFT
+	// is the load-bearing latency signal (it reflects the account's queueing /
+	// warmth), unlike total completion time which is dominated by output length.
+	// The wrap fires the measurement exactly once per call via sync.Once, and
+	// only on a real account id, so it never double-counts across the multi-
+	// endpoint retry loop. Skipped for a nil account (tests / probes).
+	if account != nil && account.ID != "" && callback != nil {
+		acctID := account.ID
+		start := time.Now()
+		var ttftOnce sync.Once
+		recordTTFT := func() {
+			ttftOnce.Do(func() {
+				// Sub-millisecond resolution: time.Duration.Milliseconds() truncates
+				// to an integer, so a first token arriving in <1ms would yield 0 and
+				// be discarded by RecordTTFT's `ms <= 0` guard — losing the
+				// measurement for fast responses (and making every local-stub test
+				// record nothing). Divide by time.Millisecond to keep the fraction.
+				ms := float64(time.Since(start)) / float64(time.Millisecond)
+				pool.GetPool().RecordTTFT(acctID, ms)
+			})
+		}
+		wrapped := *callback
+		if origText := callback.OnText; origText != nil {
+			wrapped.OnText = func(text string, isThinking bool) {
+				recordTTFT()
+				origText(text, isThinking)
+			}
+		} else {
+			wrapped.OnText = func(string, bool) { recordTTFT() }
+		}
+		if origTool := callback.OnToolUse; origTool != nil {
+			wrapped.OnToolUse = func(tu KiroToolUse) {
+				recordTTFT()
+				origTool(tu)
+			}
 		}
 		callback = &wrapped
 	}

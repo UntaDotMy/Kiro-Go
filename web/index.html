@@ -1644,6 +1644,8 @@
                 'accounts.inflightHint': '当前在途请求数 / 自适应并发上限（仅 least-request 策略）。上限在成功时 +1、遇到 429 时减为 3/4，自动逼近 AWS 的限流阈值。',
                 'accounts.paced': '限速',
                 'accounts.pacedHint': '该账号的自适应请求速率（次/秒，仅 least-request 策略）。空/0 = 不限速（全速）。遇到 429 后开始学习：速率降为实测吞吐的一半，随后在持续成功时每次 +5% 逐步探升，使账号稳定运行在隐藏令牌桶阈值之下，而不是反复撞上 429。',
+                'accounts.ttft': '首字延迟',
+                'accounts.ttftHint': '该账号的平均首字响应时间（毫秒，仅 least-request 策略）。这是智能路由所依据的负载感知延迟信号：在仍有速率余量的账号中，优先选择响应最快的。仅测量首字时间，不受输出长度影响，因此长回答不会让健康账号显得变慢。',
                 'accounts.cooldown': '冷却中',
                 'accounts.cooldownHint': '该账号最近遇到 429/错误，正在冷却，调度器会跳过它，倒计时结束后自动恢复。',
                 'accounts.overQuota': '超额',
@@ -2066,6 +2068,8 @@
                 'accounts.inflightHint': 'Current outstanding requests / adaptive concurrency limit (least-request strategy only). The limit grows by 1 on success and drops to 3/4 on a 429, self-tuning toward the AWS throttle threshold.',
                 'accounts.paced': 'Paced',
                 'accounts.pacedHint': 'Adaptive request RATE for this account (req/sec, least-request strategy only). Blank/0 = unpaced (full speed). After a 429 the rate is learned: it snaps to half the measured throughput, then probes back up +5% on sustained success, so the account stays just below its hidden token bucket instead of bouncing off 429s.',
+                'accounts.ttft': 'TTFT',
+                'accounts.ttftHint': 'Average time-to-first-token for this account (ms, least-request strategy only). This is the load-aware latency signal the smart router steers by: among accounts that still have rate headroom, the fastest-responding one is preferred. Output length does not contaminate it (only first-token time is measured), so a long answer never makes a healthy account look slow.',
                 'accounts.cooldown': 'Cooling',
                 'accounts.cooldownHint': 'This account recently hit a 429/error and is in cooldown. The scheduler skips it until the countdown ends, then it auto-recovers.',
                 'accounts.overQuota': 'Over quota',
@@ -4027,7 +4031,7 @@
                     'trialUsageCurrent','trialUsageLimit','trialUsagePercent',
                     'requestCount','errorCount','totalTokens','totalCredits',
                     'lastUsed','lastRefresh','inflight','concurrencyLimit',
-                    'pacedRate','observedRate',
+                    'pacedRate','observedRate','ttftMs',
                     'cooldownSecs','overQuota'];
                 for (const f of fields) {
                     if (s[f] !== undefined && a[f] !== s[f]) { a[f] = s[f]; changed = true; }
@@ -4665,6 +4669,7 @@
 
                 const inflight = (a.inflight !== undefined) ? '<div class="acct-sub num" title="' + t('accounts.inflightHint') + '">' + t('accounts.inflight') + ' ' + (a.inflight || 0) + '/' + (a.concurrencyLimit || 0) + '</div>' : '';
                 const pacedSub = a.pacedRate ? '<div class="acct-sub num" title="' + t('accounts.pacedHint') + '">' + t('accounts.paced') + ' ' + a.pacedRate.toFixed(1) + '/s</div>' : '';
+                const ttftSub = a.ttftMs ? '<div class="acct-sub num" title="' + t('accounts.ttftHint') + '">' + t('accounts.ttft') + ' ' + Math.round(a.ttftMs) + 'ms</div>' : '';
 
                 const actions = '<div class="row-actions">' +
                     '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccount(\'' + a.id + '\')" title="' + t('accounts.refresh') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
@@ -4685,7 +4690,7 @@
                     '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
                     '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
                     '<td class="cell-num">' + (a.totalCredits || 0).toFixed(1) + '</td>' +
-                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + pacedSub + '</td>' +
+                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + pacedSub + ttftSub + '</td>' +
                     '<td>' + weightSelect + '</td>' +
                     '<td>' + actions + '</td>' +
                     '</tr>';

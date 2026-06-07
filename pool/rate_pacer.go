@@ -91,7 +91,44 @@ const (
 	// sample (requests/sec) so two completions landing microseconds apart can't
 	// blow the EWMA up to an absurd value that would mis-seed the snap-down.
 	rateObservedMaxSample = 500.0
+
+	// ttftEWMAAlpha is the weight on the newest time-to-first-token sample in the
+	// per-account TTFT EWMA used for latency-aware "smart laning" selection. 0.3
+	// tracks recent latency while damping single-request spikes; biased slightly
+	// toward recency so an account that starts slowing is penalized within a few
+	// requests (the Peak-EWMA intent) without one outlier dominating.
+	ttftEWMAAlpha = 0.3
+
+	// ttftMaxSampleMs clamps a single TTFT sample (milliseconds) so a pathological
+	// outlier (a near-stalled request that still eventually produced a token)
+	// can't blow the EWMA out and make an otherwise-fast account look permanently
+	// slow. 60s is far beyond any healthy first-token latency.
+	ttftMaxSampleMs = 60000.0
+
+	// ttftPenaltyCap bounds how much the latency-aware scorer can divide an
+	// account's score by relative to the fastest candidate. A factor of 4 means
+	// even an account 10× slower in TTFT is only penalized as if it were 4× — so
+	// latency steering is a strong PREFERENCE for the fast lane, never a hard ban
+	// that starves a slower-but-healthy account of all traffic (which would also
+	// stop us re-measuring whether it has recovered).
+	ttftPenaltyCap = 4.0
 )
+
+// updateTTFT folds one time-to-first-token sample (milliseconds) into the EWMA.
+// A non-positive sample is ignored (returns prev); the sample is clamped to
+// ttftMaxSampleMs before blending; a zero prev seeds directly. Pure.
+func updateTTFT(prev, sampleMs float64) float64 {
+	if sampleMs <= 0 {
+		return prev
+	}
+	if sampleMs > ttftMaxSampleMs {
+		sampleMs = ttftMaxSampleMs
+	}
+	if prev <= 0 {
+		return sampleMs
+	}
+	return ttftEWMAAlpha*sampleMs + (1-ttftEWMAAlpha)*prev
+}
 
 // emissionInterval converts a rate (requests/sec) into the GCRA emission
 // interval T = 1/rate. Returns 0 for a non-positive rate (meaning "unpaced").

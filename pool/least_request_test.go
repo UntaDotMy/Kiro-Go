@@ -397,3 +397,73 @@ func TestSwrStrategyReservesNothing(t *testing.T) {
 		t.Fatalf("swr must not reserve an in-flight slot, got inflight=%d for %s", got, acc.ID)
 	}
 }
+
+// --- event-driven admission: Release signals waiters ----------------------
+
+// TestReleaseSignalsWaiter verifies the Phase-B event-driven admission wakeup:
+// releasing a real in-flight slot pushes a signal on ReleaseSignal so an
+// admission waiter wakes immediately instead of polling.
+func TestReleaseSignalsWaiter(t *testing.T) {
+	withLeastRequest(t)
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// Reserve a slot, then drain any signal the setup may have produced.
+	acc, _, ok := p.AcquireForModelExcluding("", nil)
+	if !ok || acc == nil {
+		t.Fatal("expected an acquire")
+	}
+	select {
+	case <-p.ReleaseSignal():
+	default:
+	}
+
+	// Release the slot — a signal must be delivered.
+	p.Release(acc.ID)
+	select {
+	case <-p.ReleaseSignal():
+		// good: woken
+	case <-time.After(time.Second):
+		t.Fatal("Release did not signal ReleaseSignal within 1s")
+	}
+}
+
+// TestReleaseSignalCoalescesAndNeverBlocks verifies the non-blocking,
+// buffered-1 contract: many concurrent releases never block the releaser, and
+// they coalesce into at most one pending wakeup (a woken waiter re-attempts
+// Acquire, so a dropped duplicate signal is harmless).
+func TestReleaseSignalCoalescesAndNeverBlocks(t *testing.T) {
+	withLeastRequest(t)
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// Reserve several slots so each Release frees one (and thus signals).
+	for i := 0; i < 5; i++ {
+		if _, _, ok := p.AcquireForModelExcluding("", nil); !ok {
+			// limit may cap before 5; that's fine for this test.
+			break
+		}
+	}
+	// Fire many releases with no reader draining between them. Each must return
+	// promptly (non-blocking send); the buffer-1 channel coalesces them.
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			p.Release("a")
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good: never blocked despite no one draining the signal between sends
+	case <-time.After(2 * time.Second):
+		t.Fatal("Release blocked — signal send must be non-blocking")
+	}
+	// At most one pending signal remains.
+	<-p.ReleaseSignal()
+	select {
+	case <-p.ReleaseSignal():
+		t.Fatal("expected signals to coalesce to at most one pending wakeup")
+	default:
+	}
+}
