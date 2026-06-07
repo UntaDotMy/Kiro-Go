@@ -168,25 +168,31 @@ func TestReleaseUnknownAccountIsNoOp(t *testing.T) {
 // TestAIMDGrowOnSuccessGatedByUsage verifies the additive-increase only fires
 // when the account is actually using its limit (inflight >= limit): a success on
 // an idle account must NOT grow the limit (which would let the next burst
-// overshoot), while a success at the ceiling bumps it by 1.
+// overshoot), while a success at the ceiling bumps it (by 2 under the faster
+// Phase-A growth).
 func TestAIMDGrowOnSuccessGatedByUsage(t *testing.T) {
 	withLeastRequest(t)
 	p := newTestPool()
 	p.setAccounts([]config.Account{{ID: "a"}})
 
 	// Seed an entry at the initial limit with no inflight, then a success: the
-	// limit must stay put (idle account, not using its capacity).
+	// limit must stay put (idle account well below the limit-1 growth gate).
 	p.cooldowns["a"] = &cooldownEntry{limit: aimdInitialLimit, inflight: 0}
 	p.RecordSuccess("a")
 	if _, limit := p.ConcurrencyState("a"); limit != aimdInitialLimit {
 		t.Fatalf("idle success must not grow limit; expected %d, got %d", aimdInitialLimit, limit)
 	}
 
-	// Now saturate (inflight == limit) and record a success: limit grows by 1.
+	// Now saturate (inflight == limit) and record a success: limit grows by 2,
+	// capped at aimdMaxLimit.
 	p.cooldowns["a"] = &cooldownEntry{limit: aimdInitialLimit, inflight: aimdInitialLimit}
 	p.RecordSuccess("a")
-	if _, limit := p.ConcurrencyState("a"); limit != aimdInitialLimit+1 {
-		t.Fatalf("at-capacity success should grow limit to %d, got %d", aimdInitialLimit+1, limit)
+	want := aimdInitialLimit + 2
+	if want > aimdMaxLimit {
+		want = aimdMaxLimit
+	}
+	if _, limit := p.ConcurrencyState("a"); limit != want {
+		t.Fatalf("at-capacity success should grow limit to %d, got %d", want, limit)
 	}
 }
 
@@ -270,20 +276,18 @@ func TestFloorAfterCooldown(t *testing.T) {
 		t.Fatalf("expected limit floored at %d after storm, got %d", aimdMinLimit, limit)
 	}
 
-	// First two acquires succeed — the account now admits up to
-	// aimdMinLimit (= 2) concurrent in-flight before shedding.
-	acc1, _, ok1 := p.AcquireForModelExcluding("", nil)
-	if !ok1 || acc1 == nil {
-		t.Fatal("expected the first probe to be admitted")
+	// The account now admits up to aimdMinLimit concurrent in-flight before
+	// shedding. Acquire exactly that many — all must succeed.
+	for i := 0; i < aimdMinLimit; i++ {
+		acc, _, ok := p.AcquireForModelExcluding("", nil)
+		if !ok || acc == nil {
+			t.Fatalf("probe %d/%d should be admitted at the floor, got ok=%v", i+1, aimdMinLimit, ok)
+		}
 	}
-	acc2, _, ok2 := p.AcquireForModelExcluding("", nil)
-	if !ok2 || acc2 == nil {
-		t.Fatal("expected the second probe to be admitted at the floor")
-	}
-	// Third acquire is shed: the only account is at its limit of 2.
-	acc3, retryAfter, ok3 := p.AcquireForModelExcluding("", nil)
-	if ok3 || acc3 != nil {
-		t.Fatalf("expected third acquire to be shed (floor=%d, inflight=2), got %v", aimdMinLimit, acc3)
+	// The next acquire is shed: the only account is at its limit (= aimdMinLimit).
+	acc, retryAfter, ok := p.AcquireForModelExcluding("", nil)
+	if ok || acc != nil {
+		t.Fatalf("acquire past the floor (inflight=%d) must be shed, got %v", aimdMinLimit, acc)
 	}
 	if retryAfter != saturationPollInterval {
 		t.Fatalf("expected saturation hint %s, got %s", saturationPollInterval, retryAfter)
@@ -391,5 +395,75 @@ func TestSwrStrategyReservesNothing(t *testing.T) {
 	}
 	if got := p.InflightCount(acc.ID); got != 0 {
 		t.Fatalf("swr must not reserve an in-flight slot, got inflight=%d for %s", got, acc.ID)
+	}
+}
+
+// --- event-driven admission: Release signals waiters ----------------------
+
+// TestReleaseSignalsWaiter verifies the Phase-B event-driven admission wakeup:
+// releasing a real in-flight slot pushes a signal on ReleaseSignal so an
+// admission waiter wakes immediately instead of polling.
+func TestReleaseSignalsWaiter(t *testing.T) {
+	withLeastRequest(t)
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// Reserve a slot, then drain any signal the setup may have produced.
+	acc, _, ok := p.AcquireForModelExcluding("", nil)
+	if !ok || acc == nil {
+		t.Fatal("expected an acquire")
+	}
+	select {
+	case <-p.ReleaseSignal():
+	default:
+	}
+
+	// Release the slot — a signal must be delivered.
+	p.Release(acc.ID)
+	select {
+	case <-p.ReleaseSignal():
+		// good: woken
+	case <-time.After(time.Second):
+		t.Fatal("Release did not signal ReleaseSignal within 1s")
+	}
+}
+
+// TestReleaseSignalCoalescesAndNeverBlocks verifies the non-blocking,
+// buffered-1 contract: many concurrent releases never block the releaser, and
+// they coalesce into at most one pending wakeup (a woken waiter re-attempts
+// Acquire, so a dropped duplicate signal is harmless).
+func TestReleaseSignalCoalescesAndNeverBlocks(t *testing.T) {
+	withLeastRequest(t)
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// Reserve several slots so each Release frees one (and thus signals).
+	for i := 0; i < 5; i++ {
+		if _, _, ok := p.AcquireForModelExcluding("", nil); !ok {
+			// limit may cap before 5; that's fine for this test.
+			break
+		}
+	}
+	// Fire many releases with no reader draining between them. Each must return
+	// promptly (non-blocking send); the buffer-1 channel coalesces them.
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			p.Release("a")
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good: never blocked despite no one draining the signal between sends
+	case <-time.After(2 * time.Second):
+		t.Fatal("Release blocked — signal send must be non-blocking")
+	}
+	// At most one pending signal remains.
+	<-p.ReleaseSignal()
+	select {
+	case <-p.ReleaseSignal():
+		t.Fatal("expected signals to coalesce to at most one pending wakeup")
+	default:
 	}
 }

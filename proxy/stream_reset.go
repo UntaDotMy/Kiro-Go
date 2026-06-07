@@ -26,6 +26,8 @@ import (
 	"errors"
 	"strings"
 
+	"kiro-go/logger"
+
 	"golang.org/x/net/http2"
 )
 
@@ -75,7 +77,19 @@ func classifyStreamError(err error) error {
 	if strings.Contains(msg, "INTERNAL_ERROR") ||
 		strings.Contains(msg, "stream error") ||
 		strings.Contains(msg, "RST_STREAM") ||
-		strings.Contains(msg, "GOAWAY") {
+		strings.Contains(msg, "GOAWAY") ||
+		// "http2: client connection lost" — created inline (errors.New) inside
+		// http2.(*ClientConn).closeForLostPing when a health-check PING is not
+		// ACKed within PingTimeout, OR the conn is otherwise lost mid-flight. It
+		// is NOT an exported sentinel, so string match is the only option. This
+		// is the connection-died-while-in-flight shape: a fresh conn (or peer
+		// account) is clean, so treat it exactly like a RST/GOAWAY — retryable
+		// pre-commit, friendly message post-commit. Was previously only caught by
+		// the broad "connection" substring in isRetryableUpstreamError (so
+		// failover worked) but never wrapped here, so the raw Go string leaked to
+		// the client post-commit as "API Error: http2: client connection lost".
+		strings.Contains(msg, "client connection lost") ||
+		strings.Contains(msg, "connection lost") {
 		return &ErrUpstreamStreamReset{Cause: err}
 	}
 	return err
@@ -86,3 +100,24 @@ func classifyStreamError(err error) error {
 // a stream reset. Logged at WARN with the original cause for operator
 // diagnosis; the client never sees the raw Go string.
 const upstreamStreamResetMessage = "upstream stream reset (INTERNAL_ERROR); please retry"
+
+// safeStreamErrorMessage returns a client-facing message for a post-commit
+// upstream failure that never leaks raw Go/transport internals (ARNs, hostnames,
+// "received from peer", "http2: client connection lost", etc.). A recognized
+// stream reset / connection-lost gets the stable, friendly retry message; any
+// other upstream error collapses to a generic line. The real cause is logged at
+// WARN for operators. Use this at every post-commit error-emit site (Claude SSE,
+// Responses SSE, Responses WS) so a deliberately-triggered upstream failure can
+// never surface backend detail to the API consumer.
+func safeStreamErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var sre *ErrUpstreamStreamReset
+	if errors.As(err, &sre) {
+		logger.Warnf("[StreamReset] post-commit upstream stream reset: %v", err)
+		return upstreamStreamResetMessage
+	}
+	logger.Warnf("[Upstream] post-commit upstream error: %v", err)
+	return "upstream error; please retry"
+}

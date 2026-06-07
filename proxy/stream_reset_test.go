@@ -66,8 +66,32 @@ func TestClassifyStreamError_SubstringFallback(t *testing.T) {
 	}
 }
 
-// TestClassifyStreamError_UnrelatedPassesThrough ensures we don't
-// over-classify — generic errors must NOT be wrapped in the sentinel.
+// TestClassifyStreamError_ClientConnectionLost is the regression guard for the
+// "API Error: http2: client connection lost" leak. That string is created
+// inline (errors.New) inside http2.(*ClientConn).closeForLostPing when a
+// health-check PING is not ACKed in time — it is NOT a typed/exported sentinel,
+// so it must be caught by substring. Before the fix it matched none of the
+// classifier markers, so it was never wrapped and the raw Go string leaked to
+// the client post-commit.
+func TestClassifyStreamError_ClientConnectionLost(t *testing.T) {
+	cases := []string{
+		"http2: client connection lost",
+		"Post \"https://q.us-east-1.amazonaws.com/\": http2: client connection lost",
+		"http2: server sent GOAWAY and closed the connection; LastStreamID=5",
+	}
+	for _, msg := range cases {
+		got := classifyStreamError(errors.New(msg))
+		var sre *ErrUpstreamStreamReset
+		if !errors.As(got, &sre) {
+			t.Errorf("expected %q to be classified as a stream reset, got %T", msg, got)
+		}
+		if !isRetryableUpstreamError(got) {
+			t.Errorf("a connection-lost error must be retryable so the dispatcher fails over: %q", msg)
+		}
+	}
+}
+
+
 func TestClassifyStreamError_UnrelatedPassesThrough(t *testing.T) {
 	notAReset := errors.New("connection refused")
 	if got := classifyStreamError(notAReset); got != notAReset {
@@ -103,6 +127,36 @@ func TestIsRetryableUpstreamError_ContextCanceledNotStreamReset(t *testing.T) {
 	}
 	if isRetryableUpstreamError(context.DeadlineExceeded) {
 		t.Fatal("context.DeadlineExceeded must remain non-retryable")
+	}
+}
+
+// TestSafeStreamErrorMessageNeverLeaks is the regression guard for the
+// post-commit error-emit path (Claude SSE, Responses SSE, Responses WS). The
+// client-facing message must NEVER contain raw Go/transport internals — no
+// "http2: client connection lost", no "received from peer", no ARNs/hosts — for
+// ANY upstream error, recognized stream reset or not.
+func TestSafeStreamErrorMessageNeverLeaks(t *testing.T) {
+	leaky := []error{
+		&ErrUpstreamStreamReset{Cause: errors.New("http2: client connection lost")},
+		&ErrUpstreamStreamReset{Cause: &http2.StreamError{Code: http2.ErrCodeInternal, StreamID: 7}},
+		errors.New("http2: client connection lost"),
+		errors.New("Post \"https://q.us-east-1.amazonaws.com/\": net/http: TLS handshake timeout"),
+		errors.New("HTTP 500 from Kiro IDE: arn:aws:codewhisperer:us-east-1:123:profile/ABC internal failure"),
+	}
+	banned := []string{"http2:", "received from peer", "arn:aws", "amazonaws.com", "stream ID", "RST_STREAM"}
+	for _, err := range leaky {
+		msg := safeStreamErrorMessage(err)
+		if msg == "" {
+			t.Errorf("non-nil error must yield a non-empty client message, got empty for %v", err)
+		}
+		for _, b := range banned {
+			if strings.Contains(msg, b) {
+				t.Errorf("client message %q leaks internal token %q (from %v)", msg, b, err)
+			}
+		}
+	}
+	if safeStreamErrorMessage(nil) != "" {
+		t.Fatal("safeStreamErrorMessage(nil) must be empty")
 	}
 }
 

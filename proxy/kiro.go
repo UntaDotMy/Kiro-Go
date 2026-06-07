@@ -11,6 +11,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net"
 	"net/http"
 	"net/url"
@@ -157,11 +158,25 @@ const (
 	// much silence on a connection. That does double duty: the PING traffic
 	// keeps middleboxes from treating the connection as idle (prevention), and a
 	// missing PING ACK within PingTimeout tears the connection down with a
-	// concrete error in ~30s instead of 5 minutes (fast detection). A
-	// healthy-but-slow stream is unaffected — PINGs are answered, reads keep
-	// returning data, and idleTimeoutReader's 5m budget is never approached.
-	h2ReadIdleTimeout = 15 * time.Second
-	h2PingTimeout     = 15 * time.Second
+	// concrete error instead of 5 minutes (fast detection). A healthy-but-slow
+	// stream is unaffected — PINGs are answered at the transport layer regardless
+	// of application-level token generation, reads keep returning data, and
+	// idleTimeoutReader's 5m budget is never approached.
+	//
+	// Budget tuning (raised from 15s/15s): a PING ACK isn't only delayed by a
+	// dead connection — an alive-but-busy intermediary (AWS ALB/NLB, NAT, a
+	// TLS-terminating proxy) can delay the ACK round-trip during a legitimate
+	// quiet stretch of a long generation. With a tight 15s ReadIdleTimeout +
+	// 15s PingTimeout, that delay tripped closeForLostPing and aborted the
+	// in-flight request with "http2: client connection lost" — a false-positive
+	// teardown surfaced to the user as an API error. We now ping only after 30s
+	// of genuine silence and give the ACK 20s of headroom (gRPC's own keepalive
+	// ACK-timeout default), so a slow-but-alive upstream is no longer killed.
+	// The combined 50s detection budget is still far under streamIdleTimeout (5m)
+	// — enforced by TestEnableHTTP2PingsAppliesTimeouts — so a genuinely dead
+	// connection is still caught in well under a minute, not five.
+	h2ReadIdleTimeout = 30 * time.Second
+	h2PingTimeout     = 20 * time.Second
 
 	// tcpKeepAliveInterval is the OS-level TCP keep-alive probe interval on the
 	// upstream dialer. It is the dead-connection detection floor for BOTH
@@ -589,6 +604,47 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 				tu.Name = original
 			}
 			originalOnToolUse(tu)
+		}
+		callback = &wrapped
+	}
+
+	// Measure TIME-TO-FIRST-TOKEN for latency-aware "smart laning" selection.
+	// We record the elapsed time from request dispatch to the FIRST content
+	// callback (text or tool_use), per account, into the pool's TTFT EWMA. TTFT
+	// is the load-bearing latency signal (it reflects the account's queueing /
+	// warmth), unlike total completion time which is dominated by output length.
+	// The wrap fires the measurement exactly once per call via sync.Once, and
+	// only on a real account id, so it never double-counts across the multi-
+	// endpoint retry loop. Skipped for a nil account (tests / probes).
+	if account != nil && account.ID != "" && callback != nil {
+		acctID := account.ID
+		start := time.Now()
+		var ttftOnce sync.Once
+		recordTTFT := func() {
+			ttftOnce.Do(func() {
+				// Sub-millisecond resolution: time.Duration.Milliseconds() truncates
+				// to an integer, so a first token arriving in <1ms would yield 0 and
+				// be discarded by RecordTTFT's `ms <= 0` guard — losing the
+				// measurement for fast responses (and making every local-stub test
+				// record nothing). Divide by time.Millisecond to keep the fraction.
+				ms := float64(time.Since(start)) / float64(time.Millisecond)
+				pool.GetPool().RecordTTFT(acctID, ms)
+			})
+		}
+		wrapped := *callback
+		if origText := callback.OnText; origText != nil {
+			wrapped.OnText = func(text string, isThinking bool) {
+				recordTTFT()
+				origText(text, isThinking)
+			}
+		} else {
+			wrapped.OnText = func(string, bool) { recordTTFT() }
+		}
+		if origTool := callback.OnToolUse; origTool != nil {
+			wrapped.OnToolUse = func(tu KiroToolUse) {
+				recordTTFT()
+				origTool(tu)
+			}
 		}
 		callback = &wrapped
 	}

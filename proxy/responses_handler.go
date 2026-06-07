@@ -527,7 +527,7 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 			"response": map[string]interface{}{
 				"id":     respID,
 				"status": "failed",
-				"error":  map[string]interface{}{"type": "server_error", "message": err.Error()},
+				"error":  map[string]interface{}{"type": "server_error", "message": safeStreamErrorMessage(err)},
 			},
 		})
 		return

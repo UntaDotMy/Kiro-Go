@@ -71,6 +71,12 @@ type Handler struct {
 	startTime       int64
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
+	// stopDashboardPusher terminates the periodic dashboard snapshot pusher.
+	// That pusher broadcasts the live snapshot ~1s while >=1 dashboard is
+	// connected, so purely-live fields (inflight, cooldown countdown, paced
+	// rate, AIMD limit) update in realtime instead of only on request
+	// completion. Closed in Stop().
+	stopDashboardPusher chan struct{}
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
@@ -333,11 +339,12 @@ func NewHandler() *Handler {
 		failedRequests:  int64(failedReq),
 		totalTokens:     int64(totalTokens),
 		totalCredits:    totalCredits,
-		startTime:       time.Now().Unix(),
-		stopRefresh:     make(chan struct{}),
-		stopStatsSaver:  make(chan struct{}),
-		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
-		dashboardHub:    newDashboardHub(),
+		startTime:           time.Now().Unix(),
+		stopRefresh:         make(chan struct{}),
+		stopStatsSaver:      make(chan struct{}),
+		stopDashboardPusher: make(chan struct{}),
+		promptCache:         newPromptCacheTracker(defaultPromptCacheTTL),
+		dashboardHub:        newDashboardHub(),
 	}
 	// Configure the opt-in global rate limiter from persisted config (0 = off).
 	h.globalRL.Configure(config.GetGlobalRateLimitPerMinute())
@@ -361,6 +368,11 @@ func NewHandler() *Handler {
 	// Periodic sweep of the admin brute-force map so a distributed attack from
 	// many distinct single-attempt IPs can't grow it without bound.
 	h.startAdminFailSweeper()
+	// Periodic dashboard snapshot pusher so live-only fields (inflight, cooldown
+	// countdown, paced rate, AIMD limit) update in realtime while a dashboard is
+	// open, not just on request completion. Gated by hasSubscribers() so it's a
+	// cheap no-op when nobody is watching.
+	safeGo("dashboardPusher", h.dashboardPusher)
 	return h
 }
 
@@ -368,16 +380,25 @@ func NewHandler() *Handler {
 // during graceful shutdown so the proxy doesn't leak goroutines or partial
 // config writes.
 func (h *Handler) Stop() {
-	select {
-	case <-h.stopRefresh:
-	default:
-		close(h.stopRefresh)
+	// closeOnce closes a stop channel exactly once and tolerates a nil channel.
+	// Nil-safe because a Handler built as a struct literal in tests (rather than
+	// via NewHandler) leaves these channels nil; close(nil) would panic, and the
+	// bare select/default form does not guard against that (a receive on a nil
+	// channel blocks, so the default arm runs and closes nil). Production always
+	// goes through NewHandler, so this only matters for test ergonomics.
+	closeOnce := func(ch chan struct{}) {
+		if ch == nil {
+			return
+		}
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
 	}
-	select {
-	case <-h.stopStatsSaver:
-	default:
-		close(h.stopStatsSaver)
-	}
+	closeOnce(h.stopRefresh)
+	closeOnce(h.stopStatsSaver)
+	closeOnce(h.stopDashboardPusher)
 	// One last stats flush so the latest counters survive the restart.
 	h.saveStats()
 }
@@ -2092,21 +2113,22 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 		// Already streaming — we can't fail over. Record the failure (this
 		// committed request failed mid-stream) and surface it inline as an
-		// SSE error event so the client sees it.
+		// SSE error event so the client sees it. safeStreamErrorMessage never
+		// leaks raw Go/transport internals (e.g. "stream error: ...; INTERNAL_ERROR;
+		// received from peer" or "http2: client connection lost") — it logs the
+		// real cause and returns a stable, friendly message. A recognized stream
+		// reset / connection-lost is additionally surfaced as the distinct
+		// overloaded_error event type so clients can tell it apart from a generic
+		// api_error and retry.
 		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
-		emitError := map[string]string{"type": "api_error", "message": err.Error()}
 		eventType := "error"
-		// HTTP/2 RST_STREAM / GOAWAY: emit a stable, friendly
-		// overloaded_error so the client never sees the raw Go string
-		// (e.g. "stream error: stream ID 7; INTERNAL_ERROR; received
-		// from peer"). The original cause is logged for operators.
+		emitType := "api_error"
 		var sre *ErrUpstreamStreamReset
 		if errors.As(err, &sre) {
-			logger.Warnf("[StreamReset] post-commit upstream stream reset: %v", err)
-			emitError["type"] = "overloaded_error"
-			emitError["message"] = upstreamStreamResetMessage
 			eventType = "overloaded_error"
+			emitType = "overloaded_error"
 		}
+		emitError := map[string]string{"type": emitType, "message": safeStreamErrorMessage(err)}
 		emit(eventType, map[string]interface{}{
 			"type":  eventType,
 			"error": emitError,
@@ -3215,6 +3237,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		stats := statsMap[a.ID]
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
 		pacedRate, observedRate := h.pool.RateState(a.ID)
+		ttft := h.pool.TTFTState(a.ID)
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -3263,6 +3286,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"concurrencyLimit":  concurrencyLimit,
 			"pacedRate":         pacedRate,
 			"observedRate":      observedRate,
+			"ttftMs":            ttft,
 			"cooldownSecs":      int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds()),
 			"overQuota":         a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit,
 		}

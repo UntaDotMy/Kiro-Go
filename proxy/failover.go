@@ -185,12 +185,20 @@ func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker 
 // acquireWithAdmissionWait wraps the pool's reserving picker with a bounded wait
 // for a free in-flight slot. When the picker reports saturation (every eligible
 // account at its AIMD limit, signalled by a small retryAfter with ok=false and
-// no account), it retries for up to admissionWaitBudget before giving up — a
-// slot frees as concurrent requests complete. A cooling-pool retryAfter (longer
-// than the saturation poll) is returned immediately, since waiting won't help on
-// that timescale.
+// no account), it waits up to admissionWaitBudget for capacity to free. A
+// cooling-pool retryAfter (longer than the saturation poll) is returned
+// immediately, since waiting won't help on that timescale.
+//
+// The wait is EVENT-DRIVEN: it blocks on the pool's ReleaseSignal (woken the
+// instant a concurrency slot frees) rather than sleeping a fixed poll interval,
+// so a freed slot is reused at wakeup latency instead of up to a full tick
+// later. A bounded fallback timer (saturationPollInterval) still ticks because a
+// RATE-paced account frees no slot on Release — its GCRA bucket refills on a
+// clock — so that recovery path must be re-checked on a timer. If the pool
+// exposes no signal channel, this degrades to pure polling.
 func (h *Handler) acquireWithAdmissionWait(model string, tried map[string]bool) (*config.Account, time.Duration, bool) {
 	deadline := time.Now().Add(admissionWaitBudget)
+	releaseCh := h.pool.ReleaseSignal()
 	for {
 		account, retryAfter, ok := h.pool.AcquireForModelExcluding(model, tried)
 		if ok {
@@ -202,12 +210,30 @@ func (h *Handler) acquireWithAdmissionWait(model string, tried map[string]bool) 
 		if retryAfter <= 0 || retryAfter > saturationPollHint {
 			return nil, retryAfter, false
 		}
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			// Waited our budget and still no slot. Shed with the poll hint so
 			// the caller emits a short Retry-After.
 			return nil, retryAfter, false
 		}
-		time.Sleep(retryAfter)
+		// Wake on the SOONER of: a slot freeing (event), the fallback poll
+		// (covers rate-bucket refills that don't signal), or the budget
+		// deadline. Capping the timer at `remaining` keeps the total wait
+		// bounded by admissionWaitBudget.
+		wait := retryAfter
+		if wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		if releaseCh != nil {
+			select {
+			case <-releaseCh:
+			case <-timer.C:
+			}
+		} else {
+			<-timer.C
+		}
+		timer.Stop()
 	}
 }
 

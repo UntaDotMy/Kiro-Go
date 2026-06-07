@@ -94,20 +94,22 @@ const (
 	// successes, multiplicative-decrease on a 429. The request handler reserves
 	// a slot before the upstream call (Acquire) and releases it after (Release).
 	//
-	// aimdInitialLimit is where a fresh / just-recovered account starts. 2 lets
-	// a little parallelism through immediately without spraying a burst.
-	aimdInitialLimit = 2
-	// aimdMinLimit is the floor — never drop below this on a 429. With
-	// multiple accounts pooled, a 1-slot floor left no headroom: any
-	// concurrent burst on a recovered account immediately re-throttled,
-	// and the dispatcher's admission-wait budget turned into a stall.
-	// A 2-slot floor keeps a recovered account productive immediately
-	// while still letting it self-tune down toward AWS's actual bucket
-	// size on the multiplicative-decrease path.
-	aimdMinLimit = 2
-	// aimdMaxLimit caps how far additive-increase can climb, so one account
-	// can't absorb the entire burst and re-trigger the storm we're fixing.
-	aimdMaxLimit = 12
+	// aimdInitialLimit is where a fresh / just-recovered account starts. 4 lets
+	// a real fan-out through immediately (a small pool of 2-3 accounts otherwise
+	// admits almost nothing on cold start and dumps the overflow into the
+	// admission wait). The rate pacer is the proactive 429-avoider; this
+	// concurrency limit is the burst gate, so it can afford to start higher.
+	aimdInitialLimit = 4
+	// aimdMinLimit is the floor — never drop below this on a 429. A 3-slot floor
+	// keeps a recovered account productive immediately under a burst while still
+	// letting it self-tune down on the multiplicative-decrease path.
+	aimdMinLimit = 3
+	// aimdMaxLimit caps how far the increase can climb. Raised to 32 because on a
+	// SMALL pool the old cap of 12 throttled total concurrency hard (2 accounts ×
+	// 12 = 24); the per-account rate pacer is what actually keeps us under the
+	// hidden bucket, so the concurrency ceiling can be generous without causing a
+	// storm. Larger pools rarely reach this because load spreads across accounts.
+	aimdMaxLimit = 32
 	// aimdDecreaseNum/Den is the multiplicative-decrease factor on a 429 (×3/4).
 	// A token bucket is a wall, not TCP congestion, so we cut harder than
 	// Netflix's 0.9 default but softer than TCP's 0.5 to avoid over-shrinking a
@@ -123,8 +125,11 @@ const (
 	// saturationPollInterval is the "try again very soon" hint the picker
 	// returns when every eligible account is at its concurrency limit (not
 	// cooling, just busy). The failover dispatcher waits this long for a slot to
-	// free before re-selecting, up to its admission budget.
-	saturationPollInterval = 100 * time.Millisecond
+	// free before re-selecting, up to its admission budget. 25ms (was 100ms)
+	// shrinks the quantization waste — a slot that frees just after a poll is
+	// reused ~4× sooner. Phase B replaces this poll with an event-driven wakeup
+	// on Release; until then, a tighter poll is the cheap latency win.
+	saturationPollInterval = 25 * time.Millisecond
 )
 
 // accountSlot is one entry in the SWRR scheduler. The slot is keyed
@@ -170,6 +175,17 @@ type cooldownEntry struct {
 	observedRate  float64
 	lastSuccessAt time.Time
 	lastProbeAt   time.Time
+
+	// ttftEWMA is the exponentially-weighted moving average of TIME-TO-FIRST-TOKEN
+	// for this account, in milliseconds (0 = no measurement yet). TTFT is the
+	// load-bearing latency signal: it reflects this account's queueing / warmth /
+	// remaining capacity, unlike total completion time which is dominated by the
+	// response's output length and would mis-steer traffic away from a healthy
+	// account that simply got a long answer. The scorer prefers the account with
+	// the LOWEST ttftEWMA among those that already passed the rate-headroom and
+	// concurrency gates — the "best lane" choice, which never overrides 429
+	// safety because the gates run first.
+	ttftEWMA float64
 }
 
 // AccountPool 账号池
@@ -186,6 +202,17 @@ type AccountPool struct {
 	slots      []*accountSlot             // SWRR scheduler slots, parallel to accounts
 	cooldowns  map[string]*cooldownEntry  // accountID → cooldown state
 	modelLists map[string]map[string]bool // accountID → set of supported model IDs
+
+	// releaseCh wakes an admission waiter the instant an in-flight slot frees,
+	// so the failover dispatcher no longer has to poll for a free slot (a freed
+	// slot was previously unused until the next ~25ms poll tick). Buffered-1 with
+	// a non-blocking send in Release: concurrent releases coalesce into a single
+	// wakeup (the woken waiter re-attempts Acquire and re-waits if it still can't
+	// get one), and a send that finds the buffer full is simply dropped. Waiters
+	// MUST still use a bounded fallback timer because a RATE-paced account frees
+	// no slot on Release — its GCRA bucket refills on a clock, not on completion —
+	// so the signal alone can't cover that recovery path.
+	releaseCh chan struct{}
 }
 
 var (
@@ -199,6 +226,7 @@ func GetPool() *AccountPool {
 		pool = &AccountPool{
 			cooldowns:  make(map[string]*cooldownEntry),
 			modelLists: make(map[string]map[string]bool),
+			releaseCh:  make(chan struct{}, 1),
 		}
 		pool.Reload()
 	})
@@ -214,6 +242,7 @@ func NewForTesting() *AccountPool {
 	return &AccountPool{
 		cooldowns:  make(map[string]*cooldownEntry),
 		modelLists: make(map[string]map[string]bool),
+		releaseCh:  make(chan struct{}, 1),
 	}
 }
 
@@ -522,12 +551,45 @@ func (p *AccountPool) AcquireForModelExcluding(model string, exclude map[string]
 // Safe to call unconditionally: it floors at zero and is a no-op for accounts
 // that never reserved (non-least-request strategies, or an already-released
 // slot). Must be called exactly once per successful Acquire.
+//
+// On a real slot free it signals releaseCh (non-blocking, coalesced) so an
+// admission waiter wakes immediately instead of after the next poll tick.
 func (p *AccountPool) Release(id string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	freed := false
 	if cd, ok := p.cooldowns[id]; ok && cd.inflight > 0 {
 		cd.inflight--
+		freed = true
 	}
+	p.mu.Unlock()
+	if freed {
+		p.signalRelease()
+	}
+}
+
+// signalRelease does a non-blocking send on releaseCh so a waiting acquirer
+// wakes at once. Buffered-1 + non-blocking: concurrent releases coalesce into a
+// single pending wakeup, and a send that finds the buffer full is dropped (the
+// already-pending signal will wake a waiter, who re-attempts and re-waits if a
+// slot still isn't available). Nil-safe for pools built without the channel.
+func (p *AccountPool) signalRelease() {
+	if p.releaseCh == nil {
+		return
+	}
+	select {
+	case p.releaseCh <- struct{}{}:
+	default:
+	}
+}
+
+// ReleaseSignal returns the channel an admission waiter selects on to be woken
+// the instant an in-flight slot frees. Always pair a receive on it with a
+// bounded fallback timer: a RATE-paced account frees no slot on Release (its
+// GCRA bucket refills on a clock), so the signal alone does not cover that
+// recovery path. Returns nil for a pool built without the channel, in which
+// case the caller falls back to pure polling.
+func (p *AccountPool) ReleaseSignal() <-chan struct{} {
+	return p.releaseCh
 }
 
 // InflightCount reports the current reserved in-flight count for an account
@@ -553,6 +615,18 @@ func (p *AccountPool) RateState(id string) (pacedRate, observedRate float64) {
 		return cd.rateEstimate, cd.observedRate
 	}
 	return 0, 0
+}
+
+// TTFTState reports an account's EWMA time-to-first-token in milliseconds (0 =
+// not measured yet), for the dashboard's realtime latency display and tests.
+// This is the load signal the latency-aware scorer steers by.
+func (p *AccountPool) TTFTState(id string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if cd, ok := p.cooldowns[id]; ok {
+		return cd.ttftEWMA
+	}
+	return 0
 }
 
 // ConcurrencyState reports an account's live in-flight count and its current
@@ -716,9 +790,33 @@ func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) 
 		}
 		winner = candidates[0]
 		bestScore := -1.0
+		// Latency-aware "smart laning": among the candidates that already passed
+		// the rate-headroom + concurrency gates (so this can never override 429
+		// safety), prefer the account with the lowest time-to-first-token. We
+		// penalize each candidate's score by how much slower its TTFT is than the
+		// FASTEST candidate's, bounded so one slow reading can't starve an account.
+		// minTTFT is the fastest measured candidate (0 if none measured yet).
+		minTTFT := 0.0
+		for _, i := range candidates {
+			if tt := p.ttftLocked(p.accounts[i].ID); tt > 0 && (minTTFT == 0 || tt < minTTFT) {
+				minTTFT = tt
+			}
+		}
 		for _, i := range candidates {
 			inflight := p.inflightLocked(p.accounts[i].ID)
 			score := float64(p.slots[i].effectiveWeight) / float64(inflight+1)
+			// ttftFactor >= 1: 1.0 for the fastest (or any unmeasured) account, up
+			// to ttftPenaltyCap for the slowest. An unmeasured account stays at 1.0
+			// so a fresh account still gets traffic to learn its TTFT (explore).
+			if minTTFT > 0 {
+				if tt := p.ttftLocked(p.accounts[i].ID); tt > 0 {
+					factor := tt / minTTFT
+					if factor > ttftPenaltyCap {
+						factor = ttftPenaltyCap
+					}
+					score /= factor
+				}
+			}
 			if score > bestScore {
 				bestScore = score
 				winner = i
@@ -753,6 +851,15 @@ func (p *AccountPool) limitLocked(id string) int {
 		return cd.limit
 	}
 	return aimdInitialLimit
+}
+
+// ttftLocked returns the account's EWMA time-to-first-token in milliseconds, or
+// 0 when no measurement exists yet. Caller must hold p.mu.
+func (p *AccountPool) ttftLocked(id string) float64 {
+	if cd, ok := p.cooldowns[id]; ok {
+		return cd.ttftEWMA
+	}
+	return 0
 }
 
 // reserveLocked increments an account's in-flight counter, creating the entry
@@ -843,6 +950,16 @@ func (p *AccountPool) decayCountersLocked(now time.Time) {
 			cd.consecutiveErrs = 0
 			continue
 		}
+		// Likewise preserve a learned TTFT measurement: an account whose error
+		// history has aged out but which we've measured latency for should keep
+		// that EWMA so the latency-aware scorer doesn't lose its "fast lane"
+		// signal and have to re-learn from scratch. Age out only the error fields.
+		if cd.ttftEWMA > 0 {
+			cd.lastErrorAt = time.Time{}
+			cd.lastSleep = 0
+			cd.consecutiveErrs = 0
+			continue
+		}
 		delete(p.cooldowns, id)
 	}
 }
@@ -858,6 +975,26 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 		}
 	}
 	return nil
+}
+
+// RecordTTFT folds a time-to-first-token sample (milliseconds) into the
+// account's EWMA, the load signal the latency-aware scorer steers by. Called
+// once per request when the first content byte/token arrives upstream. Creates
+// the cooldown entry if needed (an account we've only ever measured latency for
+// still needs somewhere to keep it). A non-positive or absent sample is ignored
+// by updateTTFT, so a request that produced no token never corrupts the EWMA.
+func (p *AccountPool) RecordTTFT(id string, ms float64) {
+	if ms <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cd := p.cooldowns[id]
+	if cd == nil {
+		cd = &cooldownEntry{limit: aimdInitialLimit}
+		p.cooldowns[id] = cd
+	}
+	cd.ttftEWMA = updateTTFT(cd.ttftEWMA, ms)
 }
 
 // RecordSuccess clears soft cooldown and resets the consecutive error counter.
@@ -905,14 +1042,22 @@ func (p *AccountPool) RecordSuccess(id string) {
 	cd.until = time.Time{}
 	cd.consecutiveErrs = 0
 	cd.lastSleep = 0
-	// AIMD additive increase, gated on actually using the limit so an idle
-	// account doesn't accumulate headroom for the next burst to overshoot.
+	// AIMD increase, gated on actually using the limit so an idle account
+	// doesn't accumulate headroom for the next burst to overshoot. Grows by 2
+	// (was 1) so a small pool reaches a useful concurrency ceiling in half the
+	// successful requests; the rate pacer remains the proactive 429-guard, so a
+	// faster concurrency climb doesn't itself induce throttling. The gate is
+	// relaxed to inflight >= limit-1 so growth keeps up under a steady burst that
+	// sits just below the ceiling.
 	limit := cd.limit
 	if limit <= 0 {
 		limit = aimdInitialLimit
 	}
-	if cd.inflight >= limit && limit < aimdMaxLimit {
-		limit++
+	if cd.inflight >= limit-1 && limit < aimdMaxLimit {
+		limit += 2
+		if limit > aimdMaxLimit {
+			limit = aimdMaxLimit
+		}
 	}
 	cd.limit = limit
 	// Drop the entry only when it carries NO useful state at all. A
@@ -922,7 +1067,8 @@ func (p *AccountPool) RecordSuccess(id string) {
 	// between every pair of successes. Idle measurement-only entries are reaped
 	// later by decayCountersLocked.
 	if cd.inflight == 0 && cd.limit == aimdInitialLimit && cd.lastErrorAt.IsZero() &&
-		cd.rateEstimate == 0 && cd.observedRate == 0 && cd.lastSuccessAt.IsZero() {
+		cd.rateEstimate == 0 && cd.observedRate == 0 && cd.lastSuccessAt.IsZero() &&
+		cd.ttftEWMA == 0 {
 		delete(p.cooldowns, id)
 	}
 }
