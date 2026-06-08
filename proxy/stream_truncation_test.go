@@ -137,3 +137,92 @@ func TestCompleteStreamWithToolUseIsSuccess(t *testing.T) {
 		t.Fatal("expected the tool use to be delivered")
 	}
 }
+
+// TestPendingToolUseWithValidJSONFlushedOnEOF is the core fix for the
+// "Claude Code emits a preamble then ends the turn" bug. A tool-use whose input
+// is fully assembled (valid complete JSON) but whose stop:true frame was lost to
+// a connection drop must be FLUSHED at clean EOF — not silently discarded — so
+// the client actually runs the tool instead of seeing a fabricated end_turn.
+func TestPendingToolUseWithValidJSONFlushedOnEOF(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "Let me look at the project structure"}))
+	// Tool use with complete, valid JSON input but NO stop:true frame, then EOF.
+	buf.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "tu_1", "name": "Glob", "input": `{"pattern":"**/*.go"}`,
+	}))
+
+	var gotTool *KiroToolUse
+	cb := &KiroStreamCallback{
+		OnText:    func(string, bool) {},
+		OnToolUse: func(tu KiroToolUse) { gotTool = &tu },
+	}
+
+	err := parseEventStream(bytes.NewReader(buf.Bytes()), cb)
+	if err != nil {
+		t.Fatalf("a recoverable (valid-JSON) pending tool use must be flushed, not errored; got %v", err)
+	}
+	if gotTool == nil {
+		t.Fatal("pending tool use with valid JSON must be flushed on EOF, was dropped")
+	}
+	if gotTool.Name != "Glob" {
+		t.Fatalf("flushed tool name = %q, want Glob", gotTool.Name)
+	}
+	if gotTool.Input["pattern"] != "**/*.go" {
+		t.Fatalf("flushed tool input = %v, want pattern=**/*.go", gotTool.Input)
+	}
+}
+
+// TestPendingToolUseWithInvalidJSONIsRetryableTruncation verifies the other
+// branch: a tool use cut MID-ARGUMENTS (accumulated input is non-empty but not
+// valid JSON, and no stop:true) is a genuine UnexpectedToolUseEos truncation. We
+// cannot fabricate the missing arguments, so it must surface as a retryable
+// stream reset (failover pre-commit / real error post-commit), never a flushed
+// half-tool or a clean end_turn.
+func TestPendingToolUseWithInvalidJSONIsRetryableTruncation(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "Let me search"}))
+	// Tool input cut mid-arguments: a partial, unparseable JSON fragment, no stop.
+	buf.Write(buildEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "tu_1", "name": "Grep", "input": `{"pattern":"M7`,
+	}))
+
+	var gotTool bool
+	cb := &KiroStreamCallback{
+		OnText:    func(string, bool) {},
+		OnToolUse: func(KiroToolUse) { gotTool = true },
+	}
+
+	err := parseEventStream(bytes.NewReader(buf.Bytes()), cb)
+	if gotTool {
+		t.Fatal("a tool use truncated mid-arguments must NOT be flushed with partial input")
+	}
+	var sre *ErrUpstreamStreamReset
+	if !errors.As(err, &sre) {
+		t.Fatalf("mid-arguments truncation should be a retryable *ErrUpstreamStreamReset, got %T: %v", err, err)
+	}
+	if !isRetryableUpstreamError(err) {
+		t.Fatal("a truncated tool use must be retryable so the dispatcher fails over")
+	}
+}
+
+// TestPendingArglessToolUseFlushedOnEOF verifies an argument-less tool whose
+// stop frame was lost (empty input buffer) is still flushed — an empty input is
+// "complete" for a no-arg tool, not a truncation.
+func TestPendingArglessToolUseFlushedOnEOF(t *testing.T) {
+	frame := buildEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "tu_1", "name": "ListFiles",
+		// no "input", no "stop"
+	})
+
+	var gotTool bool
+	cb := &KiroStreamCallback{
+		OnText:    func(string, bool) {},
+		OnToolUse: func(KiroToolUse) { gotTool = true },
+	}
+	if err := parseEventStream(bytes.NewReader(frame), cb); err != nil {
+		t.Fatalf("an argless pending tool use must flush cleanly, got %v", err)
+	}
+	if !gotTool {
+		t.Fatal("argless pending tool use must be flushed on EOF")
+	}
+}

@@ -1076,6 +1076,35 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 	}
 
+	// Clean EOF reached (every error path inside the loop returns, so getting
+	// here means the body ended normally). Finalize any tool use that was still
+	// being assembled: it never received its stop:true frame. This is the AWS
+	// "UnexpectedToolUseEos" shape — "the stream can unexpectedly end while
+	// waiting for an exceptionally complex tool use [because] some proxy server
+	// dropped the idle connection." Previously the pending tool use was SILENTLY
+	// DISCARDED here: the loop just fell through to OnComplete, the handler saw
+	// no tool call, and the request resolved to a fabricated end_turn — so a
+	// client like Claude Code emitted its "Let me look at the project..."
+	// preamble and then ended the turn instead of running the tool.
+	//
+	// Decide by the completeness of the accumulated input, which is correct
+	// whether stop:true is a guaranteed terminator or merely best-effort:
+	//   - empty input (argless tool) or input that parses as valid complete
+	//     JSON  -> the call finished and only the stop frame was lost in transit;
+	//     flush it so the tool call is delivered rather than dropped.
+	//   - non-empty input that is NOT valid JSON -> genuinely truncated
+	//     mid-arguments; we can't fabricate the rest, so surface a retryable
+	//     stream-reset (classifyStreamError maps io.ErrUnexpectedEOF to one) so
+	//     the dispatcher fails over to a peer pre-commit, or the post-commit path
+	//     emits a real error frame — never a clean end_turn.
+	if currentToolUse != nil {
+		if buf := currentToolUse.InputBuffer.String(); buf != "" && !json.Valid([]byte(buf)) {
+			return classifyStreamError(io.ErrUnexpectedEOF)
+		}
+		finishToolUse(currentToolUse, callback)
+		currentToolUse = nil
+	}
+
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
 	}
