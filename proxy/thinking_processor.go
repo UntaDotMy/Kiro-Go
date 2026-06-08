@@ -6,8 +6,8 @@ import "strings"
 // <thinking>...</thinking> tags into discrete state transitions for the
 // caller's emitter. It is the single source of truth for both the Anthropic
 // /v1/messages and OpenAI /v1/chat/completions streaming paths — earlier
-// revisions had two near-identical copies that drifted (most recently the
-// 15-rune tail-hold that interacted badly with normalizeChunk).
+// revisions had two near-identical copies that drifted (most recently a
+// 15-rune tail-hold that interacted badly with the upstream delta handling).
 //
 // Lifecycle:
 //   p := newThinkingProcessor(thinking, emit)

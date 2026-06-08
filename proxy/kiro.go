@@ -909,8 +909,6 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var inputTokens, outputTokens int
 	var totalCredits float64
 	var currentToolUse *toolUseState
-	var lastAssistantContent string
-	var lastReasoningContent string
 	stopReasonEmitted := false
 
 	emitStopReason := func(reason string) {
@@ -938,6 +936,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		_, err := io.ReadFull(body, prelude[:])
 		if err == io.EOF {
+			// Clean EOF at a frame boundary is how the upstream signals normal
+			// end-of-stream: CodeWhisperer / Amazon Q generateAssistantResponse
+			// has NO application-level terminal event (no messageStop /
+			// stopReason). A drop that lands exactly on a frame boundary is
+			// therefore indistinguishable from a complete response even to AWS's
+			// own client, so we treat a clean EOF as success. A drop MID-FRAME is
+			// caught below: io.ReadFull returns io.ErrUnexpectedEOF, which
+			// classifyStreamError flags as a retryable stream reset.
 			break
 		}
 		if err != nil {
@@ -1025,17 +1031,27 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		// Dispatch by event type.
 		switch eventType {
 		case "assistantResponseEvent":
+			// content is an INCREMENTAL delta fragment, NOT a cumulative
+			// snapshot: CodeWhisperer / Amazon Q generateAssistantResponse emits
+			// each piece once and the full message is their verbatim
+			// concatenation (confirmed against AWS's own Q CLI, which does a
+			// plain push_str, and every reference proxy, which does
+			// `result.content += event.content`). We therefore forward each
+			// fragment AS-IS. An earlier "normalizeChunk" deduper assumed a
+			// cumulative stream and dropped exact-equal or prefix-overlapping
+			// fragments — which silently corrupted legitimate output ("i like
+			// you" -> "ilike you", "water" -> "wate", a doubled word -> one).
+			// The binary frame parser already delivers each frame exactly once,
+			// so there is nothing to dedup.
 			if content, ok := event["content"].(string); ok && content != "" {
-				normalized := normalizeChunk(content, &lastAssistantContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, false)
+				if callback.OnText != nil {
+					callback.OnText(content, false)
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
-				normalized := normalizeChunk(text, &lastReasoningContent)
-				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, true)
+				if callback.OnText != nil {
+					callback.OnText(text, true)
 				}
 			}
 		case "toolUseEvent":
@@ -1281,51 +1297,6 @@ func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
 			collectUsageMaps(child, out)
 		}
 	}
-}
-
-// normalizeChunk reconciles a freshly received upstream text chunk with the
-// snapshot of what we have already emitted. Kiro's event stream sometimes
-// replays cumulative content (e.g. successive chunks "abc" then "abcde"), and
-// older snapshots can arrive out of order on retries. We strip those exact
-// overlaps but never guess at partial-suffix duplication: a coincidental match
-// between prev's tail and chunk's head can just as easily be legitimate text
-// across a chunk boundary, and dropping it produced visible truncations like
-// "sleep" -> "slep" or "lets begin" -> "letsbegin".
-func normalizeChunk(chunk string, previous *string) string {
-	if chunk == "" {
-		return ""
-	}
-
-	prev := *previous
-	if prev == "" {
-		*previous = chunk
-		return chunk
-	}
-
-	// Exact replay of the most recent snapshot — drop.
-	if chunk == prev {
-		return ""
-	}
-
-	// Cumulative replay: the new chunk extends prev. Emit only the new tail.
-	if strings.HasPrefix(chunk, prev) {
-		delta := chunk[len(prev):]
-		*previous = chunk
-		return delta
-	}
-
-	// Rewind: an older, shorter snapshot arrived after a longer one. Ignore it
-	// and keep the longer snapshot so future cumulative comparisons stay sound.
-	if strings.HasPrefix(prev, chunk) {
-		return ""
-	}
-
-	// Otherwise treat the chunk as a pure delta. Earlier revisions tried to
-	// detect partial overlaps via HasSuffix(prev, chunk[:i]) and trim them,
-	// but that heuristic mis-deletes legitimate characters whenever prev's
-	// trailing rune happens to match chunk's leading rune.
-	*previous = chunk
-	return chunk
 }
 
 func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
