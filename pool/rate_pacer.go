@@ -93,11 +93,15 @@ const (
 	rateObservedMaxSample = 500.0
 
 	// ttftEWMAAlpha is the weight on the newest time-to-first-token sample in the
-	// per-account TTFT EWMA used for latency-aware "smart laning" selection. 0.3
-	// tracks recent latency while damping single-request spikes; biased slightly
-	// toward recency so an account that starts slowing is penalized within a few
-	// requests (the Peak-EWMA intent) without one outlier dominating.
-	ttftEWMAAlpha = 0.3
+	// per-account TTFT EWMA used for latency-aware "smart laning" selection. 0.5
+	// weights the latest sample equally with history, so an account that starts
+	// slowing (or recovers) is reflected within ~2 requests instead of ~4. We
+	// measured TTFT swinging 1.9s–11.8s for the SAME request against a live pool,
+	// so the signal is genuinely noisy and time-varying; a faster-tracking EWMA
+	// follows the currently-fast identity rather than lagging on stale history.
+	// Single-request outliers are still bounded by ttftMaxSampleMs and the
+	// scorer's ttftPenaltyCap, so faster tracking doesn't let one spike dominate.
+	ttftEWMAAlpha = 0.5
 
 	// ttftMaxSampleMs clamps a single TTFT sample (milliseconds) so a pathological
 	// outlier (a near-stalled request that still eventually produced a token)
@@ -106,12 +110,16 @@ const (
 	ttftMaxSampleMs = 60000.0
 
 	// ttftPenaltyCap bounds how much the latency-aware scorer can divide an
-	// account's score by relative to the fastest candidate. A factor of 4 means
-	// even an account 10× slower in TTFT is only penalized as if it were 4× — so
-	// latency steering is a strong PREFERENCE for the fast lane, never a hard ban
-	// that starves a slower-but-healthy account of all traffic (which would also
-	// stop us re-measuring whether it has recovered).
-	ttftPenaltyCap = 4.0
+	// account's score by relative to the fastest candidate. Raised from 4 to 10
+	// after measuring a real spread of ~1.5s (fastest) to ~9.6s (slowest) across
+	// one live pool — a 6.4x ratio. At the old cap of 4 the scorer treated a
+	// 6.4x-slower account as only 4x slower, so it still steered meaningful
+	// traffic onto the slow lane; 10 lets the penalty track the real ratio up to
+	// an order of magnitude. It stays a strong PREFERENCE, not a hard ban: even
+	// at 10x an account keeps ~10% selection weight, so a recovered account still
+	// gets probed and can climb back as its EWMA improves (and unmeasured
+	// accounts stay at factor 1.0 to explore).
+	ttftPenaltyCap = 10.0
 )
 
 // updateTTFT folds one time-to-first-token sample (milliseconds) into the EWMA.
