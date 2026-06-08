@@ -15,13 +15,21 @@ import (
 // token miss rotate to a peer instead of being misclassified as a terminal
 // upstream error.
 
-// saturatePool drives every account in the pool up to its AIMD concurrency
-// limit by repeatedly acquiring (and never releasing) reserving slots under the
+// saturatePool drives every account in the pool up to its concurrency limit by
+// repeatedly acquiring (and never releasing) reserving slots under the
 // least-request strategy. It returns once the next acquire would be shed.
+//
+// It pins a small per-account concurrency bound (2/2) for the duration of the
+// pool's lifetime so saturation is fast and deterministic regardless of the
+// production default (which is large — 12/48). The first acquire caches that
+// bound onto the pool, so restoring the resolver afterwards is safe: the cached
+// value won't be re-resolved.
 func saturatePool(t *testing.T, p *pool.AccountPool, ids ...string) {
 	t.Helper()
-	// aimdInitialLimit is 2 per account; acquire generously and stop when the
-	// pool starts shedding (ok=false with the saturation hint).
+	restore := pool.SetConcurrencyResolverForTesting(func() (int, int) { return 2, 2 })
+	defer restore()
+	// 2 slots/account; acquire generously and stop when the pool starts shedding
+	// (ok=false with the saturation hint).
 	for i := 0; i < len(ids)*8; i++ {
 		_, _, ok := p.AcquireForModelExcluding("", nil)
 		if !ok {

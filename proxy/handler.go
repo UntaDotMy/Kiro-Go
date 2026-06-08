@@ -4729,22 +4729,26 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 // apiGetEndpointConfig 获取端点配置
 func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"preferredEndpoint": config.GetPreferredEndpoint(),
-		"endpointFallback":  config.GetEndpointFallback(),
-		"region":            config.GetKiroAPIRegion(),
-		"regions":           config.GetKiroAPIRegions(),
-		"poolStrategy":      config.GetPoolStrategy(),
+		"preferredEndpoint":      config.GetPreferredEndpoint(),
+		"endpointFallback":       config.GetEndpointFallback(),
+		"region":                 config.GetKiroAPIRegion(),
+		"regions":                config.GetKiroAPIRegions(),
+		"poolStrategy":           config.GetPoolStrategy(),
+		"poolInitialConcurrency": config.GetPoolInitialConcurrency(),
+		"poolMaxConcurrency":     config.GetPoolMaxConcurrency(),
 	})
 }
 
 // apiUpdateEndpointConfig 更新端点配置
 func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PreferredEndpoint string    `json:"preferredEndpoint"`
-		EndpointFallback  *bool     `json:"endpointFallback"`
-		Region            *string   `json:"region,omitempty"`
-		Regions           *[]string `json:"regions,omitempty"`
-		PoolStrategy      *string   `json:"poolStrategy,omitempty"`
+		PreferredEndpoint      string    `json:"preferredEndpoint"`
+		EndpointFallback       *bool     `json:"endpointFallback"`
+		Region                 *string   `json:"region,omitempty"`
+		Regions                *[]string `json:"regions,omitempty"`
+		PoolStrategy           *string   `json:"poolStrategy,omitempty"`
+		PoolInitialConcurrency *int      `json:"poolInitialConcurrency,omitempty"`
+		PoolMaxConcurrency     *int      `json:"poolMaxConcurrency,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4819,6 +4823,29 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+	}
+
+	// Adaptive-concurrency knobs (least-request strategy). Both are optional; a
+	// nil pointer leaves the current value untouched. We resolve the effective
+	// values for whichever side wasn't sent so the cross-field "max >= initial"
+	// check in UpdatePoolConcurrency validates against the persisted value, not 0
+	// (which would otherwise read as "reset to default" and skip the check).
+	if req.PoolInitialConcurrency != nil || req.PoolMaxConcurrency != nil {
+		initial := config.GetPoolInitialConcurrency()
+		if req.PoolInitialConcurrency != nil {
+			initial = *req.PoolInitialConcurrency
+		}
+		max := config.GetPoolMaxConcurrency()
+		if req.PoolMaxConcurrency != nil {
+			max = *req.PoolMaxConcurrency
+		}
+		if err := config.UpdatePoolConcurrency(initial, max); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// Apply mid-run: Reload refreshes the pool's cached concurrency bounds.
+		h.pool.Reload()
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

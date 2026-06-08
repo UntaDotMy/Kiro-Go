@@ -165,11 +165,10 @@ func TestReleaseUnknownAccountIsNoOp(t *testing.T) {
 
 // --- AIMD grow / shrink ----------------------------------------------------
 
-// TestAIMDGrowOnSuccessGatedByUsage verifies the additive-increase only fires
-// when the account is actually using its limit (inflight >= limit): a success on
-// an idle account must NOT grow the limit (which would let the next burst
-// overshoot), while a success at the ceiling bumps it (by 2 under the faster
-// Phase-A growth).
+// TestAIMDGrowOnSuccessGatedByUsage verifies the increase only fires when the
+// account is actually using its limit (inflight >= limit-1): a success on an idle
+// account must NOT grow the limit (which would let the next burst overshoot),
+// while a success at the ceiling grows it via slow-start (limit += limit/2).
 func TestAIMDGrowOnSuccessGatedByUsage(t *testing.T) {
 	withLeastRequest(t)
 	p := newTestPool()
@@ -183,16 +182,108 @@ func TestAIMDGrowOnSuccessGatedByUsage(t *testing.T) {
 		t.Fatalf("idle success must not grow limit; expected %d, got %d", aimdInitialLimit, limit)
 	}
 
-	// Now saturate (inflight == limit) and record a success: limit grows by 2,
-	// capped at aimdMaxLimit.
+	// Now saturate (inflight == limit) and record a success: with no ssthresh
+	// yet the account is in slow-start, so the limit grows multiplicatively by
+	// limit/2 (12 -> 18), not by +1.
 	p.cooldowns["a"] = &cooldownEntry{limit: aimdInitialLimit, inflight: aimdInitialLimit}
 	p.RecordSuccess("a")
-	want := aimdInitialLimit + 2
-	if want > aimdMaxLimit {
-		want = aimdMaxLimit
-	}
+	want := aimdInitialLimit + aimdInitialLimit/2
 	if _, limit := p.ConcurrencyState("a"); limit != want {
-		t.Fatalf("at-capacity success should grow limit to %d, got %d", want, limit)
+		t.Fatalf("at-capacity slow-start success should grow limit to %d, got %d", want, limit)
+	}
+}
+
+// TestSlowStartReachesMaxFast verifies the headline property of the rework: a
+// fresh, fully-saturated account climbs from the initial window to the max
+// ceiling in a handful of successes (geometric slow-start), not the ~36 additive
+// steps the old +1 loop needed. With initial 12 / max 48 it should take <= 4.
+func TestSlowStartReachesMaxFast(t *testing.T) {
+	withLeastRequest(t)
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// Keep the account pinned at capacity so every success counts, no ssthresh
+	// (never 429ed) so it stays in slow-start the whole way.
+	steps := 0
+	for {
+		_, limit := p.ConcurrencyState("a")
+		if limit >= aimdMaxLimit {
+			break
+		}
+		p.cooldowns["a"] = &cooldownEntry{limit: limit, inflight: limit}
+		p.RecordSuccess("a")
+		steps++
+		if steps > 10 {
+			t.Fatalf("slow-start took too many steps to reach max (%d); ramp is not geometric", steps)
+		}
+	}
+	if steps > 4 {
+		t.Fatalf("slow-start should reach max in <= 4 saturated successes, took %d", steps)
+	}
+}
+
+// TestSsthreshMemoryRecoversNearCeiling verifies the remembered-ceiling
+// behavior: after a 429 backs the limit off to 3/4 and records that point as
+// ssthresh, subsequent at-capacity successes grow ADDITIVELY (+1) rather than
+// slow-starting past the discovered ceiling — so the account probes gently right
+// where it last throttled instead of slamming back into the bucket.
+func TestSsthreshMemoryRecoversNearCeiling(t *testing.T) {
+	withLeastRequest(t)
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// Drive the limit up to the max via slow-start, then trip a 429.
+	p.cooldowns["a"] = &cooldownEntry{limit: aimdMaxLimit, inflight: aimdMaxLimit}
+	p.RecordError("a", true, time.Second)
+	cd := p.cooldowns["a"]
+	wantCeiling := aimdMaxLimit * aimdDecreaseNum / aimdDecreaseDen // 48*3/4 = 36
+	if cd.ssthresh != wantCeiling {
+		t.Fatalf("429 should record ssthresh=%d (the backed-off ceiling), got %d", wantCeiling, cd.ssthresh)
+	}
+	if cd.limit != wantCeiling {
+		t.Fatalf("429 should drop limit to %d (not collapse to 1), got %d", wantCeiling, cd.limit)
+	}
+
+	// Clear the cooldown timer so the account is eligible, then a saturated
+	// success: limit == ssthresh, so we're in congestion-avoidance -> +1 only.
+	cd.until = time.Time{}
+	cd.inflight = cd.limit
+	p.RecordSuccess("a")
+	if _, limit := p.ConcurrencyState("a"); limit != wantCeiling+1 {
+		t.Fatalf("at-ceiling success should grow additively to %d, got %d", wantCeiling+1, limit)
+	}
+}
+
+// TestConfiguredConcurrencyBounds verifies the picker honors the
+// concurrencyResolver: a fresh account starts at the configured initial limit
+// and the slow-start ramp caps at the configured max, not the built-in defaults.
+func TestConfiguredConcurrencyBounds(t *testing.T) {
+	withLeastRequest(t)
+	restore := SetConcurrencyResolverForTesting(func() (int, int) { return 3, 5 })
+	defer restore()
+
+	p := newTestPool()
+	p.setAccounts([]config.Account{{ID: "a"}})
+
+	// First reserving acquire lazily resolves + caches the configured bounds and
+	// seeds the entry at the configured initial limit (3).
+	acc, _, ok := p.AcquireForModelExcluding("", nil)
+	if !ok || acc == nil {
+		t.Fatal("expected an acquire")
+	}
+	p.Release("a")
+	if _, limit := p.ConcurrencyState("a"); limit != 3 {
+		t.Fatalf("account should start at configured initial 3, got %d", limit)
+	}
+
+	// Saturated successes must cap at the configured max (5), never the default 48.
+	for i := 0; i < 10; i++ {
+		_, limit := p.ConcurrencyState("a")
+		p.cooldowns["a"] = &cooldownEntry{limit: limit, inflight: limit}
+		p.RecordSuccess("a")
+	}
+	if _, limit := p.ConcurrencyState("a"); limit != 5 {
+		t.Fatalf("limit must cap at configured max 5, got %d", limit)
 	}
 }
 

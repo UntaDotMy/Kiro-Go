@@ -18,13 +18,18 @@
 // into smooth backpressure. See the AWS jitter blog, Envoy least-request, and
 // Google SRE "Handling Overload".
 //
-// Concurrency control (least-request strategy only): an AIMD per-account
-// concurrency limit gates admission — it grows by 1 on a healthy success and is
-// halved on a 429, so each account self-tunes to AWS's unpublished bucket size.
-// After a cooldown the limit sits low (often 1), which gives a "half-open single
-// probe" recovery for free: only one request is admitted until it succeeds. The
-// other strategies (swr/least-used/random) do NOT reserve in-flight slots or
-// apply the AIMD gate, so they behave exactly as before.
+// Concurrency control (least-request strategy only): a per-account in-flight
+// limit gates admission and self-tunes to AWS's unpublished bucket size using
+// TCP-style slow-start + congestion-avoidance with a remembered ceiling
+// (ssthresh). It starts WIDE (configurable initial window, default 12), grows
+// MULTIPLICATIVELY while below the remembered ceiling (fast) and ADDITIVELY at
+// or above it (cautious), and on a 429 backs off to ⌊limit×3/4⌋ while recording
+// that point as ssthresh — so recovery snaps back near the known-good ceiling
+// instead of re-climbing from scratch. Only a sustained run of 429s collapses
+// the limit toward 1, which then gives a "half-open single probe" recovery for
+// free. The other strategies (swr/least-used/random) do NOT reserve in-flight
+// slots or apply this gate, so they behave exactly as before. See RFC 5681 /
+// 6928, AWS SDK adaptive retry (CUBIC), and Netflix concurrency-limits.
 //
 // SWRR (the nginx/Envoy variant), kept as an option: for each pick we add the
 // effective weight to every account's runningWeight, pick the account with the
@@ -89,31 +94,59 @@ const (
 
 	// ---- Adaptive concurrency (least-request strategy only) ----
 	//
-	// Each account carries an AIMD in-flight limit that self-tunes to AWS's
-	// unpublished per-identity token bucket: additive-increase on healthy
-	// successes, multiplicative-decrease on a 429. The request handler reserves
-	// a slot before the upstream call (Acquire) and releases it after (Release).
+	// Each account carries a self-tuning in-flight limit that converges on AWS's
+	// unpublished per-identity token bucket. The earlier revision used plain AIMD
+	// (start at 2, +1 per success, ×3/4 on a 429); that was SAFE but SLOW — a
+	// fresh account admitted only 2 parallel requests and climbed +1 per *streaming
+	// completion*, so 2→12 took ~10 serialized completions (tens of seconds) and a
+	// healthy identity sat throttled far below what AWS actually allowed.
 	//
-	// aimdInitialLimit is where a fresh / just-recovered account starts. 4 lets
-	// a real fan-out through immediately (a small pool of 2-3 accounts otherwise
-	// admits almost nothing on cold start and dumps the overflow into the
-	// admission wait). The rate pacer is the proactive 429-avoider; this
-	// concurrency limit is the burst gate, so it can afford to start higher.
-	aimdInitialLimit = 4
+	// ---- Adaptive concurrency (least-request strategy only) ----
+	//
+	// Each account carries a self-tuning in-flight limit that converges on AWS's
+	// unpublished per-identity token bucket. TWO mechanisms cooperate:
+	//
+	//   - The RATE pacer (rate_pacer.go) is the PROACTIVE 429-guard: it paces each
+	//     account just below its learned refill rate, so throttle-avoidance does
+	//     not rest on the concurrency limit. Because the pacer holds the rate line,
+	//     this concurrency limit is the BURST gate, not the rate gate, and can
+	//     afford to be generous.
+	//   - The concurrency limit grows with TCP-style slow-start + congestion-
+	//     avoidance and a remembered ceiling (ssthresh): it opens FAST (geometric)
+	//     on a healthy account and, after a 429, snaps back near the last-known-good
+	//     ceiling instead of re-climbing linearly from the floor.
+	//
+	// The original revision grew +1 per streaming completion from an initial 2, so
+	// a cold account sat throttled for tens of seconds. Slow-start (limit += limit/2
+	// below ssthresh, +1 above) reaches the ceiling in a handful of successes;
+	// ssthresh memory makes recovery near-instant.
+	//
+	// aimdInitialLimit / aimdMaxLimit are the BUILT-IN DEFAULTS used when config
+	// supplies nothing (and by unit tests that build a pool without Reload). The
+	// live values come from config (GetPoolInitialConcurrency /
+	// GetPoolMaxConcurrency), cached onto the pool in Reload so the hot path never
+	// nests the config lock under p.mu.
+	//
+	// See RFC 5681 (slow-start/CA), RFC 6928 (IW10 — start wide), AWS SDK adaptive
+	// retry (CUBIC, β≈0.7), Netflix concurrency-limits, Google SRE "Handling
+	// Overload".
+	aimdInitialLimit = 12
 	// aimdMinLimit is the floor — never drop below this on a 429. A 3-slot floor
-	// keeps a recovered account productive immediately under a burst while still
-	// letting it self-tune down on the multiplicative-decrease path.
+	// keeps a recovered account productive immediately under a burst: the rate
+	// pacer (not a concurrency collapse to 1) is what prevents an immediate
+	// re-trip, while the multiplicative-decrease path still lets the limit
+	// self-tune down toward this floor.
 	aimdMinLimit = 3
-	// aimdMaxLimit caps how far the increase can climb. Raised to 32 because on a
-	// SMALL pool the old cap of 12 throttled total concurrency hard (2 accounts ×
-	// 12 = 24); the per-account rate pacer is what actually keeps us under the
-	// hidden bucket, so the concurrency ceiling can be generous without causing a
-	// storm. Larger pools rarely reach this because load spreads across accounts.
-	aimdMaxLimit = 32
-	// aimdDecreaseNum/Den is the multiplicative-decrease factor on a 429 (×3/4).
-	// A token bucket is a wall, not TCP congestion, so we cut harder than
-	// Netflix's 0.9 default but softer than TCP's 0.5 to avoid over-shrinking a
-	// pool that's only lightly throttled.
+	// aimdMaxLimit caps how far the ramp can climb. Generous (48) because the rate
+	// pacer is the real throttle-guard; a high concurrency ceiling lets a small
+	// pool use its burst headroom without itself causing a storm. Larger pools
+	// rarely reach it because load spreads across accounts.
+	aimdMaxLimit = 48
+	// aimdDecreaseNum/Den is the multiplicative-decrease factor on a 429 (×3/4),
+	// applied to BOTH the limit and the remembered ssthresh. A token bucket is a
+	// wall, not TCP congestion, so we cut harder than Netflix's 0.9 default but
+	// softer than TCP Reno's 0.5 (close to CUBIC's β≈0.7) to avoid over-shrinking
+	// a pool that's only lightly throttled.
 	aimdDecreaseNum = 3
 	aimdDecreaseDen = 4
 
@@ -149,11 +182,20 @@ type cooldownEntry struct {
 	consecutiveErrs int           // consecutive non-quota errors
 
 	// Adaptive concurrency (least-request strategy). inflight is the number of
-	// requests currently reserved on this account; limit is the AIMD ceiling.
-	// limit==0 means "uninitialized" — treated as aimdInitialLimit on first use,
-	// so an account with no cooldownEntry yet behaves as a fresh limit.
+	// requests currently reserved on this account; limit is the live ceiling the
+	// picker enforces. limit==0 means "uninitialized" — treated as the pool's
+	// initial limit on first use, so an account with no cooldownEntry yet behaves
+	// as a fresh limit.
+	//
+	// ssthresh is the slow-start threshold: the remembered concurrency ceiling at
+	// which the last 429 occurred. Below ssthresh the limit grows multiplicatively
+	// (slow-start, fast); at/above it the limit grows additively (congestion-
+	// avoidance, cautious). ssthresh==0 means "not yet discovered" — the account
+	// stays in slow-start all the way to the pool max until its first 429 teaches
+	// it where the bucket ceiling is.
 	inflight int
 	limit    int
+	ssthresh int
 
 	// Adaptive RATE pacing (least-request strategy). See rate_pacer.go for the
 	// full design. These implement a per-account GCRA pacer whose rate is learned
@@ -213,6 +255,13 @@ type AccountPool struct {
 	// no slot on Release — its GCRA bucket refills on a clock, not on completion —
 	// so the signal alone can't cover that recovery path.
 	releaseCh chan struct{}
+
+	// initialLimit / maxLimit are the per-account adaptive-concurrency bounds,
+	// cached from config on Reload (and on first use) so the request hot path
+	// reads them under p.mu without nesting the config lock. Zero means "not yet
+	// loaded" — resolved lazily to the built-in defaults via concurrencyBounds.
+	initialLimit int
+	maxLimit     int
 }
 
 var (
@@ -269,6 +318,17 @@ func (p *AccountPool) SetAccountsForTesting(accounts []config.Account) {
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Refresh the cached adaptive-concurrency bounds from config so an operator
+	// change (admin UI) takes effect on Reload. Resolved here, under p.mu but
+	// NOT under the config lock-on-hot-path, since Reload is a cold operation.
+	p.initialLimit, p.maxLimit = concurrencyResolver()
+	if p.initialLimit <= 0 {
+		p.initialLimit = aimdInitialLimit
+	}
+	if p.maxLimit < p.initialLimit {
+		p.maxLimit = p.initialLimit
+	}
 
 	enabled := config.GetEnabledAccounts()
 	accounts := make([]config.Account, 0, len(enabled))
@@ -396,6 +456,40 @@ func SetStrategyResolverForTesting(fn func() string) (restore func()) {
 	prev := strategyResolver
 	strategyResolver = fn
 	return func() { strategyResolver = prev }
+}
+
+// concurrencyResolver returns the configured (initial, max) per-account
+// concurrency bounds. Indirection via a package-level variable lets tests pin
+// the bounds without bringing up a full config; production points it at config.
+// The values are clamped/defaulted inside config, so callers can trust them.
+var concurrencyResolver = func() (initial, max int) {
+	return config.GetPoolInitialConcurrency(), config.GetPoolMaxConcurrency()
+}
+
+// SetConcurrencyResolverForTesting replaces the concurrency-bounds resolver so
+// unit tests can pin specific (initial, max) values. Tests restore the previous
+// resolver in a defer/cleanup.
+func SetConcurrencyResolverForTesting(fn func() (int, int)) (restore func()) {
+	prev := concurrencyResolver
+	concurrencyResolver = fn
+	return func() { concurrencyResolver = prev }
+}
+
+// concurrencyBounds returns the pool's cached (initial, max) concurrency limits,
+// lazily resolving them from config on first use so a pool built without Reload
+// (unit tests, NewForTesting) still gets sane non-zero bounds. Caller must hold
+// p.mu.
+func (p *AccountPool) concurrencyBounds() (initial, max int) {
+	if p.initialLimit <= 0 || p.maxLimit <= 0 {
+		p.initialLimit, p.maxLimit = concurrencyResolver()
+		if p.initialLimit <= 0 {
+			p.initialLimit = aimdInitialLimit
+		}
+		if p.maxLimit < p.initialLimit {
+			p.maxLimit = p.initialLimit
+		}
+	}
+	return p.initialLimit, p.maxLimit
 }
 
 // modelLookupKeys returns the set of ids the model whitelist matcher
@@ -637,14 +731,21 @@ func (p *AccountPool) TTFTState(id string) float64 {
 func (p *AccountPool) ConcurrencyState(id string) (inflight, limit int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	// Read-only fallback: this method holds RLock, so it can't lazily populate
+	// the cached bounds via concurrencyBounds (which mutates). Use the cached
+	// initial limit if Reload has run, else the built-in default.
+	initial := p.initialLimit
+	if initial <= 0 {
+		initial = aimdInitialLimit
+	}
 	if cd, ok := p.cooldowns[id]; ok {
 		limit = cd.limit
 		if limit <= 0 {
-			limit = aimdInitialLimit
+			limit = initial
 		}
 		return cd.inflight, limit
 	}
-	return 0, aimdInitialLimit
+	return 0, initial
 }
 
 // pick is the shared selection core. reserve=true applies the AIMD concurrency
@@ -844,13 +945,14 @@ func (p *AccountPool) inflightLocked(id string) int {
 	return 0
 }
 
-// limitLocked returns the account's current AIMD concurrency limit, treating an
-// absent/zero limit as the initial limit. Caller must hold p.mu.
+// limitLocked returns the account's current concurrency limit, treating an
+// absent/zero limit as the pool's initial limit. Caller must hold p.mu.
 func (p *AccountPool) limitLocked(id string) int {
 	if cd, ok := p.cooldowns[id]; ok && cd.limit > 0 {
 		return cd.limit
 	}
-	return aimdInitialLimit
+	initial, _ := p.concurrencyBounds()
+	return initial
 }
 
 // ttftLocked returns the account's EWMA time-to-first-token in milliseconds, or
@@ -863,15 +965,16 @@ func (p *AccountPool) ttftLocked(id string) float64 {
 }
 
 // reserveLocked increments an account's in-flight counter, creating the entry
-// (seeded with the initial AIMD limit) if needed. Caller must hold p.mu.
+// (seeded with the pool's initial limit) if needed. Caller must hold p.mu.
 func (p *AccountPool) reserveLocked(id string) {
+	initial, _ := p.concurrencyBounds()
 	cd := p.cooldowns[id]
 	if cd == nil {
-		cd = &cooldownEntry{limit: aimdInitialLimit}
+		cd = &cooldownEntry{limit: initial}
 		p.cooldowns[id] = cd
 	}
 	if cd.limit <= 0 {
-		cd.limit = aimdInitialLimit
+		cd.limit = initial
 	}
 	cd.inflight++
 }
@@ -998,22 +1101,27 @@ func (p *AccountPool) RecordTTFT(id string, ms float64) {
 }
 
 // RecordSuccess clears soft cooldown and resets the consecutive error counter.
-// It also applies the AIMD additive-increase: a healthy response nudges the
-// account's concurrency limit up by 1 (capped at aimdMaxLimit), but only while
-// the account is actually using its current limit (inflight near the ceiling) —
-// growing an idle account's limit would just let the next burst overshoot. Hard
-// quota state (UsageCurrent ≥ UsageLimit) is unaffected and continues to be
-// enforced by computeEffectiveWeight on the next Reload.
+// It also grows the account's concurrency limit using TCP-style slow-start /
+// congestion-avoidance, but only while the account is actually USING its limit
+// (inflight at the ceiling) — growing an idle account's limit would just let the
+// next burst overshoot. Below the remembered ssthresh the limit grows
+// MULTIPLICATIVELY (limit += limit/2, fast slow-start); at/above ssthresh it
+// grows ADDITIVELY (+1, cautious congestion-avoidance). Both are capped at the
+// pool max. An account that has never 429ed (ssthresh==0) stays in fast
+// slow-start all the way to the max. Hard quota state (UsageCurrent ≥ UsageLimit)
+// is unaffected and continues to be enforced by computeEffectiveWeight on the
+// next Reload.
+//
 //
 // It also feeds the RATE pacer (see rate_pacer.go): every success folds the
 // inter-success interval into the achieved-throughput EWMA (used to seed the
 // snap-down on a future 429), and — if the account is currently paced — probes
-// the paced rate upward by +5% once per rateProbeInterval so it climbs back
-// toward the true ceiling instead of staying pinned at half.
+// the paced rate upward once per rateProbeInterval so it climbs back toward the
+// true ceiling instead of staying pinned low.
 //
-// We preserve the cooldown entry (rather than deleting it) so the AIMD limit
-// AND the learned paced rate survive across requests; the soft-cooldown fields
-// are cleared instead.
+// We preserve the cooldown entry (rather than deleting it) so the concurrency
+// limit, the remembered ssthresh, AND the learned paced rate survive across
+// requests; the soft-cooldown fields are cleared instead.
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1038,35 +1146,49 @@ func (p *AccountPool) RecordSuccess(id string) {
 		cd.rateEstimate = aimdRateProbe(cd.rateEstimate)
 		cd.lastProbeAt = now
 	}
+	initial, max := p.concurrencyBounds()
 	// Clear soft-cooldown / error state.
 	cd.until = time.Time{}
 	cd.consecutiveErrs = 0
 	cd.lastSleep = 0
-	// AIMD increase, gated on actually using the limit so an idle account
-	// doesn't accumulate headroom for the next burst to overshoot. Grows by 2
-	// (was 1) so a small pool reaches a useful concurrency ceiling in half the
-	// successful requests; the rate pacer remains the proactive 429-guard, so a
-	// faster concurrency climb doesn't itself induce throttling. The gate is
-	// relaxed to inflight >= limit-1 so growth keeps up under a steady burst that
-	// sits just below the ceiling.
+	// Grow the limit, gated on actually using it so an idle account doesn't
+	// accumulate headroom for the next burst to overshoot. The gate is relaxed to
+	// inflight >= limit-1 so growth keeps up under a steady burst that sits just
+	// below the ceiling. Below the remembered ssthresh the limit climbs FAST
+	// (slow-start, geometric); at/above it the limit grows by +1 (congestion-
+	// avoidance). The rate pacer remains the proactive 429-guard, so a fast
+	// concurrency climb doesn't itself induce throttling.
 	limit := cd.limit
 	if limit <= 0 {
-		limit = aimdInitialLimit
+		limit = initial
 	}
-	if cd.inflight >= limit-1 && limit < aimdMaxLimit {
-		limit += 2
-		if limit > aimdMaxLimit {
-			limit = aimdMaxLimit
+	if cd.inflight >= limit-1 && limit < max {
+		if cd.ssthresh > 0 && limit >= cd.ssthresh {
+			// Congestion-avoidance: gently probe above a known ceiling.
+			limit++
+		} else {
+			// Slow-start: climb fast toward the ceiling (or the max if no
+			// ceiling has been discovered yet). limit/2 makes it geometric;
+			// the max(1, …) guarantees forward progress at small limits.
+			step := limit / 2
+			if step < 1 {
+				step = 1
+			}
+			limit += step
+		}
+		if limit > max {
+			limit = max
 		}
 	}
 	cd.limit = limit
-	// Drop the entry only when it carries NO useful state at all. A
-	// lastSuccessAt measurement must survive so the NEXT success can compute the
-	// inter-success interval that feeds observedRate (the foundation of "discover
-	// then pace") — deleting it here was silently resetting the measurement
-	// between every pair of successes. Idle measurement-only entries are reaped
+	// Drop the entry only when it carries NO useful state at all. A lastSuccessAt
+	// measurement must survive so the NEXT success can compute the inter-success
+	// interval that feeds observedRate (the foundation of "discover then pace") —
+	// deleting it here was silently resetting the measurement between every pair
+	// of successes. A remembered ssthresh must likewise survive so recovery snaps
+	// back to the known-good ceiling. Idle measurement-only entries are reaped
 	// later by decayCountersLocked.
-	if cd.inflight == 0 && cd.limit == aimdInitialLimit && cd.lastErrorAt.IsZero() &&
+	if cd.inflight == 0 && cd.limit == initial && cd.ssthresh == 0 && cd.lastErrorAt.IsZero() &&
 		cd.rateEstimate == 0 && cd.observedRate == 0 && cd.lastSuccessAt.IsZero() &&
 		cd.ttftEWMA == 0 {
 		delete(p.cooldowns, id)
@@ -1163,19 +1285,30 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 	}
 }
 
-// aimdDecreaseLocked applies the multiplicative-decrease to a cooldown entry's
-// concurrency limit on a quota error: limit = max(aimdMinLimit, ⌊limit×3/4⌋).
-// An uninitialized limit is seeded from the initial limit first so the cut is
+// aimdDecreaseLocked applies the multiplicative-decrease on a quota error and
+// REMEMBERS the ceiling. It sets ssthresh = ⌊limit×3/4⌋ (the slow-start
+// threshold — where this account started 429ing) and drops the live limit to
+// that same value, floored at aimdMinLimit. This is TCP/CUBIC fast-recovery, not
+// a collapse to 1: a single 429 backs the account off to 3/4 of where it was and
+// records that point, so the next recovery snaps back via slow-start to just
+// below the known ceiling instead of re-climbing from the initial window. Only a
+// sustained run of 429s walks both limit and ssthresh down toward the floor —
+// which is precisely when the half-open single-probe recovery is wanted. An
+// uninitialized limit is seeded from the pool initial limit first so the cut is
 // meaningful. Caller must hold p.mu.
 func (p *AccountPool) aimdDecreaseLocked(cd *cooldownEntry) {
+	initial, _ := p.concurrencyBounds()
 	limit := cd.limit
 	if limit <= 0 {
-		limit = aimdInitialLimit
+		limit = initial
 	}
 	limit = limit * aimdDecreaseNum / aimdDecreaseDen
 	if limit < aimdMinLimit {
 		limit = aimdMinLimit
 	}
+	// Remember the backed-off point as the slow-start threshold so recovery
+	// returns near the discovered ceiling and then probes additively above it.
+	cd.ssthresh = limit
 	cd.limit = limit
 }
 

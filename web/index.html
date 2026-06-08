@@ -1121,6 +1121,16 @@
                     </select>
                     <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. Least-request (default) steers each request to the least-busy account by outstanding in-flight requests and applies a per-account adaptive concurrency limit (grows on success, halves on a 429) — best for bursty parallel load like agent fan-out, where it stops the whole pool throttling at once. SWR is balanced rate-based rotation but blind to concurrency. Least-used tilts traffic toward less-burned accounts when the pool is heterogeneous. Random is a control or to break unintended request synchronisation.</small>
                 </div>
+                <div class="form-group">
+                    <label>Initial Concurrency / account</label>
+                    <input type="number" id="poolInitialConcurrency" min="1" max="256" placeholder="12">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Least-request only. How many parallel requests a fresh or just-recovered account starts admitting (the "initial window"). Higher = faster ramp-up, more like unthrottled round-robin; lower = gentler on 429-sensitive accounts. Empty/0 = default (12). The limit grows fast (slow-start) toward the ceiling below, then probes gently above the point where the account last hit a 429.</small>
+                </div>
+                <div class="form-group">
+                    <label>Max Concurrency / account</label>
+                    <input type="number" id="poolMaxConcurrency" min="1" max="256" placeholder="48">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Least-request only. The ceiling the adaptive limit can climb to as an account proves it can absorb load without throttling. Empty/0 = default (48). Must be ≥ initial concurrency. Caps how much of a burst any single account (AWS identity) can soak up before the pool spreads to others.</small>
+                </div>
                 <button class="btn btn-primary" onclick="saveEndpointConfig()"
                     data-i18n="settings.saveEndpoint"></button>
             </div>
@@ -3417,6 +3427,14 @@
             if (stratEl) {
                 stratEl.value = d.poolStrategy || 'least-request';
             }
+            const initConcEl = document.getElementById('poolInitialConcurrency');
+            if (initConcEl) {
+                initConcEl.value = d.poolInitialConcurrency || '';
+            }
+            const maxConcEl = document.getElementById('poolMaxConcurrency');
+            if (maxConcEl) {
+                maxConcEl.value = d.poolMaxConcurrency || '';
+            }
         }
         async function saveEndpointConfig() {
             const body = {
@@ -3432,6 +3450,16 @@
             }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) body.poolStrategy = stratEl.value;
+            const initConcEl = document.getElementById('poolInitialConcurrency');
+            if (initConcEl) {
+                const raw = (initConcEl.value || '').trim();
+                body.poolInitialConcurrency = raw === '' ? 0 : parseInt(raw, 10);
+            }
+            const maxConcEl = document.getElementById('poolMaxConcurrency');
+            if (maxConcEl) {
+                const raw = (maxConcEl.value || '').trim();
+                body.poolMaxConcurrency = raw === '' ? 0 : parseInt(raw, 10);
+            }
             const res = await fetch('/admin/api/endpoint', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
                 body: JSON.stringify(body)
