@@ -219,6 +219,20 @@ type Config struct {
 	// differs.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
 
+	// PoolInitialConcurrency and PoolMaxConcurrency tune the per-account adaptive
+	// concurrency limiter used by the least-request strategy. InitialConcurrency
+	// is where a fresh / just-recovered account starts admitting parallel requests
+	// (the "initial window"); MaxConcurrency caps how far the slow-start ramp can
+	// climb as the account proves it can absorb load without 429ing.
+	//
+	// Both 0 (the zero value) means "use the built-in default" (12 / 48). They are
+	// clamped to sane bounds on read (see GetPoolInitialConcurrency /
+	// GetPoolMaxConcurrency); max is additionally floored to >= initial so a
+	// misconfiguration can't strand the limiter below its start point. They apply
+	// only to the least-request strategy; the other strategies reserve no slots.
+	PoolInitialConcurrency int `json:"poolInitialConcurrency,omitempty"`
+	PoolMaxConcurrency     int `json:"poolMaxConcurrency,omitempty"`
+
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
@@ -347,7 +361,8 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A18"
+// Version current version
+const Version = "1.0.10-A19"
 
 var (
 	cfg     *Config
@@ -1403,6 +1418,82 @@ func UpdatePoolStrategy(strategy string) error {
 	defer cfgLock.Unlock()
 	cfg.PoolStrategy = strings.TrimSpace(strategy)
 	return Save()
+}
+
+// Adaptive-concurrency bounds for the least-request strategy. These are the
+// clamps GetPoolInitialConcurrency / GetPoolMaxConcurrency enforce on whatever
+// the operator configured, so a typo (0, negative, or absurdly large) can never
+// strand or stampede the limiter. The defaults match the "aggressive" profile:
+// start wide (12) and let a strong account discover headroom up to 48.
+const (
+	defaultPoolInitialConcurrency = 12
+	defaultPoolMaxConcurrency     = 48
+	minPoolConcurrency            = 1
+	maxPoolConcurrency            = 256
+)
+
+// GetPoolInitialConcurrency returns the per-account initial concurrency window
+// for the least-request limiter, clamped to [minPoolConcurrency,
+// maxPoolConcurrency]. An unset (0) value — or cfg==nil before Init() in unit
+// tests — resolves to the built-in default.
+func GetPoolInitialConcurrency() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PoolInitialConcurrency == 0 {
+		return defaultPoolInitialConcurrency
+	}
+	return clampInt(cfg.PoolInitialConcurrency, minPoolConcurrency, maxPoolConcurrency)
+}
+
+// GetPoolMaxConcurrency returns the per-account concurrency ceiling for the
+// least-request limiter, clamped to [minPoolConcurrency, maxPoolConcurrency] and
+// additionally floored to >= the resolved initial concurrency so the ramp can
+// never start above its own ceiling. An unset (0) value resolves to the default.
+func GetPoolMaxConcurrency() int {
+	initial := GetPoolInitialConcurrency()
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	max := defaultPoolMaxConcurrency
+	if cfg != nil && cfg.PoolMaxConcurrency != 0 {
+		max = clampInt(cfg.PoolMaxConcurrency, minPoolConcurrency, maxPoolConcurrency)
+	}
+	if max < initial {
+		max = initial
+	}
+	return max
+}
+
+// UpdatePoolConcurrency persists the per-account initial/max concurrency knobs.
+// Pass 0 for either to reset it to the built-in default. The values are stored
+// as given (clamping happens on read), but max must be >= initial when both are
+// non-zero so the operator gets immediate feedback on an inverted range. Caller
+// should call pool.Reload() to apply mid-run.
+func UpdatePoolConcurrency(initial, max int) error {
+	if initial != 0 && (initial < minPoolConcurrency || initial > maxPoolConcurrency) {
+		return fmt.Errorf("initial concurrency must be between %d and %d (or 0 for default)", minPoolConcurrency, maxPoolConcurrency)
+	}
+	if max != 0 && (max < minPoolConcurrency || max > maxPoolConcurrency) {
+		return fmt.Errorf("max concurrency must be between %d and %d (or 0 for default)", minPoolConcurrency, maxPoolConcurrency)
+	}
+	if initial != 0 && max != 0 && max < initial {
+		return fmt.Errorf("max concurrency (%d) must be >= initial concurrency (%d)", max, initial)
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PoolInitialConcurrency = initial
+	cfg.PoolMaxConcurrency = max
+	return Save()
+}
+
+// clampInt bounds v to [lo, hi].
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // GetWebSearchEnabled reports whether proxy-side web_search emulation is on.
