@@ -362,7 +362,7 @@ type AccountInfo struct {
 
 // Version current version
 // Version current version
-const Version = "1.0.10-A19"
+const Version = "1.0.10-A20"
 
 var (
 	cfg     *Config

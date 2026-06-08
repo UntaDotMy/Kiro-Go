@@ -8,14 +8,64 @@ import (
 	"testing"
 )
 
-func TestNormalizeChunkBasicProgression(t *testing.T) {
-	prev := ""
-
-	if got := normalizeChunk("abc", &prev); got != "abc" {
-		t.Fatalf("expected first chunk to pass through, got %q", got)
+// collectStreamText runs a sequence of assistantResponseEvent content fragments
+// through the real parseEventStream path and returns the concatenated text the
+// client would receive. This is the ground-truth check that the proxy forwards
+// incremental deltas verbatim (no dedup), matching how CodeWhisperer / Amazon Q
+// actually streams (confirmed against AWS's own Q CLI, which does push_str).
+func collectStreamText(t *testing.T, fragments ...string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	for _, f := range fragments {
+		buf.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": f}))
 	}
-	if got := normalizeChunk("abcde", &prev); got != "de" {
-		t.Fatalf("expected appended delta, got %q", got)
+	var got string
+	cb := &KiroStreamCallback{OnText: func(s string, isThinking bool) {
+		if !isThinking {
+			got += s
+		}
+	}}
+	if err := parseEventStream(bytes.NewReader(buf.Bytes()), cb); err != nil {
+		t.Fatalf("parseEventStream: %v", err)
+	}
+	return got
+}
+
+// TestStreamConcatenatesIncrementalDeltasVerbatim is the core regression for the
+// character/space-drop corruption. The upstream sends INCREMENTAL fragments; the
+// full message is their verbatim concatenation. The removed normalizeChunk
+// deduper corrupted exactly these shapes — each case here reproduces a reported
+// or class-equivalent bug and asserts the bytes now arrive intact.
+func TestStreamConcatenatesIncrementalDeltasVerbatim(t *testing.T) {
+	cases := []struct {
+		name      string
+		fragments []string
+		want      string
+	}{
+		// "water" arriving as "wat"+"er" must NOT lose the final characters.
+		{"split mid-word", []string{"wat", "er"}, "water"},
+		// "i like you" split so a space-led fragment isn't dropped.
+		{"space-led fragment preserved", []string{"i", " like", " you"}, "i like you"},
+		// A fragment that is an exact repeat of the previous (e.g. "the the")
+		// must be kept — the old chunk==prev branch dropped it.
+		{"legitimate repeated token", []string{"the ", "the "}, "the the "},
+		// A fragment that is a prefix of the previous one must be kept — the old
+		// HasPrefix(prev, chunk) rewind branch dropped it.
+		{"delta is prefix of prior", []string{"hello", "hel"}, "hellohel"},
+		// A fragment whose head matches the previous fragment's tail must not be
+		// trimmed ("lets "+" begin" -> "lets  begin" with both spaces).
+		{"boundary space not eaten", []string{"lets ", " begin"}, "lets  begin"},
+		// Cumulative-looking sequence is NOT cumulative here: "ab" then "abc" are
+		// two separate deltas and both are kept verbatim.
+		{"prefix-extension kept verbatim", []string{"ab", "abc"}, "ababc"},
+		{"unicode boundary", []string{"caf", "é"}, "café"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := collectStreamText(t, tc.fragments...); got != tc.want {
+				t.Fatalf("fragments %q concatenated to %q, want %q", tc.fragments, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -34,79 +84,6 @@ func TestParseEventStreamRejectsOversizedFrame(t *testing.T) {
 	err := parseEventStream(bytes.NewReader(prelude[:]), &KiroStreamCallback{})
 	if err == nil {
 		t.Fatal("expected an error for an oversized frame, got nil (would have allocated ~2GiB)")
-	}
-}
-
-func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
-	prev := ""
-
-	_ = normalizeChunk("abcde", &prev)
-	if got := normalizeChunk("abc", &prev); got != "" {
-		t.Fatalf("expected rewind chunk to be ignored, got %q", got)
-	}
-	if prev != "abcde" {
-		t.Fatalf("expected previous snapshot to remain longest version, got %q", prev)
-	}
-	if got := normalizeChunk("abcdef", &prev); got != "f" {
-		t.Fatalf("expected only unseen suffix after rewind, got %q", got)
-	}
-}
-
-func TestNormalizeChunkPreservesNonOverlappingDeltas(t *testing.T) {
-	// Regression: an earlier suffix-overlap heuristic in normalizeChunk would
-	// strip leading characters from a fresh chunk whenever they coincidentally
-	// matched the tail of the prior snapshot. That produced user-visible
-	// truncations like "sleep" -> "slep" or "lets begin" -> "letsbegin" any
-	// time a chunk boundary aligned with a repeated character or whitespace.
-	// Each case below exercises a previously-buggy boundary; with the fix the
-	// chunk must pass through verbatim.
-	cases := []struct {
-		name string
-		prev string
-		next string
-		want string
-	}{
-		{"single trailing letter matches leading letter", "the e", "easy", "easy"},
-		{"trailing space matches leading space", "lets ", " begin", " begin"},
-		{"trailing space and char match leading", "halt ", " sleep", " sleep"},
-		{"punctuation tail", "wow!", "!extra", "!extra"},
-		{"unicode tail and head", "café", "éclair", "éclair"},
-		{"long shared multi-rune tail does not eat delta", "abc xyz", "xyz123", "xyz123"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			prev := tc.prev
-			got := normalizeChunk(tc.next, &prev)
-			if got != tc.want {
-				t.Fatalf("normalizeChunk(%q, prev=%q) = %q, want %q",
-					tc.next, tc.prev, got, tc.want)
-			}
-			if prev != tc.next {
-				t.Fatalf("snapshot after delta = %q, want %q", prev, tc.next)
-			}
-		})
-	}
-}
-
-func TestNormalizeChunkStillDedupesCumulativeReplay(t *testing.T) {
-	// Confirm the cumulative/replay branches the heuristic was bolted onto
-	// continue to work after the suffix-overlap removal.
-	prev := ""
-	if got := normalizeChunk("hello", &prev); got != "hello" {
-		t.Fatalf("first chunk = %q, want %q", got, "hello")
-	}
-	if got := normalizeChunk("hello world", &prev); got != " world" {
-		t.Fatalf("cumulative extension = %q, want %q", got, " world")
-	}
-	if got := normalizeChunk("hello world", &prev); got != "" {
-		t.Fatalf("exact replay should be dropped, got %q", got)
-	}
-	if got := normalizeChunk("hello", &prev); got != "" {
-		t.Fatalf("rewind should be dropped, got %q", got)
-	}
-	if prev != "hello world" {
-		t.Fatalf("snapshot must keep longest version, got %q", prev)
 	}
 }
 

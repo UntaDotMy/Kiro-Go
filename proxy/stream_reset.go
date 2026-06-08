@@ -24,6 +24,7 @@ package proxy
 
 import (
 	"errors"
+	"io"
 	"strings"
 
 	"kiro-go/logger"
@@ -43,6 +44,7 @@ func (e *ErrUpstreamStreamReset) Error() string {
 }
 
 func (e *ErrUpstreamStreamReset) Unwrap() error { return e.Cause }
+
 
 // classifyStreamError returns a *ErrUpstreamStreamReset if err looks
 // like an HTTP/2 stream reset or connection-level GOAWAY; otherwise
@@ -64,6 +66,19 @@ func (e *ErrUpstreamStreamReset) Unwrap() error { return e.Cause }
 func classifyStreamError(err error) error {
 	if err == nil {
 		return nil
+	}
+	// Mid-frame truncation: parseEventStream uses io.ReadFull for the 12-byte
+	// prelude and the frame body, which returns io.ErrUnexpectedEOF when the
+	// connection ends PART-WAY through a frame (as opposed to a clean io.EOF at a
+	// frame boundary, which the parser treats as normal end-of-stream — see the
+	// EOF branch there). CodeWhisperer / Amazon Q has no application-level
+	// terminal event, so a mid-frame cut is the one definitively-detectable
+	// truncation shape: the upstream was still sending a frame when the
+	// connection dropped. Treat it like a stream reset — retryable pre-commit
+	// (a fresh transport / peer account re-runs cleanly), friendly message
+	// post-commit instead of leaking "unexpected EOF" to the client.
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return &ErrUpstreamStreamReset{Cause: err}
 	}
 	var se *http2.StreamError
 	if errors.As(err, &se) {
