@@ -4921,8 +4921,6 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 // apiGetEndpointConfig 获取端点配置
 func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"preferredEndpoint":      config.GetPreferredEndpoint(),
-		"endpointFallback":       config.GetEndpointFallback(),
 		"region":                 config.GetKiroAPIRegion(),
 		"regions":                config.GetKiroAPIRegions(),
 		"poolStrategy":           config.GetPoolStrategy(),
@@ -4935,8 +4933,6 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 // apiUpdateEndpointConfig 更新端点配置
 func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PreferredEndpoint      string    `json:"preferredEndpoint"`
-		EndpointFallback       *bool     `json:"endpointFallback"`
 		Region                 *string   `json:"region,omitempty"`
 		Regions                *[]string `json:"regions,omitempty"`
 		PoolStrategy           *string   `json:"poolStrategy,omitempty"`
@@ -4948,23 +4944,6 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
-	}
-
-	valid := map[string]bool{"auto": true, "kiro": true, "codewhisperer": true, "amazonq": true}
-	if !valid[req.PreferredEndpoint] {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid endpoint, must be: auto, kiro, codewhisperer, or amazonq"})
-		return
-	}
-
-	if err := config.UpdatePreferredEndpoint(req.PreferredEndpoint); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	if req.EndpointFallback != nil {
-		config.UpdateEndpointFallback(*req.EndpointFallback)
 	}
 
 	if req.Region != nil {

@@ -38,39 +38,28 @@ type kiroEndpoint struct {
 // code never touches it.
 var kiroEndpointsOverride []kiroEndpoint
 
-// kiroEndpointsForRegion builds the endpoint chain for a specific AWS
-// region. AWS rate-limits per (identity, action), so a 429 on one of
-// these does NOT imply the others are also throttled — that is why the
-// per-account loop in CallKiroAPI tries each endpoint before surfacing a
-// QuotaError.
+// kiroEndpointsForRegion builds the endpoint chain for a specific AWS region.
 //
-// Region defaults to us-east-1 if empty. Per Kiro's published firewall
-// allowlist (https://kiro.dev/docs/privacy-and-security/firewalls/) the
-// CURRENT "Kiro service" inference host is runtime.<region>.kiro.dev, and
-// the q.<region>.amazonaws.com endpoints are documented there as LEGACY and
-// "will be deprecated in a future release." We therefore LEAD with the
-// runtime host and keep the legacy AWS endpoints as reactive 429/error
-// fallback (NOT removed — the operator asked to keep the legacy endpoint
-// reachable). The chain, in preference order:
+// Region defaults to us-east-1 if empty. Per Kiro's published firewall allowlist
+// (https://kiro.dev/docs/privacy-and-security/firewalls/) the CURRENT "Kiro
+// service" inference host is runtime.<region>.kiro.dev, and the legacy
+// q.<region>.amazonaws.com / codewhisperer.<region>.amazonaws.com endpoints are
+// documented there as LEGACY and "will be deprecated in a future release."
+//
+// The legacy hosts carried the SAME action as the runtime host — in particular
+// codewhisperer.* used the identical X-Amz-Target
+// (AmazonCodeWhispererStreamingService.GenerateAssistantResponse); runtime.* is
+// simply the modern host for that same action. So they were redundant. We now
+// route ALL inference to the runtime host ONLY, with NO fallback chain:
 //
 //   - "https://runtime.<region>.kiro.dev/generateAssistantResponse"
-//     PRIMARY. The modern Kiro runtime host; the only one the firewall doc
-//     lists as the active "Kiro service". Resolves in every region Kiro is
-//     provisioned in.
+//     The single inference endpoint, in every region.
 //
-//   - "https://q.<region>.amazonaws.com/generateAssistantResponse"
-//     LEGACY (kept as fallback). The previous Kiro IDE default; no
-//     X-Amz-Target. Still works today, deprecation pending.
-//
-//   - "https://codewhisperer.<region>.amazonaws.com/generateAssistantResponse"
-//     LEGACY (kept, us-east-1 ONLY). The codewhisperer.* hostname returns
-//     NXDOMAIN in every other region (jwadow #58), so it's appended only
-//     for us-east-1.
-//
-//   - q.<region>.amazonaws.com again with X-Amz-Target=AmazonQDeveloper-
-//     StreamingService.SendMessage. LEGACY (kept).
-//
-// All are tried per-request with auto-fallback on 429.
+// NOTE: account-MANAGEMENT calls (getUsageLimits / GetUserInfo /
+// ListAvailableModels / ListAvailableProfiles) deliberately still use the LEGACY
+// codewhisperer.us-east-1.amazonaws.com host — see kiroRESTBaseForRegion. The
+// runtime host only serves the inference action; pointing the REST paths at it
+// breaks account refresh, and unlike inference those callers have no fallback.
 func kiroEndpointsForRegion(region string) []kiroEndpoint {
 	if kiroEndpointsOverride != nil {
 		out := make([]kiroEndpoint, len(kiroEndpointsOverride))
@@ -80,38 +69,14 @@ func kiroEndpointsForRegion(region string) []kiroEndpoint {
 	if region == "" {
 		region = "us-east-1"
 	}
-	endpoints := []kiroEndpoint{
-		// PRIMARY: the current Kiro runtime service host.
+	return []kiroEndpoint{
 		{
 			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
 			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			Name:      "Kiro Runtime",
 		},
-		// LEGACY (kept as fallback): the previous Kiro IDE default, no X-Amz-Target.
-		{
-			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "",
-			Name:      "Kiro IDE (legacy)",
-		},
 	}
-	if region == "us-east-1" {
-		// LEGACY (kept): codewhisperer.* only resolves in us-east-1.
-		endpoints = append(endpoints, kiroEndpoint{
-			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-			Name:      "CodeWhisperer (legacy)",
-		})
-	}
-	endpoints = append(endpoints, kiroEndpoint{
-		URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-		Name:      "AmazonQ (legacy)",
-	})
-	return endpoints
 }
 
 // kiroRESTBaseForRegion returns the REST base URL for the account-MANAGEMENT
@@ -490,16 +455,6 @@ type KiroStreamCallback struct {
 
 // ==================== API Call ====================
 
-// maxEndpointChain bounds the worst-case number of endpoints CallKiroAPI
-// will sequentially attempt for a single request. With one configured
-// region this is 3 (Kiro IDE / CodeWhisperer / AmazonQ); a multi-region
-// failover chain (KiroAPIRegions) multiplies that by region count. We
-// cap at 12 so a misconfigured 5-region list can't produce a 15-attempt
-// per-request stall — under responseHeaderTimeout=60s, 12 sequential
-// stuck handshakes is already 12 minutes worst-case, which is the
-// outer limit of "client will tolerate" for a single API call.
-const maxEndpointChain = 12
-
 // resolveAccountRegion returns the ONE stable AWS region an account talks
 // to, every request, for the life of that account. This is the key to
 // clean cross-account load spreading WITHOUT making any single OAuth
@@ -532,87 +487,15 @@ func resolveAccountRegion(account *config.Account) string {
 	return regions[idx]
 }
 
-// getSortedEndpoints returns the endpoint chain for a single account,
-// pinned to that account's stable region (resolveAccountRegion). The
-// chain covers ONLY that one region's service actions in preference
-// order; a healthy request uses the primary action, and the others are
-// reactive 429-only fallback WITHIN the same region. One identity never
-// crosses regions — cross-region spreading happens across ACCOUNTS, not
-// within an account. The chain is capped at maxEndpointChain.
-func getSortedEndpoints(preferred string, account *config.Account) []kiroEndpoint {
-	fallback := config.GetEndpointFallback()
-	region := resolveAccountRegion(account)
-
-	regional := kiroEndpointsForRegion(region)
-	all := sortRegionalEndpoints(regional, preferred, fallback)
-	if len(all) > maxEndpointChain {
-		all = all[:maxEndpointChain]
-	}
-	return all
-}
-
-// sortRegionalEndpoints orders one region's endpoints by the preferred
-// service target, then any others. Returns just the preferred entry when
-// fallback is disabled. The primary is resolved by MATCHING the endpoint's
-// identity (not a hardcoded index), so it stays correct regardless of the
-// chain order:
-//
-//   - "kiro"          → the modern Kiro Runtime host (runtime.<region>.kiro.dev).
-//   - "codewhisperer" → the CodeWhisperer endpoint when present (us-east-1),
-//     else the runtime host (it carries the same
-//     GenerateAssistantResponse target outside us-east-1).
-//   - "amazonq"       → the AmazonQ SendMessage endpoint.
-//   - "auto" / other  → declared order (runtime first), all reactive 429-only.
-func sortRegionalEndpoints(endpoints []kiroEndpoint, preferred string, fallback bool) []kiroEndpoint {
-	if len(endpoints) == 0 {
-		return endpoints
-	}
-
-	// findByName returns the first index whose Name contains sub, or -1.
-	findByName := func(sub string) int {
-		for i, ep := range endpoints {
-			if strings.Contains(ep.Name, sub) {
-				return i
-			}
-		}
-		return -1
-	}
-
-	primary := -1
-	switch preferred {
-	case "kiro":
-		primary = findByName("Kiro Runtime")
-	case "codewhisperer":
-		if i := findByName("CodeWhisperer"); i >= 0 {
-			primary = i
-		} else {
-			primary = findByName("Kiro Runtime") // regional equivalent
-		}
-	case "amazonq":
-		primary = findByName("AmazonQ")
-	default:
-		// "auto" — try in declared order. A healthy request always executes
-		// endpoint[0] (the Kiro Runtime host, now the primary per the firewall
-		// allowlist); the legacy endpoints stay REACTIVE 429-only fallback. This
-		// keeps a single, consistent service action per request rather than
-		// rotating the X-Amz-Target every call.
-		out := make([]kiroEndpoint, len(endpoints))
-		copy(out, endpoints)
-		return out
-	}
-	if primary < 0 || primary >= len(endpoints) {
-		primary = 0
-	}
-	if !fallback {
-		return []kiroEndpoint{endpoints[primary]}
-	}
-	result := []kiroEndpoint{endpoints[primary]}
-	for i, ep := range endpoints {
-		if i != primary {
-			result = append(result, ep)
-		}
-	}
-	return result
+// getSortedEndpoints returns the inference endpoint(s) for a single account,
+// pinned to that account's stable region (resolveAccountRegion). Inference now
+// targets the runtime host ONLY (no legacy fallback chain), so this is a single
+// endpoint per account; the kiroEndpointsOverride hook (tests) may still inject
+// a multi-entry chain to exercise the per-endpoint failover MECHANISM in
+// CallKiroAPI. One identity never crosses regions — cross-region spreading
+// happens across ACCOUNTS, not within an account.
+func getSortedEndpoints(account *config.Account) []kiroEndpoint {
+	return kiroEndpointsForRegion(resolveAccountRegion(account))
 }
 
 // CallKiroAPI calls the Kiro streaming API with a background context. Retained
@@ -658,10 +541,10 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		}
 	}
 
-	// Build the endpoint list for THIS account, pinned to its stable
-	// region (see resolveAccountRegion). One identity never crosses
-	// regions; load spreads across accounts.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint(), account)
+	// Build the inference endpoint(s) for THIS account, pinned to its stable
+	// region (see resolveAccountRegion). Inference targets the runtime host
+	// only; one identity never crosses regions and load spreads across accounts.
+	endpoints := getSortedEndpoints(account)
 
 	// All currently configured endpoints share Origin="AI_EDITOR", so the
 	// marshaled bytes are identical per iteration. We re-marshal inside the
