@@ -13,7 +13,7 @@ func TestIsSuspensionErrorMessage(t *testing.T) {
 	}
 	no := []string{
 		"HTTP 429 throttled",
-		"quota exhausted on Kiro IDE",
+		"rate limited (HTTP 429) on Kiro IDE",
 		"connection reset by peer",
 		"",
 	}
@@ -45,7 +45,7 @@ func TestIsAuthErrorMessage(t *testing.T) {
 	no := []string{
 		"HTTP 429 throttled",
 		"HTTP 500 internal server error",
-		"quota exhausted",
+		"rate limited (HTTP 429) on Kiro IDE",
 		"context deadline exceeded",
 		"",
 	}
@@ -66,7 +66,7 @@ func TestIsAuthErrorMessage(t *testing.T) {
 // would wrongly ban an account that just needs a cooldown).
 func TestAuthAndSuspensionDisjointFromQuota(t *testing.T) {
 	quotaish := []string{
-		"quota exhausted on Kiro IDE (retry after 5s)",
+		"rate limited (HTTP 429) on Kiro IDE (retry after 5s)",
 		"HTTP 429 Too Many Requests",
 		"402 OVERAGE limit reached",
 	}

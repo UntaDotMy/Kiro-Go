@@ -467,6 +467,45 @@ func TestBuildAnthropicModelsResponseHandlesAutoAndKnownAliases(t *testing.T) {
 	}
 }
 
+// TestBuildAnthropicModelsResponseContextWindowFromKiro pins the compaction
+// fix: the advertised context_window must come from Kiro's tokenLimits, never a
+// guess derived from the model id's version number. A model WITHOUT tokenLimits
+// must fall back to the safe 200K default — NOT the old fabricated 1M for >=4.6
+// ids, which set a context-aware client's auto-compaction threshold near ~920K
+// so it never compacted while the usage gauge passed 100%.
+func TestBuildAnthropicModelsResponseContextWindowFromKiro(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{
+		// Kiro reports a real 1M window for this model — honor it.
+		{ModelId: "claude-sonnet-4-6", InputTypes: []string{"text"}, TokenLimits: tokenLimits(1_000_000, 8192)},
+		// Kiro reports a 200K window — honor it.
+		{ModelId: "claude-opus-4-5", InputTypes: []string{"text"}, TokenLimits: tokenLimits(200_000, 32000)},
+		// No tokenLimits at all — must fall back to the safe default, even
+		// though the id parses as >=4.6 (the old code fabricated 1M here).
+		{ModelId: "claude-opus-4-8", InputTypes: []string{"text"}},
+	}, "-thinking")
+
+	got := map[string]int{}
+	for _, m := range models {
+		id, _ := m["id"].(string)
+		cw, _ := m["context_window"].(int)
+		cl, _ := m["context_length"].(int)
+		if cw != cl {
+			t.Fatalf("%s: context_window (%d) and context_length (%d) must agree", id, cw, cl)
+		}
+		got[id] = cw
+	}
+
+	if got["claude-sonnet-4-6"] != 1_000_000 {
+		t.Errorf("sonnet-4-6 should report Kiro's 1M window, got %d", got["claude-sonnet-4-6"])
+	}
+	if got["claude-opus-4-5"] != 200_000 {
+		t.Errorf("opus-4-5 should report Kiro's 200K window, got %d", got["claude-opus-4-5"])
+	}
+	if got["claude-opus-4-8"] != defaultContextWindow {
+		t.Errorf("opus-4-8 WITHOUT tokenLimits must fall back to the safe %d default (not a fabricated 1M), got %d", defaultContextWindow, got["claude-opus-4-8"])
+	}
+}
+
 // TestApplyAdaptiveThinkingDefaultInjectsAdaptive verifies that requests
 // against Claude 4-family models with no thinking config gain
 // thinking.type="adaptive" so Claude Code displays the thinking indicator.

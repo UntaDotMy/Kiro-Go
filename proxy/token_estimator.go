@@ -29,6 +29,30 @@ func resolveInputTokens(upstream, contextDerived, estimated int) int {
 	return 0
 }
 
+// claudeCountTokensCorrection inflates our local char-heuristic estimate to
+// better match Anthropic's real tokenizer for the /v1/messages/count_tokens
+// endpoint that Claude Code calls to PRE-measure context before sending.
+//
+// estimateApproxTokens is a char-class heuristic tuned to be close on average,
+// but it runs slightly LOW on real code/prose vs Anthropic's BPE tokenizer.
+// count_tokens is the number Claude Code uses to decide when to auto-compact;
+// if it reads low, compaction is delayed (or, combined with a mis-sized window,
+// skipped). A modest 1.15x correction — the same factor kiro-gateway applies
+// for the same reason — biases the pre-send measurement slightly HIGH so
+// compaction triggers on time rather than late. It is applied ONLY to the
+// count_tokens response, never to the streamed usage block (which prefers the
+// exact upstream count).
+const claudeCountTokensCorrection = 1.15
+
+// countTokensWithClaudeCorrection applies claudeCountTokensCorrection to a raw
+// local estimate and rounds up.
+func countTokensWithClaudeCorrection(raw int) int {
+	if raw <= 0 {
+		return raw
+	}
+	return int(math.Ceil(float64(raw) * claudeCountTokensCorrection))
+}
+
 func estimateApproxTokens(text string) int {
 	if text == "" {
 		return 0

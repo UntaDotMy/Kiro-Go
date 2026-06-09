@@ -978,7 +978,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[alias] = true
-		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
+		models = append(models, buildModelInfo(alias, "kiro-proxy", true, 0))
 	}
 
 	// Per-key model whitelist filter. When the caller authenticated with an
@@ -1034,20 +1034,37 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	// form yields a single entry.
 	models := make([]map[string]interface{}, 0, len(cached)*2)
 	seen := make(map[string]bool, len(cached)*2)
-	emit := func(id string, supportsImage bool) {
+	emit := func(id string, supportsImage bool, window int) {
 		if id == "" || seen[id] {
 			return
 		}
 		seen[id] = true
-		models = append(models, buildModelInfo(id, "anthropic", supportsImage))
+		models = append(models, buildModelInfo(id, "anthropic", supportsImage, window))
 	}
 	for _, m := range cached {
 		supportsImage := modelSupportsImage(m.InputTypes)
-		emit(kiroModelToAnthropicID(m.ModelId), supportsImage)
-		emit(m.ModelId, supportsImage)
+		// Authoritative window from Kiro's tokenLimits when present; 0 lets
+		// buildModelInfo fall back to the safe default.
+		window := contextWindowFromTokenLimits(m.TokenLimits)
+		emit(kiroModelToAnthropicID(m.ModelId), supportsImage, window)
+		emit(m.ModelId, supportsImage, window)
 	}
 	_ = thinkingSuffix // signature retained for callers; suffix variants are no longer emitted
 	return models
+}
+
+// contextWindowFromTokenLimits extracts Kiro's authoritative max input window
+// for a model from its ListAvailableModels tokenLimits, or 0 when unknown (the
+// caller then uses the safe default). This is the ONLY source we trust for a
+// non-default (e.g. 1M) window — never the model id's version number.
+func contextWindowFromTokenLimits(tl *struct {
+	MaxInputTokens  int `json:"maxInputTokens"`
+	MaxOutputTokens int `json:"maxOutputTokens"`
+}) int {
+	if tl == nil || tl.MaxInputTokens <= 0 {
+		return 0
+	}
+	return tl.MaxInputTokens
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
@@ -1066,7 +1083,7 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 			return
 		}
 		seen[id] = true
-		out = append(out, buildModelInfo(id, "anthropic", true))
+		out = append(out, buildModelInfo(id, "anthropic", true, 0))
 	}
 
 	if known := config.GetKnownModels(); len(known) > 0 {
@@ -1127,7 +1144,14 @@ func modelSupportsImage(inputTypes []string) bool {
 	return false
 }
 
-func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface{} {
+// buildModelInfo builds one /v1/models entry. contextWindow is the
+// authoritative window for this model in tokens — sourced from Kiro's
+// ListAvailableModels.tokenLimits.maxInputTokens when known (see
+// contextWindowFromTokenLimits), or the safe 200K default otherwise. It must NOT
+// be guessed from the model id: over-advertising a 1M window makes context-aware
+// clients (Claude Code) set their auto-compaction threshold near ~920K and never
+// compact in a normal session.
+func buildModelInfo(id, ownedBy string, supportsImage bool, contextWindow int) map[string]interface{} {
 	modalities := []string{"text"}
 	if supportsImage {
 		modalities = append(modalities, "image")
@@ -1152,7 +1176,9 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		thinkingSuffix = c.Suffix
 	}
 	supportsExtendedThinking := thinkingSuffix != "" && strings.HasSuffix(id, thinkingSuffix)
-	contextWindow := getContextWindowSize(id)
+	if contextWindow <= 0 {
+		contextWindow = getContextWindowSize(id)
+	}
 	maxOutputTokens := 8192
 	if strings.Contains(strings.ToLower(id), "opus") {
 		maxOutputTokens = 32000
@@ -1582,6 +1608,34 @@ func (h *Handler) effortLevelsForModel(modelID string) []string {
 	return nil
 }
 
+// contextWindowForModel resolves the authoritative context window (in tokens)
+// for a model id, used to convert Kiro's contextUsagePercentage back into an
+// input-token count. It prefers Kiro's ListAvailableModels tokenLimits
+// (maxInputTokens) for the matching model — comparing against both the dotted
+// upstream id and its dashed Anthropic form — and falls back to the safe
+// getContextWindowSize default (200K) when the model is not in the cache.
+//
+// This is the same window the /v1/models advert reports, so the pct-derived
+// fallback count and the advertised window can never disagree by the old ~5x
+// (1M-vs-200K) skew that pushed a client's context gauge past 100%.
+func (h *Handler) contextWindowForModel(model string) int {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key != "" {
+		h.modelsCacheMu.RLock()
+		for i := range h.cachedModels {
+			mid := strings.ToLower(strings.TrimSpace(h.cachedModels[i].ModelId))
+			if mid == key || strings.ToLower(kiroModelToAnthropicID(h.cachedModels[i].ModelId)) == key {
+				if w := contextWindowFromTokenLimits(h.cachedModels[i].TokenLimits); w > 0 {
+					h.modelsCacheMu.RUnlock()
+					return w
+				}
+			}
+		}
+		h.modelsCacheMu.RUnlock()
+	}
+	return getContextWindowSize(model)
+}
+
 // applyReasoningEffort forwards a graded reasoning-effort value to the Kiro
 // upstream NATIVELY when the resolved model supports it, by populating
 // payload.AdditionalModelRequestFields with {"output_config":{"effort":LEVEL}}.
@@ -1674,7 +1728,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	_ = actualModel // mapping is performed internally by ClaudeToKiro for the Kiro upstream call
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
-	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
+	estimatedTokens := countTokensWithClaudeCorrection(estimateClaudeRequestInputTokens(effectiveReq))
 	if estimatedTokens < 1 {
 		estimatedTokens = 1
 	}
@@ -2155,7 +2209,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			credits = c
 		},
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
@@ -2479,7 +2533,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			credits = c
 		},
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
@@ -2545,6 +2599,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	}
 
 	resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
+	if cacheProfile != nil {
+		cacheUsage = reconcileCacheUsage(inputTokens, cacheUsage)
+	}
 	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2922,7 +2979,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			credits = c
 		},
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
@@ -3032,7 +3089,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}

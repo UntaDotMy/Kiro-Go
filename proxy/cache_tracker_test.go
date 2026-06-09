@@ -262,3 +262,163 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
 	}
 }
+
+func TestReconcileCacheUsage(t *testing.T) {
+	assertInvariant := func(t *testing.T, inputTokens int, result promptCacheUsage) {
+		t.Helper()
+		billed := billedClaudeInputTokens(inputTokens, result)
+		total := billed + result.CacheCreationInputTokens + result.CacheReadInputTokens
+		if inputTokens <= 0 {
+			if total != 0 {
+				t.Fatalf("invariant: expected total 0 for non-positive input, got billed=%d creation=%d read=%d total=%d",
+					billed, result.CacheCreationInputTokens, result.CacheReadInputTokens, total)
+			}
+			return
+		}
+		if total != inputTokens {
+			t.Fatalf("invariant: billed(%d) + creation(%d) + read(%d) = %d, want %d",
+				billed, result.CacheCreationInputTokens, result.CacheReadInputTokens, total, inputTokens)
+		}
+	}
+
+	t.Run("no_overshoot", func(t *testing.T) {
+		input := 1000
+		usage := promptCacheUsage{
+			CacheCreationInputTokens:   200,
+			CacheReadInputTokens:       300,
+			CacheCreation5mInputTokens: 100,
+			CacheCreation1hInputTokens: 100,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		if result.CacheCreationInputTokens != 200 {
+			t.Fatalf("creation: got %d, want 200", result.CacheCreationInputTokens)
+		}
+		if result.CacheReadInputTokens != 300 {
+			t.Fatalf("read: got %d, want 300", result.CacheReadInputTokens)
+		}
+		if result.CacheCreation5mInputTokens != 100 {
+			t.Fatalf("c5: got %d, want 100", result.CacheCreation5mInputTokens)
+		}
+		if result.CacheCreation1hInputTokens != 100 {
+			t.Fatalf("c1: got %d, want 100", result.CacheCreation1hInputTokens)
+		}
+		assertInvariant(t, input, result)
+	})
+
+	t.Run("overshoot_live_bug", func(t *testing.T) {
+		input := 322495
+		usage := promptCacheUsage{
+			CacheCreationInputTokens:   444208,
+			CacheReadInputTokens:       0,
+			CacheCreation5mInputTokens: 222104,
+			CacheCreation1hInputTokens: 222104,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		if result.CacheCreationInputTokens != 322495 {
+			t.Fatalf("creation: got %d, want 322495", result.CacheCreationInputTokens)
+		}
+		if result.CacheReadInputTokens != 0 {
+			t.Fatalf("read: got %d, want 0", result.CacheReadInputTokens)
+		}
+		if result.CacheCreation5mInputTokens+result.CacheCreation1hInputTokens != 322495 {
+			t.Fatalf("c5+c1: got %d+%d=%d, want sum 322495",
+				result.CacheCreation5mInputTokens, result.CacheCreation1hInputTokens,
+				result.CacheCreation5mInputTokens+result.CacheCreation1hInputTokens)
+		}
+		assertInvariant(t, input, result)
+	})
+
+	t.Run("read_overshoot", func(t *testing.T) {
+		input := 500
+		usage := promptCacheUsage{
+			CacheCreationInputTokens: 0,
+			CacheReadInputTokens:     800,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		if result.CacheCreationInputTokens != 0 {
+			t.Fatalf("creation: got %d, want 0", result.CacheCreationInputTokens)
+		}
+		if result.CacheReadInputTokens != 500 {
+			t.Fatalf("read: got %d, want 500", result.CacheReadInputTokens)
+		}
+		assertInvariant(t, input, result)
+	})
+
+	t.Run("both_overshoot", func(t *testing.T) {
+		input := 1000
+		usage := promptCacheUsage{
+			CacheCreationInputTokens:   600,
+			CacheReadInputTokens:       600,
+			CacheCreation5mInputTokens: 300,
+			CacheCreation1hInputTokens: 300,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		// read=600 fits within input, creation capped to remaining space (1000-600=400)
+		if result.CacheReadInputTokens != 600 {
+			t.Fatalf("read: got %d, want 600", result.CacheReadInputTokens)
+		}
+		if result.CacheCreationInputTokens != 400 {
+			t.Fatalf("creation: got %d, want 400", result.CacheCreationInputTokens)
+		}
+		assertInvariant(t, input, result)
+	})
+
+	t.Run("zero_input", func(t *testing.T) {
+		input := 0
+		usage := promptCacheUsage{
+			CacheCreationInputTokens: 100,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		if result.CacheCreationInputTokens != 0 || result.CacheReadInputTokens != 0 ||
+			result.CacheCreation5mInputTokens != 0 || result.CacheCreation1hInputTokens != 0 {
+			t.Fatalf("expected all zeros, got %+v", result)
+		}
+		assertInvariant(t, input, result)
+	})
+
+	t.Run("negative_input", func(t *testing.T) {
+		input := -5
+		usage := promptCacheUsage{
+			CacheCreationInputTokens: 100,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		if result.CacheCreationInputTokens != 0 || result.CacheReadInputTokens != 0 ||
+			result.CacheCreation5mInputTokens != 0 || result.CacheCreation1hInputTokens != 0 {
+			t.Fatalf("expected all zeros, got %+v", result)
+		}
+		assertInvariant(t, input, result)
+	})
+
+	t.Run("creation_breakdown_rescale", func(t *testing.T) {
+		input := 1000
+		usage := promptCacheUsage{
+			CacheCreationInputTokens:   800,
+			CacheReadInputTokens:       400,
+			CacheCreation5mInputTokens: 600,
+			CacheCreation1hInputTokens: 200,
+		}
+		result := reconcileCacheUsage(input, usage)
+
+		// read=400 fits, maxCreation=1000-400=600, creation capped from 800→600
+		if result.CacheReadInputTokens != 400 {
+			t.Fatalf("read: got %d, want 400", result.CacheReadInputTokens)
+		}
+		if result.CacheCreationInputTokens != 600 {
+			t.Fatalf("creation: got %d, want 600", result.CacheCreationInputTokens)
+		}
+		// c5 = 600*600/800 = 450, c1 = 600-450 = 150
+		if result.CacheCreation5mInputTokens != 450 {
+			t.Fatalf("c5: got %d, want 450", result.CacheCreation5mInputTokens)
+		}
+		if result.CacheCreation1hInputTokens != 150 {
+			t.Fatalf("c1: got %d, want 150", result.CacheCreation1hInputTokens)
+		}
+		assertInvariant(t, input, result)
+	})
+}

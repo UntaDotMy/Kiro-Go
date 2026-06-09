@@ -246,7 +246,7 @@ func (h *Handler) apiGetAvailableModels(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 		seen[alias] = true
-		models = append(models, buildModelInfo(alias, "kiro-proxy", true))
+		models = append(models, buildModelInfo(alias, "kiro-proxy", true, 0))
 	}
 	// Surface a flat list of ids — the form only needs the id strings,
 	// and the existing /v1/models response shape (full objects with
