@@ -853,6 +853,10 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
                     <span class="nav-label" data-i18n="tabs.accounts"></span>
                 </div>
+                <div class="nav-item" data-tab="providers" onclick="switchTab('providers')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="8" height="8" rx="1"/><rect x="14" y="2" width="8" height="8" rx="1"/><rect x="2" y="14" width="8" height="8" rx="1"/><path d="M18 14v8M14 18h8"/></svg>
+                    <span class="nav-label" data-i18n="tabs.providers"></span>
+                </div>
                 <div class="nav-item" data-tab="apikeys" onclick="switchTab('apikeys')">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
                     <span class="nav-label" data-i18n="tabs.apikeys"></span>
@@ -943,7 +947,6 @@
                         <button class="btn btn-secondary btn-sm" onclick="showExportModal()" data-i18n="accounts.export"></button>
                         <button class="btn btn-secondary btn-sm" onclick="showImportModal()" data-i18n="accounts.import"></button>
                         <button class="btn btn-secondary btn-sm" onclick="refreshAllModels()" data-i18n="models.refreshAll"></button>
-                        <button class="btn btn-secondary btn-sm" onclick="showAddProviderModal()">+ Provider</button>
                         <button class="btn btn-primary btn-sm" onclick="showModal('add')" data-i18n="accounts.add"></button>
                     </div>
                 </div>
@@ -972,6 +975,19 @@
                     </div>
                 </div>
                 <div id="accountsList"></div>
+            </div>
+        </div>
+        <div id="tabProviders" class="tab-content hidden">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title" data-i18n="providers.title"></span>
+                    <div class="card-actions">
+                        <button class="btn btn-secondary btn-sm" onclick="loadProviders()" data-i18n="providers.refresh"></button>
+                        <button class="btn btn-primary btn-sm" onclick="showAddProviderModal()" data-i18n="providers.add"></button>
+                    </div>
+                </div>
+                <div style="padding:0 20px 12px;font-size:13px;color:#64748b" data-i18n="providers.hint"></div>
+                <div id="providersList" style="padding:0 4px 8px"></div>
             </div>
         </div>
         <div id="tabApikeys" class="tab-content hidden">
@@ -1121,12 +1137,12 @@
                         <option value="least-used">Least-Used (drain freshest first)</option>
                         <option value="random">Random</option>
                     </select>
-                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. Fast (default) picks an eligible account instantly — fill-first by weight, with optional stickiness for prompt-cache locality — and does NOT gate on concurrency or pace the request rate, so it has the lowest selection latency; it relies purely on the reactive cooldown (429 → exponential backoff) for throttle avoidance. Least-request steers each request to the least-busy account and applies a per-account adaptive concurrency limit (grows on success, halves on a 429) plus rate pacing — better for sustained heavy parallel load, at the cost of some added latency under light load. SWR is balanced rate-based rotation but blind to concurrency. Least-used tilts traffic toward less-burned accounts. Random is a control.</small>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. Fast (default) spreads requests in parallel across the least-loaded free accounts (WiFi-7 multi-link): each account holds up to its Concurrency/account cap (default 1 = send-and-ack), so a burst of N requests lands on N distinct accounts at once instead of queueing on one. When every account is at its cap the request waits for one to free and routes there — nothing is dropped. It does NOT apply a timed cooldown or adaptive concurrency limit; an in-use account simply isn't picked until it frees. Least-request steers each request to the least-busy account and applies a per-account adaptive concurrency limit (grows on success, halves on a 429) plus the soft cooldown — better when you want backoff under sustained heavy load. SWR is balanced rate-based rotation but blind to concurrency. Least-used tilts traffic toward less-burned accounts. Random is a control.</small>
                 </div>
                 <div class="form-group">
-                    <label>Sticky Limit (Fast strategy)</label>
-                    <input type="number" id="poolStickyLimit" min="1" max="1000" placeholder="3">
-                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Fast strategy only. How many consecutive requests stay on the same account before rotating to the least-recently-used peer. Higher = better prompt-cache locality (fewer cold-cache hops) but less even spread; 1 = rotate every request (no stickiness). Empty/0 = default (3).</small>
+                    <label>Concurrency / account (Fast strategy)</label>
+                    <input type="number" id="poolFastConcurrency" min="1" max="1000" placeholder="1">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Fast strategy only. How many requests a single account handles at once before the next request fans out to another free account. 1 (default) = strict send-and-ack: one request per account at a time, so N concurrent requests spread across N accounts in parallel. When every account is at this cap the request waits for one to free (woken the instant it does). Raise it to let each account pipeline multiple requests. Empty/0 = default (1).</small>
                 </div>
                 <div class="form-group">
                     <label>Initial Concurrency / account</label>
@@ -1312,7 +1328,23 @@
                 'stats.creditsRemaining': '剩余',
                 'stats.uptime': '运行时长',
                 'tabs.accounts': '账号',
+                'tabs.providers': '提供商',
                 'tabs.apikeys': 'API 密钥',
+                'providers.title': '提供商',
+                'providers.add': '+ 添加提供商',
+                'providers.refresh': '刷新',
+                'providers.hint': '非 Kiro 的上游提供商（Codex、Qoder、OpenAI、Groq、自定义 OpenAI 兼容端点……）。这里的每个账号通过 provider/model 前缀调用（例如 groq/llama-3.3-70b）。Kiro 账号在“账号”标签页下。',
+                'providers.empty': '还没有提供商账号。点击“添加提供商”来连接 Codex、API-Key 提供商，或你自己的 OpenAI 兼容端点。',
+                'providers.account': '账号',
+                'providers.accounts': '个账号',
+                'providers.status': '状态',
+                'providers.connected': '已连接',
+                'providers.noCreds': '无凭据',
+                'providers.models': '个模型',
+                'providers.modelsHint': '从该提供商实时获取的模型',
+                'providers.noModels': '无模型',
+                'providers.noModelsHint': '尚未缓存模型——请刷新模型或发起一次请求',
+                'providers.refreshModels': '刷新模型',
                 'tabs.analytics': '分析',
                 'apikeys.title': 'API 密钥',
                 'apikeys.section.basic': '基础',
@@ -1658,11 +1690,7 @@
                 'filter.banned': '已封禁',
                 'accounts.weight': '权重',
                 'accounts.inflight': '并发',
-                'accounts.inflightHint': '当前在途请求数 / 自适应并发上限（仅 least-request 策略）。上限在成功时 +1、遇到 429 时减为 3/4，自动逼近 AWS 的限流阈值。',
-                'accounts.paced': '限速',
-                'accounts.pacedHint': '该账号的自适应请求速率（次/秒，仅 least-request 策略）。空/0 = 不限速（全速）。遇到 429 后开始学习：速率降为实测吞吐的一半，随后在持续成功时每次 +5% 逐步探升，使账号稳定运行在隐藏令牌桶阈值之下，而不是反复撞上 429。',
-                'accounts.ttft': '首字延迟',
-                'accounts.ttftHint': '该账号的平均首字响应时间（毫秒，仅 least-request 策略）。这是智能路由所依据的负载感知延迟信号：在仍有速率余量的账号中，优先选择响应最快的。仅测量首字时间，不受输出长度影响，因此长回答不会让健康账号显得变慢。',
+                'accounts.inflightHint': '该账号当前正在处理的在途请求数。Fast 策略下，达到“每账号并发”上限后，新请求会分流到其他空闲账号。',
                 'accounts.cooldown': '冷却中',
                 'accounts.cooldownHint': '该账号最近遇到 429/错误，正在冷却，调度器会跳过它，倒计时结束后自动恢复。',
                 'accounts.overQuota': '超额',
@@ -1736,7 +1764,23 @@
                 'stats.creditsRemaining': 'Remaining',
                 'stats.uptime': 'Uptime',
                 'tabs.accounts': 'Accounts',
+                'tabs.providers': 'Providers',
                 'tabs.apikeys': 'API Keys',
+                'providers.title': 'Providers',
+                'providers.add': '+ Add Provider',
+                'providers.refresh': 'Refresh',
+                'providers.hint': 'Non-Kiro upstream providers (Codex, Qoder, OpenAI, Groq, custom OpenAI-compatible endpoints, ...). Each account here is reached with a provider/model prefix (e.g. groq/llama-3.3-70b). Kiro accounts live under the Accounts tab.',
+                'providers.empty': 'No provider accounts yet. Click "Add Provider" to connect Codex, an API-key provider, or your own OpenAI-compatible endpoint.',
+                'providers.account': 'Account',
+                'providers.accounts': 'accounts',
+                'providers.status': 'Status',
+                'providers.connected': 'Connected',
+                'providers.noCreds': 'No credentials',
+                'providers.models': 'models',
+                'providers.modelsHint': 'Models fetched live from this provider',
+                'providers.noModels': 'no models',
+                'providers.noModelsHint': 'No models cached yet — refresh models or send a request',
+                'providers.refreshModels': 'Refresh models',
                 'tabs.analytics': 'Analytics',
                 'apikeys.title': 'API Keys',
                 'apikeys.section.basic': 'Basic',
@@ -2082,11 +2126,7 @@
                 'filter.banned': 'Banned',
                 'accounts.weight': 'Weight',
                 'accounts.inflight': 'In-flight',
-                'accounts.inflightHint': 'Current outstanding requests / adaptive concurrency limit (least-request strategy only). The limit grows by 1 on success and drops to 3/4 on a 429, self-tuning toward the AWS throttle threshold.',
-                'accounts.paced': 'Paced',
-                'accounts.pacedHint': 'Adaptive request RATE for this account (req/sec, least-request strategy only). Blank/0 = unpaced (full speed). After a 429 the rate is learned: it snaps to half the measured throughput, then probes back up +5% on sustained success, so the account stays just below its hidden token bucket instead of bouncing off 429s.',
-                'accounts.ttft': 'TTFT',
-                'accounts.ttftHint': 'Average time-to-first-token for this account (ms, least-request strategy only). This is the load-aware latency signal the smart router steers by: among accounts that still have rate headroom, the fastest-responding one is preferred. Output length does not contaminate it (only first-token time is measured), so a long answer never makes a healthy account look slow.',
+                'accounts.inflightHint': 'Requests this account is handling right now. Under the Fast strategy, once an account reaches the per-account Concurrency cap, new requests fan out to other free accounts.',
                 'accounts.cooldown': 'Cooling',
                 'accounts.cooldownHint': 'This account recently hit a 429/error and is in cooldown. The scheduler skips it until the countdown ends, then it auto-recovers.',
                 'accounts.overQuota': 'Over quota',
@@ -2369,6 +2409,12 @@
         }
         function getFilteredAccounts() {
             return accountsData.filter(a => {
+                // The Accounts tab is Kiro-only. Non-Kiro provider accounts
+                // (codex/qoder/openai/groq/custom...) live under the Providers tab,
+                // which has its own quota/model semantics. A Backend-less account
+                // is a legacy Kiro account, so treat empty/"kiro" as Kiro.
+                const backend = (a.backend || 'kiro').toLowerCase();
+                if (backend !== 'kiro') return false;
                 if (filterStatus === 'enabled' && !a.enabled) return false;
                 if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
                 if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
@@ -2379,6 +2425,11 @@
                 }
                 return true;
             });
+        }
+        // providerAccounts returns the non-Kiro accounts, grouped for the
+        // Providers tab. Each is keyed by its backend (the provider id).
+        function providerAccounts() {
+            return accountsData.filter(a => (a.backend || 'kiro').toLowerCase() !== 'kiro');
         }
         function onFilterChange() {
             filterKeyword = document.getElementById('filterSearch').value;
@@ -3434,9 +3485,9 @@
             if (stratEl) {
                 stratEl.value = d.poolStrategy || 'fast';
             }
-            const stickyEl = document.getElementById('poolStickyLimit');
-            if (stickyEl) {
-                stickyEl.value = d.poolStickyLimit || '';
+            const fastConcEl = document.getElementById('poolFastConcurrency');
+            if (fastConcEl) {
+                fastConcEl.value = d.poolFastConcurrency || '';
             }
             const initConcEl = document.getElementById('poolInitialConcurrency');
             if (initConcEl) {
@@ -3461,10 +3512,10 @@
             }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) body.poolStrategy = stratEl.value;
-            const stickyEl = document.getElementById('poolStickyLimit');
-            if (stickyEl) {
-                const raw = (stickyEl.value || '').trim();
-                body.poolStickyLimit = raw === '' ? 0 : parseInt(raw, 10);
+            const fastConcEl = document.getElementById('poolFastConcurrency');
+            if (fastConcEl) {
+                const raw = (fastConcEl.value || '').trim();
+                body.poolFastConcurrency = raw === '' ? 0 : parseInt(raw, 10);
             }
             const initConcEl = document.getElementById('poolInitialConcurrency');
             if (initConcEl) {
@@ -3987,7 +4038,7 @@
                 const d = await res.json();
                 if (d.success) {
                     if (statusEl) statusEl.textContent = 'Added — ' + (d.modelCount || 0) + ' models found.';
-                    setTimeout(() => { closeModal(); loadAccounts(); }, 600);
+                    setTimeout(() => { closeModal(); loadAccounts(); loadProviders(); }, 600);
                 } else {
                     if (btn) { btn.disabled = false; btn.textContent = t('common.add'); }
                     if (statusEl) statusEl.textContent = '';
@@ -3998,6 +4049,90 @@
                 if (statusEl) statusEl.textContent = '';
                 alert('Failed to add provider account');
             }
+        }
+        // ---- Providers tab ----
+        // Renders non-Kiro provider accounts grouped by backend, each showing its
+        // dialect, account/key status, and fetched model count, with per-account
+        // refresh-models / test / delete. Kiro accounts stay on the Accounts tab.
+        function loadProviders() {
+            // accountsData is the single source of truth (already polled). If it
+            // isn't loaded yet, fetch it first, then render.
+            if (!accountsData || accountsData.length === 0) {
+                loadAccounts().then(renderProviders);
+            } else {
+                renderProviders();
+            }
+        }
+        const PROVIDER_LABELS = {
+            codex: 'OpenAI Codex (ChatGPT)', qoder: 'Qoder', openai: 'OpenAI', anthropic: 'Anthropic',
+            gemini: 'Gemini', groq: 'Groq', cerebras: 'Cerebras', deepseek: 'DeepSeek', mistral: 'Mistral',
+            openrouter: 'OpenRouter', xai: 'xAI', together: 'Together', fireworks: 'Fireworks',
+            cohere: 'Cohere', nebius: 'Nebius', siliconflow: 'SiliconFlow'
+        };
+        function renderProviders() {
+            const container = document.getElementById('providersList');
+            if (!container) return;
+            const provs = providerAccounts();
+            if (provs.length === 0) {
+                container.innerHTML = '<div class="empty" style="padding:32px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2" width="8" height="8" rx="1"/><rect x="14" y="2" width="8" height="8" rx="1"/><rect x="2" y="14" width="8" height="8" rx="1"/><path d="M18 14v8M14 18h8"/></svg><div>' + t('providers.empty') + '</div></div>';
+                return;
+            }
+            // Group accounts by backend (the provider id).
+            const groups = {};
+            provs.forEach(a => { const b = (a.backend || '').toLowerCase(); (groups[b] = groups[b] || []).push(a); });
+
+            const html = Object.keys(groups).sort().map(backend => {
+                const accts = groups[backend];
+                const label = PROVIDER_LABELS[backend] || backend;
+                const totalModels = accts.reduce((s, a) => s + (a.modelCount || 0), 0);
+                const rows = accts.map(a => {
+                    const ok = a.hasToken || a.hasApiKey;
+                    const statusBadge = ok
+                        ? '<span class="badge badge-success">' + t('providers.connected') + '</span>'
+                        : '<span class="badge badge-error">' + t('providers.noCreds') + '</span>';
+                    const enabledBadge = a.enabled
+                        ? '<span class="badge badge-info">' + t('accounts.enabled') + '</span>'
+                        : '<span class="badge badge-warning">' + t('accounts.disabled') + '</span>';
+                    const modelsBadge = a.modelCount
+                        ? '<span class="badge badge-success" title="' + t('providers.modelsHint') + '">' + a.modelCount + ' ' + t('providers.models') + '</span>'
+                        : '<span class="badge badge-warning" title="' + t('providers.noModelsHint') + '">' + t('providers.noModels') + '</span>';
+                    const planBadge = a.codexPlanType ? '<span class="badge badge-pro">' + a.codexPlanType + '</span>' : '';
+                    const name = a.nickname || a.email || a.id.slice(0, 8);
+                    const actions = '<div class="row-actions">' +
+                        '<button class="btn btn-sm btn-secondary" onclick="refreshAccountModels(\'' + a.id + '\')" title="' + t('providers.refreshModels') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
+                        '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>' +
+                        '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff;border-color:#2563eb">' + t('accounts.test') + '</button>' +
+                        '<button class="btn btn-sm btn-danger" onclick="deleteProviderAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
+                        '</div>';
+                    return '<tr>' +
+                        '<td><div class="acct-email">' + escapeHtml(name) + '</div></td>' +
+                        '<td><div class="row-meta">' + statusBadge + enabledBadge + planBadge + modelsBadge + '</div></td>' +
+                        '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
+                        '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
+                        '<td>' + actions + '</td>' +
+                        '</tr>';
+                }).join('');
+                return '<div class="card" style="margin:8px 0">' +
+                    '<div class="card-header" style="padding:12px 16px">' +
+                    '<span class="card-title" style="font-size:15px">' + escapeHtml(label) +
+                    ' <span style="font-weight:normal;color:#94a3b8;font-size:13px">(' + backend + ' · ' + accts.length + ' ' + t('providers.accounts') + ' · ' + totalModels + ' ' + t('providers.models') + ')</span></span>' +
+                    '</div>' +
+                    '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+                    '<th>' + t('providers.account') + '</th><th>' + t('providers.status') + '</th>' +
+                    '<th class="cell-num">' + t('accounts.requests') + '</th><th class="cell-num">' + t('accounts.tokens') + '</th>' +
+                    '<th style="text-align:right"> </th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+                    '</div>';
+            }).join('');
+            container.innerHTML = html;
+        }
+        // deleteProviderAccount deletes a non-Kiro provider account and re-renders
+        // the Providers tab (deleteAccount re-renders the Accounts tab instead).
+        async function deleteProviderAccount(id) {
+            if (!confirm(t('accounts.confirmDelete'))) return;
+            await fetch('/admin/api/accounts/' + id, { method: 'DELETE', headers: { 'X-Admin-Password': password } });
+            await loadAccounts();
+            renderProviders();
+            loadStats();
         }
         let codexPollTimer = null;
         let codexSessionId = '';
@@ -4259,7 +4394,6 @@
                     'trialUsageCurrent','trialUsageLimit','trialUsagePercent',
                     'requestCount','errorCount','totalTokens','totalCredits',
                     'lastUsed','lastRefresh','inflight','concurrencyLimit',
-                    'pacedRate','observedRate','ttftMs',
                     'cooldownSecs','overQuota'];
                 for (const f of fields) {
                     if (s[f] !== undefined && a[f] !== s[f]) { a[f] = s[f]; changed = true; }
@@ -4895,9 +5029,7 @@
                     [0, 1, 2, 3, 4, 5].map(w => '<option value="' + w + '"' + (weightVal === w ? ' selected' : '') + '>' + w + '</option>').join('') +
                     '</select>';
 
-                const inflight = (a.inflight !== undefined) ? '<div class="acct-sub num" title="' + t('accounts.inflightHint') + '">' + t('accounts.inflight') + ' ' + (a.inflight || 0) + '/' + (a.concurrencyLimit || 0) + '</div>' : '';
-                const pacedSub = a.pacedRate ? '<div class="acct-sub num" title="' + t('accounts.pacedHint') + '">' + t('accounts.paced') + ' ' + a.pacedRate.toFixed(1) + '/s</div>' : '';
-                const ttftSub = a.ttftMs ? '<div class="acct-sub num" title="' + t('accounts.ttftHint') + '">' + t('accounts.ttft') + ' ' + Math.round(a.ttftMs) + 'ms</div>' : '';
+                const inflight = (a.inflight > 0) ? '<div class="acct-sub num" title="' + t('accounts.inflightHint') + '">' + t('accounts.inflight') + ' ' + a.inflight + '</div>' : '';
 
                 const actions = '<div class="row-actions">' +
                     '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccount(\'' + a.id + '\')" title="' + t('accounts.refresh') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
@@ -4927,7 +5059,7 @@
                     '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
                     '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
                     '<td class="cell-num">' + (a.totalCredits || 0).toFixed(1) + '</td>' +
-                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + pacedSub + ttftSub + '</td>' +
+                    '<td><span class="num">' + formatTokenExpiry(a.expiresAt) + '</span>' + inflight + '</td>' +
                     '<td>' + weightSelect + '</td>' +
                     '<td>' + actions + '</td>' +
                     '</tr>';
@@ -4974,10 +5106,10 @@
 
         // ---- Section navigation (sidebar) ----
         const SECTION_TITLE_KEY = {
-            overview: 'nav.overview', accounts: 'tabs.accounts', apikeys: 'tabs.apikeys',
+            overview: 'nav.overview', accounts: 'tabs.accounts', providers: 'tabs.providers', apikeys: 'tabs.apikeys',
             analytics: 'tabs.analytics', settings: 'tabs.settings', api: 'tabs.api'
         };
-        const VALID_TABS = ['overview', 'accounts', 'apikeys', 'analytics', 'settings', 'api'];
+        const VALID_TABS = ['overview', 'accounts', 'providers', 'apikeys', 'analytics', 'settings', 'api'];
         // updateHash controls whether switchTab writes location.hash. It's false
         // only when switchTab is itself driven BY a hash change (so we don't
         // recurse through the hashchange listener).
@@ -4995,6 +5127,7 @@
                 try { history.replaceState(null, '', '#' + tab); } catch (e) { location.hash = tab; }
             }
             if (tab === 'overview') loadOverview();
+            else if (tab === 'providers') loadProviders();
             else if (tab === 'apikeys') loadApiKeys();
             else if (tab === 'analytics') {
                 // Ensure the per-key stats source is populated BEFORE rendering.

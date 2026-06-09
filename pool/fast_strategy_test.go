@@ -6,41 +6,133 @@ import (
 	"time"
 )
 
-// withFast pins the strategy resolver to "fast" and the sticky limit to the
-// given value for the duration of a test.
-func withFast(t *testing.T, stickyLimit int) {
+// withFast pins the strategy resolver to "fast" and the per-account
+// fast-concurrency cap to the given value for the duration of a test.
+func withFast(t *testing.T, fastConcurrency int) {
 	t.Helper()
 	restoreStrat := SetStrategyResolverForTesting(func() string { return "fast" })
-	restoreSticky := SetStickyLimitResolverForTesting(func() int { return stickyLimit })
+	restoreFast := SetFastConcurrencyResolverForTesting(func() int { return fastConcurrency })
 	t.Cleanup(restoreStrat)
-	t.Cleanup(restoreSticky)
+	t.Cleanup(restoreFast)
 }
 
-// TestFastStrategyNoStallOnSelection verifies the headline property of the fast
-// strategy: a reserving acquire returns an account IMMEDIATELY (ok=true,
-// retryAfter=0) with no admission-wait / saturation signal, even when several
-// requests are already in flight on every account. The least-request path would
-// gate on the AIMD concurrency limit and could return the saturation poll hint;
-// fast never does.
-func TestFastStrategyNoStallOnSelection(t *testing.T) {
-	withFast(t, 1) // stickiness off -> spread
+// TestFastStrategyNonReservingNeverGates verifies that the NON-reserving picker
+// (GetNextForModel) always returns an account immediately with no saturation
+// hint, even when far more in-flight reservations exist than any cap would
+// allow. Non-reserving callers (diagnostics / single-account paths) have no slot
+// to reserve, so the cap gate doesn't apply to them.
+func TestFastStrategyNonReservingNeverGates(t *testing.T) {
+	withFast(t, 1)
 	p := NewForTesting()
 	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
 
-	// Pile far more in-flight reservations than any AIMD limit would allow.
 	for i := 0; i < 100; i++ {
-		acc, retryAfter, ok := p.AcquireForModelExcluding("", nil)
+		acc, retryAfter, ok := p.GetNextForModel("")
 		if !ok || acc == nil {
-			t.Fatalf("fast acquire #%d should always succeed immediately, got ok=%v retryAfter=%v", i, ok, retryAfter)
+			t.Fatalf("non-reserving fast pick #%d should always succeed, got ok=%v retryAfter=%v", i, ok, retryAfter)
 		}
 		if retryAfter != 0 {
-			t.Fatalf("fast acquire #%d should never return a retryAfter (no admission gate), got %v", i, retryAfter)
+			t.Fatalf("non-reserving fast pick #%d should never return a retryAfter, got %v", i, retryAfter)
 		}
 	}
 }
 
-// TestFastStrategyFillFirstByWeight verifies that with stickiness off the fast
-// strategy prefers the highest-weight eligible account.
+// TestFastStrategyFansOutAcrossFreeAccounts is the headline property (WiFi-7
+// multi-link): with the per-account cap at 1 (send-and-ack) and 4 free accounts,
+// 4 concurrent reserving acquires each land on a DISTINCT account in parallel,
+// instead of queueing on one. A 5th acquire — with all 4 now at their cap —
+// returns the saturation poll hint so the dispatcher waits for a slot to free.
+func TestFastStrategyFansOutAcrossFreeAccounts(t *testing.T) {
+	withFast(t, 1)
+	p := NewForTesting()
+	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}})
+
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		acc, retryAfter, ok := p.AcquireForModelExcluding("", nil)
+		if !ok || acc == nil {
+			t.Fatalf("acquire #%d should succeed while a free account remains, got ok=%v retryAfter=%v", i, ok, retryAfter)
+		}
+		if seen[acc.ID] {
+			t.Fatalf("acquire #%d reused account %s — fast must fan out to a distinct free account", i, acc.ID)
+		}
+		seen[acc.ID] = true
+	}
+	if len(seen) != 4 {
+		t.Fatalf("expected 4 distinct accounts under send-and-ack fan-out, got %v", seen)
+	}
+
+	// All 4 are now at their cap of 1 — the next acquire must shed with the
+	// saturation poll hint (the dispatcher turns this into a short wait).
+	acc, retryAfter, ok := p.AcquireForModelExcluding("", nil)
+	if ok || acc != nil {
+		t.Fatalf("acquire with every account at cap should not pick, got acc=%v ok=%v", acc, ok)
+	}
+	if retryAfter != saturationPollInterval {
+		t.Fatalf("expected saturation poll hint %s when all accounts at cap, got %s", saturationPollInterval, retryAfter)
+	}
+}
+
+// TestFastStrategyWaitsThenRoutesToFreedSlot verifies the "wait until one frees"
+// contract: with cap 1 and 2 accounts both in flight, the next acquire saturates;
+// after a Release frees a slot, the following acquire succeeds and routes to the
+// freed account.
+func TestFastStrategyWaitsThenRoutesToFreedSlot(t *testing.T) {
+	withFast(t, 1)
+	p := NewForTesting()
+	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
+
+	first, _, ok := p.AcquireForModelExcluding("", nil)
+	if !ok {
+		t.Fatalf("first acquire failed")
+	}
+	second, _, ok := p.AcquireForModelExcluding("", nil)
+	if !ok || second.ID == first.ID {
+		t.Fatalf("second acquire should land on the other account, got %v (first %v)", second, first)
+	}
+	// Both at cap → saturate.
+	if _, ra, ok := p.AcquireForModelExcluding("", nil); ok || ra != saturationPollInterval {
+		t.Fatalf("expected saturation when both at cap, got ok=%v retryAfter=%v", ok, ra)
+	}
+	// Free one slot; the next acquire must succeed and route to the freed account.
+	p.Release(first.ID)
+	acc, _, ok := p.AcquireForModelExcluding("", nil)
+	if !ok || acc == nil {
+		t.Fatalf("acquire after Release should succeed")
+	}
+	if acc.ID != first.ID {
+		t.Fatalf("acquire after Release should route to the freed account %s, got %s", first.ID, acc.ID)
+	}
+}
+
+// TestFastStrategyPipelinesWhenCapAboveOne verifies that raising the per-account
+// cap lets a single account pipeline multiple concurrent requests before the
+// burst spills to a peer. With cap 2 and 2 accounts, four acquires distribute as
+// two per account (the least-loaded account always wins the next slot).
+func TestFastStrategyPipelinesWhenCapAboveOne(t *testing.T) {
+	withFast(t, 2)
+	p := NewForTesting()
+	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
+
+	counts := map[string]int{}
+	for i := 0; i < 4; i++ {
+		acc, _, ok := p.AcquireForModelExcluding("", nil)
+		if !ok || acc == nil {
+			t.Fatalf("acquire #%d should succeed under cap 2 with 2 accounts", i)
+		}
+		counts[acc.ID]++
+	}
+	if counts["a"] != 2 || counts["b"] != 2 {
+		t.Fatalf("expected 2 in-flight per account at cap 2, got %v", counts)
+	}
+	// Fifth acquire — both at cap 2 — saturates.
+	if _, ra, ok := p.AcquireForModelExcluding("", nil); ok || ra != saturationPollInterval {
+		t.Fatalf("expected saturation at cap 2 once both accounts full, got ok=%v retryAfter=%v", ok, ra)
+	}
+}
+
+// TestFastStrategyFillFirstByWeight verifies that on the first pick (equal
+// in-flight) the higher-weight account is preferred.
 func TestFastStrategyFillFirstByWeight(t *testing.T) {
 	withFast(t, 1)
 	p := NewForTesting()
@@ -54,14 +146,14 @@ func TestFastStrategyFillFirstByWeight(t *testing.T) {
 		t.Fatalf("expected a pick")
 	}
 	if acc.ID != "high" {
-		t.Fatalf("fast fill-first should pick the highest-weight account, got %s", acc.ID)
+		t.Fatalf("fast should prefer the highest-weight account when equally loaded, got %s", acc.ID)
 	}
 }
 
-// TestFastStrategyRotatesWhenStickinessOff verifies that equal-weight accounts
-// rotate (least-recently-picked) when the sticky limit is 1, instead of pinning
-// to slot 0. Over an even number of picks each account should get an equal share.
-func TestFastStrategyRotatesWhenStickinessOff(t *testing.T) {
+// TestFastStrategyRotatesEvenly verifies that equal-weight, equally-loaded
+// accounts rotate by least-recently-picked so a stream of non-reserving picks
+// spreads evenly instead of pinning to slot 0.
+func TestFastStrategyRotatesEvenly(t *testing.T) {
 	withFast(t, 1)
 	p := NewForTesting()
 	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}, {ID: "c"}})
@@ -81,93 +173,30 @@ func TestFastStrategyRotatesWhenStickinessOff(t *testing.T) {
 	}
 }
 
-// TestFastStrategyStickyHoldsThenRotates verifies sticky-round-robin: with a
-// sticky limit of 3, the strategy stays on one account for 3 consecutive picks,
-// then rotates to the least-recently-picked peer for the next 3, and so on.
-func TestFastStrategyStickyHoldsThenRotates(t *testing.T) {
-	withFast(t, 3)
-	p := NewForTesting()
-	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
-
-	var seq []string
-	for i := 0; i < 6; i++ {
-		acc, _, ok := p.GetNextForModel("")
-		if !ok {
-			t.Fatalf("pick #%d failed", i)
-		}
-		seq = append(seq, acc.ID)
-	}
-	// First 3 picks stay on one account, next 3 on the other.
-	first := seq[0]
-	for i := 1; i < 3; i++ {
-		if seq[i] != first {
-			t.Fatalf("expected first 3 picks sticky on %s, got %v", first, seq)
-		}
-	}
-	second := seq[3]
-	if second == first {
-		t.Fatalf("expected rotation to the other account after the sticky cap, got %v", seq)
-	}
-	for i := 4; i < 6; i++ {
-		if seq[i] != second {
-			t.Fatalf("expected next 3 picks sticky on %s, got %v", second, seq)
-		}
-	}
-}
-
-// TestFastStrategySkipsCooldownAccounts verifies that fast selection respects
-// the shared cooldown filter: an account in soft cooldown is never picked, and
-// once every account is cooling the picker returns the soonest-recovery hint
-// (same contract as the other strategies).
-func TestFastStrategySkipsCooldownAccounts(t *testing.T) {
+// TestFastStrategyIgnoresCooldown verifies the deliberate design choice that the
+// fast strategy routes purely by free capacity and does NOT skip a soft-cooled
+// account — an account that recently hit a 429 is steered around by load, not by
+// a timed cooldown. (The other strategies still honor the cooldown; see
+// TestFastStrategy* vs the least-request tests.)
+func TestFastStrategyIgnoresCooldown(t *testing.T) {
 	withFast(t, 1)
 	p := NewForTesting()
 	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
 
-	// Cool "a" hard; only "b" should be returned.
+	// Put "a" in a long soft cooldown. Fast must still be willing to pick it.
 	p.cooldowns["a"] = &cooldownEntry{until: time.Now().Add(time.Minute)}
-	for i := 0; i < 5; i++ {
+
+	sawA := false
+	for i := 0; i < 4; i++ {
 		acc, _, ok := p.GetNextForModel("")
 		if !ok || acc == nil {
-			t.Fatalf("pick #%d should still find b", i)
+			t.Fatalf("pick #%d failed", i)
 		}
-		if acc.ID != "a" {
-			continue
+		if acc.ID == "a" {
+			sawA = true
 		}
-		t.Fatalf("fast strategy returned a cooling account")
 	}
-
-	// Cool "b" too — now every account is cooling, picker returns retryAfter>0.
-	p.cooldowns["b"] = &cooldownEntry{until: time.Now().Add(30 * time.Second)}
-	acc, retryAfter, ok := p.GetNextForModel("")
-	if ok || acc != nil {
-		t.Fatalf("expected no pick when all accounts cooling, got acc=%v ok=%v", acc, ok)
-	}
-	if retryAfter <= 0 {
-		t.Fatalf("expected a positive soonest-recovery retryAfter, got %v", retryAfter)
-	}
-}
-
-// TestFastStrategyRotatesAwayFromCooledStickyAccount verifies that if the
-// current sticky account falls into cooldown mid-streak, the next pick rotates
-// to an eligible peer rather than getting stuck.
-func TestFastStrategyRotatesAwayFromCooledStickyAccount(t *testing.T) {
-	withFast(t, 10) // long sticky window
-	p := NewForTesting()
-	p.setAccounts([]config.Account{{ID: "a"}, {ID: "b"}})
-
-	first, _, ok := p.GetNextForModel("")
-	if !ok {
-		t.Fatalf("first pick failed")
-	}
-	// Cool the account we just stuck to.
-	p.cooldowns[first.ID] = &cooldownEntry{until: time.Now().Add(time.Minute)}
-
-	acc, _, ok := p.GetNextForModel("")
-	if !ok || acc == nil {
-		t.Fatalf("expected a pick after sticky account cooled")
-	}
-	if acc.ID == first.ID {
-		t.Fatalf("expected rotation away from cooled sticky account %s", first.ID)
+	if !sawA {
+		t.Fatalf("fast strategy must route to a cooling account (it ignores soft cooldown); never picked a")
 	}
 }

@@ -27,12 +27,12 @@ func TestGetPoolStrategyNormalization(t *testing.T) {
 		"FAST":       "fast",
 		"  fast  ":   "fast",
 		// least-request and its aliases.
-		"least-request": "least-request",
-		"least-conn":    "least-request",
-		"leastrequest":  "least-request",
-		"least_request": "least-request",
-		"lor":           "least-request",
-		"LEAST-REQUEST": "least-request",
+		"least-request":     "least-request",
+		"least-conn":        "least-request",
+		"leastrequest":      "least-request",
+		"least_request":     "least-request",
+		"lor":               "least-request",
+		"LEAST-REQUEST":     "least-request",
 		"  least-request  ": "least-request",
 		// swr family.
 		"swr":  "swr",
@@ -74,24 +74,24 @@ func TestUpdatePoolStrategyPersists(t *testing.T) {
 	}
 }
 
-// TestGetPoolStickyLimitDefaultAndClamp verifies the "fast" strategy sticky cap:
-// unset resolves to the default (3), valid values pass through, and the value is
-// clamped to [1, 1000].
-func TestGetPoolStickyLimitDefaultAndClamp(t *testing.T) {
+// TestGetPoolFastConcurrencyDefaultAndClamp verifies the "fast" strategy
+// per-account concurrency cap: unset resolves to the default (1 = send-and-ack),
+// valid values pass through, and the value is clamped to [1, 1000].
+func TestGetPoolFastConcurrencyDefaultAndClamp(t *testing.T) {
 	withTestAPIKeyConfig(t, &Config{}) // unset
-	if got := GetPoolStickyLimit(); got != defaultPoolStickyLimit {
-		t.Fatalf("unset sticky limit should default to %d, got %d", defaultPoolStickyLimit, got)
+	if got := GetPoolFastConcurrency(); got != defaultPoolFastConcurrency {
+		t.Fatalf("unset fast concurrency should default to %d, got %d", defaultPoolFastConcurrency, got)
 	}
-	withTestAPIKeyConfig(t, &Config{PoolStickyLimit: 5})
-	if got := GetPoolStickyLimit(); got != 5 {
-		t.Fatalf("sticky limit 5 should pass through, got %d", got)
+	withTestAPIKeyConfig(t, &Config{PoolFastConcurrency: 5})
+	if got := GetPoolFastConcurrency(); got != 5 {
+		t.Fatalf("fast concurrency 5 should pass through, got %d", got)
 	}
-	withTestAPIKeyConfig(t, &Config{PoolStickyLimit: 1})
-	if got := GetPoolStickyLimit(); got != 1 {
-		t.Fatalf("sticky limit 1 (stickiness off) should pass through, got %d", got)
+	withTestAPIKeyConfig(t, &Config{PoolFastConcurrency: 1})
+	if got := GetPoolFastConcurrency(); got != 1 {
+		t.Fatalf("fast concurrency 1 (send-and-ack) should pass through, got %d", got)
 	}
-	withTestAPIKeyConfig(t, &Config{PoolStickyLimit: 99999})
-	if got := GetPoolStickyLimit(); got != 1000 {
-		t.Fatalf("sticky limit should clamp to 1000, got %d", got)
+	withTestAPIKeyConfig(t, &Config{PoolFastConcurrency: 99999})
+	if got := GetPoolFastConcurrency(); got != 1000 {
+		t.Fatalf("fast concurrency should clamp to 1000, got %d", got)
 	}
 }

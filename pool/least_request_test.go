@@ -75,72 +75,6 @@ func TestLeastRequestWeightedScore(t *testing.T) {
 	}
 }
 
-// TestTTFTRoutingPenaltyCap verifies the raised ttftPenaltyCap (10) steers
-// traffic to the fast account even when a slow peer carries enough weight that
-// the OLD cap of 4 would have kept the slow account winning. Models the live
-// pool we measured: one ~1.5s account vs a ~9.6s account (a 6.4x spread that
-// fell between the old and new caps).
-func TestTTFTRoutingPenaltyCap(t *testing.T) {
-	withLeastRequest(t)
-	p := newTestPool()
-	// Give the SLOW account a 2x weight edge so weight alone favors it. With
-	// equal inflight, base scores are slow=20/1, fast=10/1. The TTFT penalty
-	// divides the slow account's score by min(ratio, cap):
-	//   old cap 4  -> slow 20/4 = 5  vs fast 10  -> fast wins already at 4x...
-	// so to make the cap the deciding factor, weight the slow account 5x:
-	//   base: slow=50, fast=10; ratio 6.4x.
-	//   old cap 4 -> slow 50/4 = 12.5 > fast 10  -> SLOW would win (bug).
-	//   new cap 10 (ratio 6.4 applies) -> slow 50/6.4 = 7.8 < fast 10 -> FAST wins.
-	p.setAccounts([]config.Account{
-		{ID: "slow", Weight: 5}, // effectiveWeight 50
-		{ID: "fast", Weight: 1}, // effectiveWeight 10
-	})
-	p.RecordTTFT("slow", 9600)
-	p.RecordTTFT("fast", 1500) // 6.4x faster
-
-	acc, _, ok := p.AcquireForModelExcluding("", nil)
-	if !ok || acc == nil {
-		t.Fatal("expected a pick")
-	}
-	if acc.ID != "fast" {
-		t.Fatalf("TTFT routing should steer to the fast account at a 6.4x spread (new cap 10), got %s", acc.ID)
-	}
-}
-
-// TestTTFTRoutingExploresUnmeasured verifies an account with NO TTFT measurement
-// is not penalized (factor 1.0), so a fresh account still gets traffic to learn
-// its latency rather than being starved by a measured-fast peer. We acquire
-// WITHOUT releasing so inflight accumulates — mirroring real concurrent load,
-// where the least-request term steers the second pick to the idle fresh account
-// once the measured one is in flight.
-func TestTTFTRoutingExploresUnmeasured(t *testing.T) {
-	withLeastRequest(t)
-	p := newTestPool()
-	p.setAccounts([]config.Account{
-		{ID: "measured", Weight: 1},
-		{ID: "fresh", Weight: 1},
-	})
-	p.RecordTTFT("measured", 1500) // fast; fresh stays unmeasured (factor 1.0)
-
-	// Acquire repeatedly without releasing. If the unmeasured account were
-	// penalized (factor > 1), it would never win; with factor 1.0 the
-	// least-request term hands it the pick once "measured" has an in-flight slot.
-	freshPicked := false
-	for i := 0; i < 4; i++ {
-		acc, _, ok := p.AcquireForModelExcluding("", nil)
-		if !ok || acc == nil {
-			t.Fatal("expected a pick")
-		}
-		if acc.ID == "fresh" {
-			freshPicked = true
-			break
-		}
-	}
-	if !freshPicked {
-		t.Fatal("an unmeasured account must still receive traffic to learn its TTFT")
-	}
-}
-
 // TestLeastRequestSaturationShed verifies that when every eligible account is at
 // its AIMD concurrency limit, the reserving picker returns ok=false with the
 // saturation poll hint instead of overcommitting a slot.
@@ -222,8 +156,8 @@ func TestAcquireReleaseAccounting(t *testing.T) {
 func TestReleaseUnknownAccountIsNoOp(t *testing.T) {
 	p := newTestPool()
 	p.setAccounts([]config.Account{{ID: "a"}})
-	p.Release("a")       // no entry yet
-	p.Release("ghost")   // never existed
+	p.Release("a")     // no entry yet
+	p.Release("ghost") // never existed
 	if got := p.InflightCount("a"); got != 0 {
 		t.Fatalf("expected inflight=0, got %d", got)
 	}

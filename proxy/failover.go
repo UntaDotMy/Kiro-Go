@@ -25,28 +25,29 @@ type streamWorker func(account *config.Account) (committed bool, err error)
 // client backs off coherently. See AWS "Using load shedding to avoid overload".
 //
 // Status of the adaptive-load-balancing work (A12):
-//   DONE — least-request default + AIMD concurrency, in-flight reservation with
-//     leak-safe Release, bounded admission wait + saturation shed, and the
-//     tokenRefreshFailure rotation sentinel. Dedicated unit tests cover all of
-//     these: LOR weighted selection + saturation skip, AIMD grow/shrink math,
-//     Acquire/Release accounting incl. decayCountersLocked preserving inflight,
-//     half-open single-probe recovery, ConcurrencyState (pool/least_request_test.go);
-//     saturation -> admission-wait -> shed and the token-refresh rotation path
-//     (proxy/failover_concurrency_test.go); strategy default + alias map
-//     (config/pool_strategy_test.go). Admin API accepts "least-request"; the
-//     Settings dropdown lists it as the default and the dashboard shows a live
-//     per-account in-flight/limit chip over the status WebSocket.
 //
-//   DEFERRED:
-//     - `go test -race`: needs a working cgo toolchain. CI runs it on Linux;
-//       the new concurrency paths are otherwise covered by the explicit
-//       Acquire/Release accounting tests above.
-//     - POOL-WIDE SHEDDING (optional next layer): the Google SRE adaptive-
-//       throttle reject probability p=max(0,(req-K*acc)/(req+1)) for when the
-//       WHOLE pool is saturated. Per-account AIMD + the bounded admission wait
-//       cover most of it; this would be the belt-and-suspenders layer.
-//     - LIVE VERIFICATION: confirm against the real account pool that the 429
-//       storm is gone under an ultracode parallel-agent burst.
+//	DONE — least-request default + AIMD concurrency, in-flight reservation with
+//	  leak-safe Release, bounded admission wait + saturation shed, and the
+//	  tokenRefreshFailure rotation sentinel. Dedicated unit tests cover all of
+//	  these: LOR weighted selection + saturation skip, AIMD grow/shrink math,
+//	  Acquire/Release accounting incl. decayCountersLocked preserving inflight,
+//	  half-open single-probe recovery, ConcurrencyState (pool/least_request_test.go);
+//	  saturation -> admission-wait -> shed and the token-refresh rotation path
+//	  (proxy/failover_concurrency_test.go); strategy default + alias map
+//	  (config/pool_strategy_test.go). Admin API accepts "least-request"; the
+//	  Settings dropdown lists it as the default and the dashboard shows a live
+//	  per-account in-flight/limit chip over the status WebSocket.
+//
+//	DEFERRED:
+//	  - `go test -race`: needs a working cgo toolchain. CI runs it on Linux;
+//	    the new concurrency paths are otherwise covered by the explicit
+//	    Acquire/Release accounting tests above.
+//	  - POOL-WIDE SHEDDING (optional next layer): the Google SRE adaptive-
+//	    throttle reject probability p=max(0,(req-K*acc)/(req+1)) for when the
+//	    WHOLE pool is saturated. Per-account AIMD + the bounded admission wait
+//	    cover most of it; this would be the belt-and-suspenders layer.
+//	  - LIVE VERIFICATION: confirm against the real account pool that the 429
+//	    storm is gone under an ultracode parallel-agent burst.
 //
 // 750ms is enough for a typical 3-4 poll cycles against saturationPollInterval
 // (100ms) under healthy load, while keeping a sustained-overload shed below
@@ -208,10 +209,9 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 // The wait is EVENT-DRIVEN: it blocks on the pool's ReleaseSignal (woken the
 // instant a concurrency slot frees) rather than sleeping a fixed poll interval,
 // so a freed slot is reused at wakeup latency instead of up to a full tick
-// later. A bounded fallback timer (saturationPollInterval) still ticks because a
-// RATE-paced account frees no slot on Release — its GCRA bucket refills on a
-// clock — so that recovery path must be re-checked on a timer. If the pool
-// exposes no signal channel, this degrades to pure polling.
+// later. A bounded fallback timer (saturationPollInterval) still ticks as a
+// safety net in case a wakeup is missed. If the pool exposes no signal channel,
+// this degrades to pure polling.
 func (h *Handler) acquireWithAdmissionWait(model string, tried map[string]bool) (*config.Account, time.Duration, bool) {
 	return h.acquireWithAdmissionWaitBackend("", model, tried)
 }

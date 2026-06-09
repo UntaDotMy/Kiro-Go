@@ -8,6 +8,7 @@ import (
 	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	"strconv"
 	"strings"
@@ -157,11 +158,20 @@ const maxFailoverAttempts = 3
 
 // saturationPollHint is the upper bound (inclusive) on a pool retryAfter that
 // the dispatcher treats as "busy, slot will free shortly" rather than "cooling,
-// come back later". It must be >= the pool's saturationPollInterval (100ms); a
+// come back later". It must be >= the pool's saturationPollInterval (25ms); a
 // retryAfter at or below this is polled within admissionWaitBudget, anything
-// larger is surfaced to the client immediately. Kept here (proxy package) to
-// avoid importing the pool's internal constant.
+// larger is surfaced to the client immediately. Kept here (proxy package) so the
+// dispatcher doesn't hard-depend on the pool's internal constant for its own
+// threshold value.
 const saturationPollHint = 250 * time.Millisecond
+
+// Compile-time invariant: the dispatcher's "wait for a freed slot" threshold
+// must be >= the value the pool actually returns on saturation. Converting the
+// difference to an unsigned constant fails the build if it goes negative (a
+// negative constant overflows uint) — far better than silently classifying
+// every saturated-pool return as a real cooldown and shedding immediately,
+// which would break the "wait until an account frees" contract.
+const _ = uint(saturationPollHint - pool.SaturationPollInterval)
 
 // tokenRefreshFailure tags a pre-commit token-refresh error so the failover
 // dispatcher rotates to a peer account without classifying it as an upstream

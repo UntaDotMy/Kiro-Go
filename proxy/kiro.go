@@ -11,7 +11,6 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
-	"kiro-go/pool"
 	"net"
 	"net/http"
 	"net/url"
@@ -211,12 +210,6 @@ const (
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
-
-// timingEnabled gates env-gated per-request latency decomposition logging
-// (KIRO_TIMING=1). Read once at startup; the per-request timing state itself is
-// kept in LOCAL variables (never package-level) so concurrent requests can't
-// race on it. Off by default = zero hot-path cost.
-var timingEnabled = os.Getenv("KIRO_TIMING") == "1"
 
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
@@ -653,69 +646,6 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		callback = &wrapped
 	}
 
-	// Per-request latency-decomposition state (KIRO_TIMING). LOCAL to this
-	// invocation so concurrent requests never race on it. callStart anchors both
-	// the TTFT measurement and headersMs so genGapMs = firstTokenMs - headersMs is
-	// internally consistent. The endpoint loop writes these; the recordTTFT
-	// closure reads them when the first token lands.
-	callStart := time.Now()
-	var timingHeadersMs float64
-	var timingEpTried int
-	var timing429 int
-	var timingEpName string
-
-	// Measure TIME-TO-FIRST-TOKEN for latency-aware "smart laning" selection.
-	// We record the elapsed time from request dispatch to the FIRST content
-	// callback (text or tool_use), per account, into the pool's TTFT EWMA. TTFT
-	// is the load-bearing latency signal (it reflects the account's queueing /
-	// warmth), unlike total completion time which is dominated by output length.
-	// The wrap fires the measurement exactly once per call via sync.Once, and
-	// only on a real account id, so it never double-counts across the multi-
-	// endpoint retry loop. Skipped for a nil account (tests / probes).
-	if account != nil && account.ID != "" && callback != nil {
-		acctID := account.ID
-		start := callStart
-		var ttftOnce sync.Once
-		recordTTFT := func() {
-			ttftOnce.Do(func() {
-				// Sub-millisecond resolution: time.Duration.Milliseconds() truncates
-				// to an integer, so a first token arriving in <1ms would yield 0 and
-				// be discarded by RecordTTFT's `ms <= 0` guard — losing the
-				// measurement for fast responses (and making every local-stub test
-				// record nothing). Divide by time.Millisecond to keep the fraction.
-				ms := float64(time.Since(start)) / float64(time.Millisecond)
-				pool.GetPool().RecordTTFT(acctID, ms)
-				// Env-gated latency decomposition. genGapMs = firstToken - headers,
-				// i.e. how long the UPSTREAM model took to produce the first token
-				// AFTER the connection was established — the part no proxy change can
-				// shrink except by routing to a faster identity. A large headersMs
-				// instead points at connect/throttle at the HTTP layer; endpointsTried
-				// > 1 / throttled > 0 means the endpoint chain burned round-trips
-				// before landing a 200.
-				if timingEnabled {
-					logger.Infof("[Timing] acct=%s firstTokenMs=%.0f headersMs=%.0f genGapMs=%.0f endpointsTried=%d throttled=%d endpoint=%s",
-						acctID, ms, timingHeadersMs, ms-timingHeadersMs, timingEpTried, timing429, timingEpName)
-				}
-			})
-		}
-		wrapped := *callback
-		if origText := callback.OnText; origText != nil {
-			wrapped.OnText = func(text string, isThinking bool) {
-				recordTTFT()
-				origText(text, isThinking)
-			}
-		} else {
-			wrapped.OnText = func(string, bool) { recordTTFT() }
-		}
-		if origTool := callback.OnToolUse; origTool != nil {
-			wrapped.OnToolUse = func(tu KiroToolUse) {
-				recordTTFT()
-				origTool(tu)
-			}
-		}
-		callback = &wrapped
-	}
-
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
@@ -750,10 +680,6 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 	}
 	var throttled []throttleHit
 	for _, ep := range endpoints {
-		if timingEnabled {
-			timingEpTried++
-			timingEpName = ep.Name
-		}
 		// Marshal lazily: first iteration always re-marshals (originPtr starts
 		// as whatever the caller supplied, typically ""), subsequent iterations
 		// only re-marshal if Origin actually changes.
@@ -828,9 +754,6 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 
 		if resp.StatusCode == 429 {
 			retryAfter := parseRetryAfter(resp.Header)
-			if timingEnabled {
-				timing429++
-			}
 			// Drain the body before Close so the underlying connection can be
 			// reused from the keep-alive pool for the next endpoint attempt.
 			// Cap at 64KiB — AWS throttling envelopes are <1KB; the limit
@@ -871,13 +794,6 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		// write to the client ResponseWriter and json.Marshal) — otherwise a
 		// panic would unwind past the inline cleanup and leak the connection and
 		// the context's supervisor goroutine.
-		if timingEnabled {
-			// client.Do() returns once response HEADERS are received, so "now" is
-			// the time-to-first-byte. firstTokenMs - this = pure upstream generation
-			// latency (the model thinking before its first token), which routing
-			// can only fix by choosing a faster identity.
-			timingHeadersMs = float64(time.Since(callStart)) / float64(time.Millisecond)
-		}
 		streamErr := func() error {
 			defer resp.Body.Close()
 			defer reqCancel()

@@ -341,26 +341,25 @@ type Config struct {
 	// PoolStrategy chooses how the account pool picks the next account for a
 	// request. Recognized values:
 	//
-	//   "fast" / ""      — 9router-style instant selection (DEFAULT). Picks an
-	//                      eligible account immediately by weight/priority
-	//                      (fill-first) or, with stickiness, stays on the current
-	//                      account for up to PoolStickyLimit consecutive requests
-	//                      before rotating to the least-recently-used peer. Does
-	//                      NOT reserve in-flight slots, gate admission, or pace the
-	//                      request rate — it relies purely on the reactive cooldown
-	//                      (429 -> exponential backoff) for throttle avoidance.
-	//                      This is the low-latency default: it avoids the
-	//                      admission-wait stall and AIMD/GCRA overhead that made
-	//                      least-request slow under light/interactive load.
+	//   "fast" / ""      — parallel-spread selection (DEFAULT). Each eligible
+	//                      account holds up to PoolFastConcurrency concurrent
+	//                      requests (the per-account "rotate number", default 1 =
+	//                      send-and-ack). A burst fans OUT across the least-loaded
+	//                      free accounts in parallel (like WiFi-7 multi-link), so
+	//                      4 requests across 4 free accounts each go to a distinct
+	//                      account at the same time instead of queueing on one.
+	//                      When EVERY eligible account is at its cap, the request
+	//                      WAITS for one to free (woken the instant a slot frees)
+	//                      and routes there. No cooldown gate and no AIMD limit on
+	//                      this path — an in-use account simply isn't picked until
+	//                      it frees. This is the low-latency default.
 	//   "least-request"  — least-outstanding-request. Picks the eligible account
 	//                      with the fewest in-flight requests (Envoy's weighted
 	//                      form: score = weight/(inflight+1)), and applies an AIMD
 	//                      per-account concurrency limit that grows on success and
-	//                      halves on a 429, plus a GCRA rate pacer and TTFT-aware
-	//                      scoring. Best for sustained bursty parallel load (agent
-	//                      fan-out) against per-identity rate limits. This is the
-	//                      only strategy that reserves in-flight slots and gates
-	//                      admission (so it can add latency under light load).
+	//                      halves on a 429, plus the soft-cooldown backoff. Best for
+	//                      sustained bursty parallel load against per-identity rate
+	//                      limits.
 	//   "swr"            — smooth weighted round-robin (legacy default).
 	//                      Balances assignment rate with predictable interleaving
 	//                      but is blind to concurrency, so a simultaneous burst
@@ -373,17 +372,20 @@ type Config struct {
 	//   "random"         — uniform random pick among eligible accounts.
 	//                      Cheap, jitter-friendly, useful as a control.
 	//
-	// All strategies obey cooldowns and model-list filters identically; only the
-	// picker among the eligible subset (and whether the AIMD gate applies)
-	// differs.
+	// The model-list filter applies to every strategy. The soft 429 cooldown is
+	// honored by all strategies EXCEPT "fast" (which routes purely by free
+	// capacity); the AIMD concurrency gate is least-request only.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
 
-	// PoolStickyLimit is the maximum number of consecutive requests the "fast"
-	// strategy keeps routing to the same account before rotating to the
-	// least-recently-used peer (9router's sticky-round-robin). 0 (the zero value)
-	// resolves to the built-in default (3). 1 disables stickiness (rotate every
-	// request). Ignored by every other strategy.
-	PoolStickyLimit int `json:"poolStickyLimit,omitempty"`
+	// PoolFastConcurrency is the per-account concurrent-request cap for the "fast"
+	// strategy — how many requests a single account handles at once before the
+	// next request fans out to another free account (and, when all are at the cap,
+	// waits for one to free). 1 (the practical default) means strict send-and-ack:
+	// one request per account at a time, so N concurrent requests spread across N
+	// accounts. 0 (the zero value) resolves to the built-in default (1). Raise it
+	// to let each account pipeline multiple requests. Ignored by every other
+	// strategy. (Supersedes the former PoolStickyLimit knob.)
+	PoolFastConcurrency int `json:"poolFastConcurrency,omitempty"`
 
 	// PoolInitialConcurrency and PoolMaxConcurrency tune the per-account adaptive
 	// concurrency limiter used by the least-request strategy. InitialConcurrency
@@ -528,7 +530,7 @@ type AccountInfo struct {
 
 // Version current version
 // Version current version
-const Version = "1.0.10-A23"
+const Version = "1.0.10-A24"
 
 var (
 	cfg     *Config
@@ -1586,10 +1588,11 @@ func GetPoolStrategy() string {
 		return "least-request"
 	default:
 		// "fast" is the production default: a 9router-style instant pick with no
-		// proactive concurrency/rate gating. It avoids the admission-wait stall
-		// and AIMD/GCRA pacing that made the least-request path slow under light
-		// load, while keeping the same reactive cooldown on a 429. Operators who
-		// want the adaptive concurrency limiter can still opt into "least-request".
+		// proactive concurrency gating. It avoids the admission-wait stall and the
+		// per-account concurrency-gate overhead that made the least-request path
+		// slow under light load, while keeping the same reactive cooldown on a 429.
+		// Operators who want the adaptive concurrency limiter can still opt into
+		// "least-request".
 		return "fast"
 	}
 }
@@ -1680,36 +1683,33 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
-// defaultPoolStickyLimit is the consecutive-use cap for the "fast" strategy's
-// sticky-round-robin when PoolStickyLimit is unset. Matches 9router's default
-// stickyRoundRobinLimit (3): keep a warm account for a few requests before
-// rotating, which preserves prompt-cache locality without pinning all traffic
-// to one identity.
-const defaultPoolStickyLimit = 3
+// defaultPoolFastConcurrency is the per-account concurrent-request cap for the
+// "fast" strategy when PoolFastConcurrency is unset. 1 = strict send-and-ack:
+// one request per account at a time, so concurrent requests fan out across
+// distinct free accounts rather than queueing on one.
+const defaultPoolFastConcurrency = 1
 
-// GetPoolStickyLimit returns the consecutive-use cap for the "fast" strategy,
-// resolving an unset (0) value — or cfg==nil before Init() — to the built-in
-// default (3). A value of 1 disables stickiness (rotate every request). Clamped
-// to a sane upper bound so a typo can't pin the pool to one account effectively
-// forever.
-func GetPoolStickyLimit() int {
+// GetPoolFastConcurrency returns the per-account concurrent cap for the "fast"
+// strategy, resolving an unset (0) value — or cfg==nil before Init() — to the
+// built-in default (1). Clamped to [1, 1000] so a typo can't disable the cap.
+func GetPoolFastConcurrency() int {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.PoolStickyLimit == 0 {
-		return defaultPoolStickyLimit
+	if cfg == nil || cfg.PoolFastConcurrency == 0 {
+		return defaultPoolFastConcurrency
 	}
-	return clampInt(cfg.PoolStickyLimit, 1, 1000)
+	return clampInt(cfg.PoolFastConcurrency, 1, 1000)
 }
 
-// UpdatePoolStickyLimit persists the "fast" strategy sticky-use cap. Pass 0 to
-// reset to the default. Caller should call pool.Reload() to apply mid-run.
-func UpdatePoolStickyLimit(limit int) error {
-	if limit != 0 && (limit < 1 || limit > 1000) {
-		return fmt.Errorf("sticky limit must be between 1 and 1000 (or 0 for default)")
+// UpdatePoolFastConcurrency persists the "fast" strategy per-account cap. Pass 0
+// to reset to the default (1). Caller should call pool.Reload() to apply mid-run.
+func UpdatePoolFastConcurrency(n int) error {
+	if n != 0 && (n < 1 || n > 1000) {
+		return fmt.Errorf("fast concurrency must be between 1 and 1000 (or 0 for default)")
 	}
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.PoolStickyLimit = limit
+	cfg.PoolFastConcurrency = n
 	return Save()
 }
 
