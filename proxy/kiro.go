@@ -562,7 +562,7 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		retryAfter time.Duration
 	}
 	var throttled []throttleHit
-	for _, ep := range endpoints {
+	for i, ep := range endpoints {
 		// Marshal lazily: first iteration always re-marshals (originPtr starts
 		// as whatever the caller supplied, typically ""), subsequent iterations
 		// only re-marshal if Origin actually changes.
@@ -646,8 +646,16 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 			reqCancel()
 			// Per-endpoint throttle is logged at INFO so the operator can see
 			// the chain progress without WARN-level noise. We only WARN once
-			// at the end if EVERY endpoint refused.
-			logger.Infof("[KiroAPI] Endpoint %s throttled (429, retry-after=%s) — trying next endpoint", ep.Name, retryAfter)
+			// at the end if EVERY endpoint refused. Only claim a "next endpoint"
+			// when one actually remains — the inference chain is a single host
+			// (Kiro Runtime) today, so saying "trying next endpoint" after the
+			// last (only) endpoint was misleading operators into thinking a
+			// fallback existed.
+			if i < len(endpoints)-1 {
+				logger.Infof("[KiroAPI] Endpoint %s throttled (429, retry-after=%s) — trying next endpoint", ep.Name, retryAfter)
+			} else {
+				logger.Infof("[KiroAPI] Endpoint %s throttled (429, retry-after=%s)", ep.Name, retryAfter)
+			}
 			throttled = append(throttled, throttleHit{name: ep.Name, retryAfter: retryAfter})
 			lastErr = &QuotaError{Endpoints: []string{ep.Name}, RetryAfter: retryAfter}
 			continue
@@ -723,10 +731,16 @@ type QuotaError struct {
 
 func (e *QuotaError) Error() string {
 	joined := strings.Join(e.Endpoints, "+")
+	// This is an HTTP 429 throttle, NOT monthly quota exhaustion (that is the
+	// 402 OVERAGE path, handled separately). The message keeps the literal
+	// "429" so the substring-fallback classifier in isRetryableUpstreamError /
+	// recordPoolError still treats a wrapped instance as a retryable rate-limit,
+	// while the wording no longer alarms operators into thinking the account's
+	// monthly allowance is gone for a routine, self-healing throttle.
 	if e.RetryAfter > 0 {
-		return fmt.Sprintf("quota exhausted on %s (retry after %s)", joined, e.RetryAfter)
+		return fmt.Sprintf("rate limited (HTTP 429) on %s (retry after %s)", joined, e.RetryAfter)
 	}
-	return fmt.Sprintf("quota exhausted on %s", joined)
+	return fmt.Sprintf("rate limited (HTTP 429) on %s", joined)
 }
 
 // parseRetryAfter reads the Retry-After header in either delta-seconds or
@@ -943,7 +957,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				if callback.OnContextUsage != nil {
-					callback.OnContextUsage(pct)
+					// Clamp at the parse source so every consumer's
+					// pct×window back-conversion is bounded: a malformed or
+					// saturated upstream value (>100, or negative) must not
+					// synthesize an input-token count larger than the window
+					// (which would push a client's context gauge past 100%).
+					// Consumers re-clamp defensively; clampPercent is idempotent.
+					callback.OnContextUsage(clampPercent(pct))
 				}
 			}
 		case "messageStopEvent", "messageStop":
@@ -1105,88 +1125,45 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	return inputTokens, outputTokens
 }
 
-// getContextWindowSize returns the context window size (in tokens) for a model.
-func getContextWindowSize(model string) int {
-	if isLargeContextModel(model) {
-		return 1_000_000
-	}
-	return 200_000
-}
+// defaultContextWindow is the context window assumed for a Claude model when we
+// have no authoritative figure from Kiro's ListAvailableModels. Every current
+// Claude model (Opus/Sonnet/Haiku 4.x) ships a 200K-token window by default;
+// the 1M window is a beta opt-in (context-1m header) that the upstream does NOT
+// advertise per model, so we must NOT assume it from a version number. The
+// authoritative non-default window (e.g. the beta 1M) is honored only when
+// Kiro's own tokenLimits.maxInputTokens reports it — see
+// Handler.contextWindowForModel — never as a guess derived from the model id.
+const defaultContextWindow = 200_000
 
-// isLargeContextModel reports whether a Claude model has the 1M-token context
-// window. Claude Opus/Sonnet/Haiku >= 4.6 (and any major >= 5) are 1M; earlier
-// versions are 200K.
+// getContextWindowSize returns the FALLBACK context window (in tokens) for a
+// model id when no authoritative upstream figure is available. It always
+// returns defaultContextWindow (200K).
 //
-// We version-PARSE rather than substring-match a fixed "4.6"/"4.7" list so new
-// minors (4.8, 4.9, 4.10) and majors (5.x) are classified correctly without a
-// code change. The previous fixed-list form under-reported 4.8+ as 200K — a ~5x
-// under-count of input tokens — even though our model router resolves those ids.
-// A substring fallback covers non-standard identifiers that don't parse cleanly.
-func isLargeContextModel(model string) bool {
-	m := strings.ToLower(model)
-	if major, minor, ok := parseClaudeVersion(m); ok {
-		if major > 4 {
-			return true
-		}
-		if major == 4 && minor >= 6 {
-			return true
-		}
-		return false
-	}
-	// Fallback for ids that don't match the family-version shape.
-	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
-		if strings.Contains(m, tag) {
-			return true
-		}
-	}
-	return false
+// IMPORTANT: this used to version-parse the id and return 1_000_000 for any
+// Claude >= 4.6. That was a fabricated guess: it made /v1/models advertise a 1M
+// window for sonnet-4.6 / opus-4.8 and made the pct×window input-token
+// back-conversion compute against 1M. A client (e.g. Claude Code) that derives
+// its auto-compaction threshold from the window then sets it near ~920K and
+// NEVER compacts in a normal session, while its usage gauge — fed by the exact
+// upstream input_tokens — sails past 100%. The authoritative per-model window
+// now comes from Kiro's ListAvailableModels.tokenLimits.maxInputTokens via
+// Handler.contextWindowForModel; this pure helper is only the safe fallback.
+func getContextWindowSize(model string) int {
+	return defaultContextWindow
 }
 
-// parseClaudeVersion extracts the major.minor version from a
-// "claude-<family>-<major>.<minor>" (dot or dash) id without a regexp
-// dependency. Returns ok=false if the id doesn't match that shape.
-func parseClaudeVersion(m string) (major, minor int, ok bool) {
-	const prefix = "claude-"
-	if !strings.HasPrefix(m, prefix) {
-		return 0, 0, false
+// clampPercent bounds a context-usage percentage to [0,100]. Kiro forwards its
+// own contextUsagePercentage verbatim; a malformed or saturated value (>100, or
+// negative from a bad frame) must never synthesize an input-token count outside
+// [0, window].
+func clampPercent(pct float64) float64 {
+	if pct < 0 {
+		return 0
 	}
-	rest := m[len(prefix):]
-	for _, fam := range []string{"opus", "sonnet", "haiku"} {
-		famPrefix := fam + "-"
-		if !strings.HasPrefix(rest, famPrefix) {
-			continue
-		}
-		ver := rest[len(famPrefix):]
-		// Locate the major/minor separator ('.' or '-').
-		sep := -1
-		for i := 0; i < len(ver); i++ {
-			if ver[i] == '.' || ver[i] == '-' {
-				sep = i
-				break
-			}
-		}
-		if sep < 1 {
-			return 0, 0, false
-		}
-		majStr := ver[:sep]
-		// Minor is the run of digits after the separator (stop at next non-digit).
-		rem := ver[sep+1:]
-		end := 0
-		for end < len(rem) && rem[end] >= '0' && rem[end] <= '9' {
-			end++
-		}
-		if end == 0 {
-			return 0, 0, false
-		}
-		minStr := rem[:end]
-		maj, errMaj := strconv.Atoi(majStr)
-		min, errMin := strconv.Atoi(minStr)
-		if errMaj != nil || errMin != nil {
-			return 0, 0, false
-		}
-		return maj, min, true
+	if pct > 100 {
+		return 100
 	}
-	return 0, 0, false
+	return pct
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {

@@ -171,7 +171,7 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}

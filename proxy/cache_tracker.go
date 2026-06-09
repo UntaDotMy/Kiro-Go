@@ -510,7 +510,50 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
+// reconcileCacheUsage caps the locally-estimated cache split so it can never
+// exceed the authoritative inputTokens total. The cache_read / cache_creation
+// figures come from a local prompt-cache estimator (promptCacheTracker.Compute)
+// that is decoupled from the exact upstream input count resolved by
+// resolveInputTokens. When the estimate overshoots — e.g. inputTokens=322495 but
+// cache_creation=444208, observed live — billedClaudeInputTokens floors to 0 AND
+// the emitted block (billed + cache_read + cache_creation) over-reports the true
+// total, so a client's running context tally drifts upward every turn.
+//
+// We restore the invariant billed + cache_read + cache_creation == inputTokens
+// by capping the components to fit the total, preferring to keep cache_read
+// (a concrete prefix match) over cache_creation (the "new this turn" estimate),
+// and rescaling the 5m/1h creation breakdown to the capped creation value.
+func reconcileCacheUsage(inputTokens int, usage promptCacheUsage) promptCacheUsage {
+	if inputTokens <= 0 {
+		return promptCacheUsage{}
+	}
+	read := usage.CacheReadInputTokens
+	if read > inputTokens {
+		read = inputTokens
+	}
+	creation := usage.CacheCreationInputTokens
+	if maxCreation := inputTokens - read; creation > maxCreation {
+		creation = maxCreation
+	}
+	c5, c1 := usage.CacheCreation5mInputTokens, usage.CacheCreation1hInputTokens
+	if sum := c5 + c1; sum > creation {
+		// Rescale the TTL breakdown proportionally so 5m+1h == capped creation.
+		// sum > creation >= 0 guarantees sum >= 1, so the division is safe.
+		c5 = creation * c5 / sum
+		c1 = creation - c5
+	}
+	return promptCacheUsage{
+		CacheCreationInputTokens:   creation,
+		CacheReadInputTokens:       read,
+		CacheCreation5mInputTokens: c5,
+		CacheCreation1hInputTokens: c1,
+	}
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+	if includeCache {
+		usage = reconcileCacheUsage(inputTokens, usage)
+	}
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
 		"output_tokens": outputTokens,

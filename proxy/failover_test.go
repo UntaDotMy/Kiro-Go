@@ -25,6 +25,7 @@ func TestIsRetryableUpstreamError(t *testing.T) {
 		{"nil", nil, false},
 		{"quota error type", &QuotaError{Endpoints: []string{"Kiro IDE"}, RetryAfter: time.Second}, true},
 		{"429 string", errors.New("HTTP 429 from Kiro IDE: throttled"), true},
+		{"rate-limited string", errors.New("rate limited (HTTP 429) on Kiro IDE"), true},
 		{"quota string", errors.New("quota exhausted on Kiro IDE"), true},
 		{"500", errors.New("HTTP 500 from Kiro IDE: internal"), true},
 		{"502", errors.New("HTTP 502 from Kiro IDE"), true},
@@ -176,4 +177,3 @@ func TestRunWithFailoverStopsOnTerminalError(t *testing.T) {
 		t.Fatalf("expected exactly 1 failure, got %d", got)
 	}
 }
-

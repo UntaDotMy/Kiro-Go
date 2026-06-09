@@ -45,13 +45,13 @@ const maxWebSearchRounds = 4
 
 // kiroRoundResult is what one collected (non-streamed) Kiro round produced.
 type kiroRoundResult struct {
-	content       string
-	thinking      string
-	toolUses      []KiroToolUse
-	inputTokens   int
-	outputTokens  int
-	credits       float64
-	stopReason    string
+	content      string
+	thinking     string
+	toolUses     []KiroToolUse
+	inputTokens  int
+	outputTokens int
+	credits      float64
+	stopReason   string
 }
 
 // runKiroCollect runs a single Kiro round against the pool with full failover,
@@ -89,7 +89,7 @@ func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (
 			OnComplete: func(inTok, outTok int) { out.inputTokens = inTok; out.outputTokens = outTok },
 			OnCredits:  func(c float64) { out.credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 			},
 			OnStopReason: func(r string) { out.stopReason = r },
 		}
