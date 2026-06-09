@@ -943,6 +943,7 @@
                         <button class="btn btn-secondary btn-sm" onclick="showExportModal()" data-i18n="accounts.export"></button>
                         <button class="btn btn-secondary btn-sm" onclick="showImportModal()" data-i18n="accounts.import"></button>
                         <button class="btn btn-secondary btn-sm" onclick="refreshAllModels()" data-i18n="models.refreshAll"></button>
+                        <button class="btn btn-secondary btn-sm" onclick="showAddProviderModal()">+ Provider</button>
                         <button class="btn btn-primary btn-sm" onclick="showModal('add')" data-i18n="accounts.add"></button>
                     </div>
                 </div>
@@ -1114,12 +1115,18 @@
                 <div class="form-group">
                     <label>Pool Strategy</label>
                     <select id="poolStrategy">
-                        <option value="least-request">Least-Request (default, best for bursts)</option>
+                        <option value="fast">Fast (default, lowest latency)</option>
+                        <option value="least-request">Least-Request (adaptive concurrency, best for sustained bursts)</option>
                         <option value="swr">Smooth Weighted Round-Robin</option>
                         <option value="least-used">Least-Used (drain freshest first)</option>
                         <option value="random">Random</option>
                     </select>
-                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. Least-request (default) steers each request to the least-busy account by outstanding in-flight requests and applies a per-account adaptive concurrency limit (grows on success, halves on a 429) — best for bursty parallel load like agent fan-out, where it stops the whole pool throttling at once. SWR is balanced rate-based rotation but blind to concurrency. Least-used tilts traffic toward less-burned accounts when the pool is heterogeneous. Random is a control or to break unintended request synchronisation.</small>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">How the pool picks the next account. Fast (default) picks an eligible account instantly — fill-first by weight, with optional stickiness for prompt-cache locality — and does NOT gate on concurrency or pace the request rate, so it has the lowest selection latency; it relies purely on the reactive cooldown (429 → exponential backoff) for throttle avoidance. Least-request steers each request to the least-busy account and applies a per-account adaptive concurrency limit (grows on success, halves on a 429) plus rate pacing — better for sustained heavy parallel load, at the cost of some added latency under light load. SWR is balanced rate-based rotation but blind to concurrency. Least-used tilts traffic toward less-burned accounts. Random is a control.</small>
+                </div>
+                <div class="form-group">
+                    <label>Sticky Limit (Fast strategy)</label>
+                    <input type="number" id="poolStickyLimit" min="1" max="1000" placeholder="3">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Fast strategy only. How many consecutive requests stay on the same account before rotating to the least-recently-used peer. Higher = better prompt-cache locality (fewer cold-cache hops) but less even spread; 1 = rotate every request (no stickiness). Empty/0 = default (3).</small>
                 </div>
                 <div class="form-group">
                     <label>Initial Concurrency / account</label>
@@ -3425,7 +3432,11 @@
             }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) {
-                stratEl.value = d.poolStrategy || 'least-request';
+                stratEl.value = d.poolStrategy || 'fast';
+            }
+            const stickyEl = document.getElementById('poolStickyLimit');
+            if (stickyEl) {
+                stickyEl.value = d.poolStickyLimit || '';
             }
             const initConcEl = document.getElementById('poolInitialConcurrency');
             if (initConcEl) {
@@ -3450,6 +3461,11 @@
             }
             const stratEl = document.getElementById('poolStrategy');
             if (stratEl) body.poolStrategy = stratEl.value;
+            const stickyEl = document.getElementById('poolStickyLimit');
+            if (stickyEl) {
+                const raw = (stickyEl.value || '').trim();
+                body.poolStickyLimit = raw === '' ? 0 : parseInt(raw, 10);
+            }
             const initConcEl = document.getElementById('poolInitialConcurrency');
             if (initConcEl) {
                 const raw = (initConcEl.value || '').trim();
@@ -3799,6 +3815,8 @@
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'local\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.localTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.localDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'credentials\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.credentialsTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.credentialsDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'cookie\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.cookieTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.cookieDesc') + '</div></div>' +
+                    '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'codex\')" onmouseover="this.style.borderColor=\'#3b82f6\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">OpenAI Codex (ChatGPT)</div><div style="font-size:13px;color:#64748b">Connect a ChatGPT/Codex account via OpenAI login, or paste an access token.</div></div>' +
+                    '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'qoder\')" onmouseover="this.style.borderColor=\'#ec4899\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">Qoder</div><div style="font-size:13px;color:#64748b">Connect a Qoder account via device login (opens qoder.com in your browser).</div></div>' +
                     '</div>' +
                     '<div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button></div>';
             } else if (type === 'builderid') {
@@ -3852,6 +3870,34 @@
                     '<div class="form-group"><label>Region</label><input type="text" id="iamRegion" value="us-east-1"></div>' +
                     '<div id="iamStep2" class="hidden"><div class="form-group"><label>' + t('iam.loginUrl') + '</label><div class="endpoint" style="margin-bottom:0"><span id="iamAuthUrl" style="font-size:11px"></span></div><div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'iamAuthUrl\').textContent,\'_blank\')">' + t('builderid.open') + '</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'iamAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div><p style="color:#16a34a;margin:12px 0;font-size:14px">' + t('iam.completeLogin') + '</p><div class="form-group"><label>' + t('iam.callbackUrl') + '</label><input type="text" id="iamCallback" placeholder="http://127.0.0.1:xxx/?code=..."></div></div>' +
                     '<div class="modal-footer"><button class="btn btn-secondary" onclick="showModal(\'add\')">' + t('common.back') + '</button><button class="btn btn-primary" id="iamBtn" onclick="startIamSso()">' + t('builderid.startLogin') + '</button></div>';
+            } else if (type === 'codex') {
+                title.textContent = 'OpenAI Codex (ChatGPT)';
+                body.innerHTML =
+                    '<p style="font-size:13px;color:#64748b;margin-bottom:16px">Connect a ChatGPT/Codex account. Browser login uses OpenAI on the fixed callback port 1455 (the same port the Codex CLI uses — make sure no Codex CLI login is running). Or paste an access/id token directly.</p>' +
+                    '<div id="codexStep1">' +
+                    '<div class="modal-footer" style="justify-content:flex-start;gap:8px"><button class="btn btn-secondary" onclick="showModal(\'add\')">' + t('common.back') + '</button><button class="btn btn-primary" onclick="startCodexLogin()">Login with OpenAI</button></div>' +
+                    '<div style="margin:16px 0;text-align:center;color:#94a3b8;font-size:12px">— or —</div>' +
+                    '<div class="form-group"><label>Paste Access / ID Token <span style="font-weight:normal;color:#64748b;font-size:12px">(optional)</span></label><textarea id="codexToken" placeholder="eyJ..." style="min-height:80px;font-family:monospace;font-size:12px"></textarea></div>' +
+                    '<div class="form-group"><label>Name <span style="font-weight:normal;color:#64748b;font-size:12px">(optional)</span></label><input type="text" id="codexName" placeholder="My ChatGPT account"></div>' +
+                    '<div class="modal-footer"><button class="btn btn-primary" onclick="importCodexToken()">' + t('common.add') + ' (token)</button></div>' +
+                    '</div>' +
+                    '<div id="codexStep2" class="hidden">' +
+                    '<div class="form-group"><label>Login URL</label><div class="endpoint" style="margin-bottom:0"><span id="codexAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'codexAuthUrl\').textContent,\'_blank\')">Open</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'codexAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div>' +
+                    '<p id="codexStatus" style="color:#64748b;margin:16px 0;font-size:13px;text-align:center">Waiting for you to authorize in the browser…</p>' +
+                    '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelCodexLogin()">' + t('common.cancel') + '</button></div>' +
+                    '</div>';
+            } else if (type === 'qoder') {
+                title.textContent = 'Qoder';
+                body.innerHTML =
+                    '<p style="font-size:13px;color:#64748b;margin-bottom:16px">Connect a Qoder account. Clicking "Login with Qoder" opens qoder.com in your browser; authorize there and this dialog completes automatically. Device tokens last ~30 days (re-login when expired).</p>' +
+                    '<div id="qoderStep1"><div class="modal-footer"><button class="btn btn-secondary" onclick="showModal(\'add\')">' + t('common.back') + '</button><button class="btn btn-primary" onclick="startQoderLogin()">Login with Qoder</button></div></div>' +
+                    '<div id="qoderStep2" class="hidden">' +
+                    '<div class="form-group"><label>Login URL</label><div class="endpoint" style="margin-bottom:0"><span id="qoderAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'qoderAuthUrl\').textContent,\'_blank\')">Open</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'qoderAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div>' +
+                    '<p id="qoderStatus" style="color:#64748b;margin:16px 0;font-size:13px;text-align:center">Waiting for you to authorize in the browser…</p>' +
+                    '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelQoderLogin()">' + t('common.cancel') + '</button></div>' +
+                    '</div>';
             }
             modal.classList.add('active');
         }
@@ -3860,6 +3906,160 @@
             iamSession = '';
             if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
             builderIdSession = '';
+            if (typeof codexPollTimer !== 'undefined' && codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
+            if (typeof codexSessionId !== 'undefined') { codexSessionId = ''; }
+            if (typeof qoderPollTimer !== 'undefined' && qoderPollTimer) { clearTimeout(qoderPollTimer); qoderPollTimer = null; }
+            if (typeof qoderSessionId !== 'undefined') { qoderSessionId = ''; }
+        }
+        // Add a non-Kiro provider account. Two shapes:
+        //   - a named built-in provider (Groq, OpenAI, DeepSeek, ...) — just an
+        //     API key; base URL and dialect are known.
+        //   - "Custom (OpenAI/Anthropic/Gemini-compatible)" — paste an API BASE
+        //     URL (e.g. https://api.example.com/v1) + key; we derive
+        //     /chat/completions and /models from it and fetch the model list on
+        //     add. This is NOT the Kiro account schema.
+        async function showAddProviderModal() {
+            const modal = document.getElementById('addModal');
+            const title = document.getElementById('modalTitle');
+            const body = document.getElementById('modalBody');
+            title.textContent = 'Add Provider Account';
+            body.innerHTML = '<p style="font-size:13px;color:#64748b;margin-bottom:12px">Loading providers…</p>';
+            modal.classList.add('active');
+            let cat = [];
+            try {
+                const res = await fetch('/admin/api/providers/catalog', { headers: { 'X-Admin-Password': password } });
+                const d = await res.json();
+                cat = (d.providers || []).filter(p => p.authType === 'apikey');
+            } catch (e) { /* fall through to empty */ }
+            const builtinOpts = cat.map(p => '<option value="' + p.id + '" data-dialect="' + p.dialect + '">' + (p.name || p.id) + ' (' + p.dialect + ')</option>').join('');
+            const opts = builtinOpts + '<option value="custom">➕ Custom (OpenAI / Anthropic / Gemini compatible)</option>';
+            body.innerHTML =
+                '<p style="font-size:13px;color:#64748b;margin-bottom:16px">Add any API-key provider. Models route with a <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px">provider/model</code> prefix (e.g. <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px">groq/llama-3.3-70b</code>). Pick <b>Custom</b> to bring your own OpenAI-compatible endpoint by base URL — its models are fetched automatically. OAuth providers (Codex, Qoder) use their own connect flow.</p>' +
+                '<div class="form-group"><label>Provider</label><select id="provBackend" onchange="onProvBackendChange()">' + opts + '</select></div>' +
+                '<div id="provCustomFields" class="hidden">' +
+                '  <div class="form-group"><label>Display Name</label><input type="text" id="provCustomName" placeholder="My LLM Gateway"></div>' +
+                '  <div class="form-group"><label>API Base URL <span style="font-weight:normal;color:#64748b;font-size:12px">(not the /chat/completions URL — just the base)</span></label><input type="text" id="provCustomBase" placeholder="https://api.example.com/v1"></div>' +
+                '  <div class="form-group"><label>Dialect</label><select id="provCustomDialect"><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic-compatible</option><option value="gemini">Gemini</option></select></div>' +
+                '  <div class="form-group"><label>Route Prefix <span style="font-weight:normal;color:#64748b;font-size:12px">(optional; defaults to a slug of the name)</span></label><input type="text" id="provCustomAlias" placeholder="mygw"></div>' +
+                '</div>' +
+                '<div class="form-group"><label>API Key</label><input type="password" id="provApiKey" placeholder="sk-..."></div>' +
+                '<div class="form-group" id="provNameRow"><label>Name <span style="font-weight:normal;color:#64748b;font-size:12px">(optional)</span></label><input type="text" id="provName" placeholder="My Groq key"></div>' +
+                '<div id="provAddStatus" style="font-size:13px;color:#64748b;margin:8px 0;min-height:18px"></div>' +
+                '<div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button><button class="btn btn-primary" id="provAddBtn" onclick="submitProviderAccount()">' + t('common.add') + '</button></div>';
+            onProvBackendChange();
+        }
+        function onProvBackendChange() {
+            const sel = document.getElementById('provBackend');
+            if (!sel) return;
+            const isCustom = sel.value === 'custom';
+            const custom = document.getElementById('provCustomFields');
+            const nameRow = document.getElementById('provNameRow');
+            if (custom) custom.classList.toggle('hidden', !isCustom);
+            // The generic "Name" field is redundant for custom (it has its own
+            // Display Name), so hide it there.
+            if (nameRow) nameRow.classList.toggle('hidden', isCustom);
+        }
+        async function submitProviderAccount() {
+            const backend = document.getElementById('provBackend').value;
+            const apiKey = document.getElementById('provApiKey').value.trim();
+            if (!backend) { alert('Pick a provider'); return; }
+            if (!apiKey) { alert('API key is required'); return; }
+            const payload = { backend, apiKey };
+            if (backend === 'custom') {
+                payload.name = document.getElementById('provCustomName').value.trim();
+                payload.baseURL = document.getElementById('provCustomBase').value.trim();
+                payload.dialect = document.getElementById('provCustomDialect').value;
+                payload.alias = document.getElementById('provCustomAlias').value.trim();
+                if (!payload.baseURL) { alert('API Base URL is required for a custom provider'); return; }
+            } else {
+                payload.name = document.getElementById('provName').value.trim();
+            }
+            const btn = document.getElementById('provAddBtn');
+            const statusEl = document.getElementById('provAddStatus');
+            if (btn) { btn.disabled = true; btn.textContent = 'Adding…'; }
+            if (statusEl) statusEl.textContent = 'Adding account and fetching models…';
+            try {
+                const res = await fetch('/admin/api/providers/account', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify(payload)
+                });
+                const d = await res.json();
+                if (d.success) {
+                    if (statusEl) statusEl.textContent = 'Added — ' + (d.modelCount || 0) + ' models found.';
+                    setTimeout(() => { closeModal(); loadAccounts(); }, 600);
+                } else {
+                    if (btn) { btn.disabled = false; btn.textContent = t('common.add'); }
+                    if (statusEl) statusEl.textContent = '';
+                    alert(d.error || 'Failed to add provider account');
+                }
+            } catch (e) {
+                if (btn) { btn.disabled = false; btn.textContent = t('common.add'); }
+                if (statusEl) statusEl.textContent = '';
+                alert('Failed to add provider account');
+            }
+        }
+        let codexPollTimer = null;
+        let codexSessionId = '';
+        async function startCodexLogin() {
+            const res = await fetch('/admin/api/auth/codex/start', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: '{}' });
+            const d = await res.json();
+            if (!res.ok || d.error) { alert(d.error || 'Failed to start Codex login'); return; }
+            codexSessionId = d.sessionId;
+            document.getElementById('codexStep1').classList.add('hidden');
+            document.getElementById('codexStep2').classList.remove('hidden');
+            document.getElementById('codexAuthUrl').textContent = d.authUrl;
+            window.open(d.authUrl, '_blank');
+            pollCodexLogin();
+        }
+        async function pollCodexLogin() {
+            if (!codexSessionId) return;
+            try {
+                const res = await fetch('/admin/api/auth/codex/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify({ sessionId: codexSessionId }) });
+                const d = await res.json();
+                if (d.status === 'completed') { cancelCodexLogin(); closeModal(); loadAccounts(); return; }
+                if (d.status === 'error') { document.getElementById('codexStatus').textContent = 'Error: ' + (d.error || 'login failed'); return; }
+            } catch (e) { /* keep polling */ }
+            codexPollTimer = setTimeout(pollCodexLogin, 2000);
+        }
+        function cancelCodexLogin() {
+            if (codexPollTimer) { clearTimeout(codexPollTimer); codexPollTimer = null; }
+            codexSessionId = '';
+        }
+        async function importCodexToken() {
+            const accessToken = document.getElementById('codexToken').value.trim();
+            const name = document.getElementById('codexName').value.trim();
+            if (!accessToken) { alert('Paste an access/id token, or use Login with OpenAI'); return; }
+            const res = await fetch('/admin/api/auth/codex/token', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify({ accessToken, name }) });
+            const d = await res.json();
+            if (d.success) { closeModal(); loadAccounts(); } else { alert(d.error || 'Failed to add Codex account'); }
+        }
+        let qoderPollTimer = null;
+        let qoderSessionId = '';
+        async function startQoderLogin() {
+            const res = await fetch('/admin/api/auth/qoder/start', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: '{}' });
+            const d = await res.json();
+            if (!res.ok || d.error) { alert(d.error || 'Failed to start Qoder login'); return; }
+            qoderSessionId = d.sessionId;
+            document.getElementById('qoderStep1').classList.add('hidden');
+            document.getElementById('qoderStep2').classList.remove('hidden');
+            document.getElementById('qoderAuthUrl').textContent = d.authUrl;
+            window.open(d.authUrl, '_blank');
+            pollQoderLogin();
+        }
+        async function pollQoderLogin() {
+            if (!qoderSessionId) return;
+            try {
+                const res = await fetch('/admin/api/auth/qoder/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify({ sessionId: qoderSessionId }) });
+                const d = await res.json();
+                if (d.status === 'completed') { cancelQoderLogin(); closeModal(); loadAccounts(); return; }
+                if (d.status === 'error') { document.getElementById('qoderStatus').textContent = 'Error: ' + (d.error || 'login failed'); return; }
+            } catch (e) { /* keep polling */ }
+            qoderPollTimer = setTimeout(pollQoderLogin, 2000);
+        }
+        function cancelQoderLogin() {
+            if (qoderPollTimer) { clearTimeout(qoderPollTimer); qoderPollTimer = null; }
+            qoderSessionId = '';
         }
         function loadLocalFile(input, targetId) {
             const file = input.files[0];
@@ -4710,9 +4910,18 @@
                     '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
                     '</div>';
 
+                const backend = (a.backend || 'kiro');
+                const isProviderAcct = backend !== 'kiro';
+                // For Kiro accounts keep the existing IdP-method badge; for a
+                // provider account show the backend + how many models it serves.
+                const idMeta = isProviderAcct
+                    ? '<span class="badge badge-info" title="Upstream provider">' + backend + '</span>' +
+                      (a.modelCount ? '<span class="badge badge-success" title="Models fetched from this provider">' + a.modelCount + ' models</span>' : '<span class="badge badge-warning" title="No models cached yet — refresh or send a request">no models</span>')
+                    : '<span class="badge badge-info">' + formatAuthMethod(a.provider || a.authMethod) + '</span>';
+
                 return '<tr class="' + rowCls.trim() + '">' +
                     '<td><input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="toggleSelectAccount(\'' + a.id + '\')" style="cursor:pointer;width:15px;height:15px"></td>' +
-                    '<td><div class="acct-email">' + getDisplayEmail(a.email, a.id) + '</div><div class="row-meta"><span class="badge badge-info">' + formatAuthMethod(a.provider || a.authMethod) + '</span></div></td>' +
+                    '<td><div class="acct-email">' + getDisplayEmail(a.email || a.nickname, a.id) + '</div><div class="row-meta">' + idMeta + '</div></td>' +
                     '<td><div class="row-meta">' + metaBadges + '</div></td>' +
                     '<td>' + usageCell + '</td>' +
                     '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +

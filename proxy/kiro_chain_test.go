@@ -11,19 +11,24 @@ import (
 )
 
 // Replaces the endpoint chain with httptest URLs for the duration of a
-// test, then restores the original list. Each replacement preserves the
-// original Origin field (the upstream cares about it; httptest itself
-// does not).
+// test, then restores the original list. Builds exactly len(urls) synthetic
+// endpoints so a test can drive an N-endpoint failover chain regardless of how
+// many endpoints the production region chain currently declares — the tests
+// here exercise the failover MECHANISM, not the specific production host set.
 func swapKiroEndpoints(t *testing.T, urls []string) {
 	t.Helper()
-	defaults := kiroEndpointsForRegion("us-east-1")
-	if len(urls) != len(defaults) {
-		t.Fatalf("swapKiroEndpoints expected %d urls, got %d", len(defaults), len(urls))
+	if len(urls) == 0 {
+		t.Fatalf("swapKiroEndpoints requires at least one url")
 	}
-	override := make([]kiroEndpoint, len(defaults))
-	copy(override, defaults)
-	for i := range override {
-		override[i].URL = urls[i]
+	// Seed each synthetic endpoint from the real chain's entry at the same index
+	// (cycling if the test asks for more than the chain declares) so Origin /
+	// AmzTarget stay realistic; only the URL is swapped to the httptest server.
+	defaults := kiroEndpointsForRegion("us-east-1")
+	override := make([]kiroEndpoint, len(urls))
+	for i, u := range urls {
+		base := defaults[i%len(defaults)]
+		base.URL = u
+		override[i] = base
 	}
 	prev := kiroEndpointsOverride
 	kiroEndpointsOverride = override

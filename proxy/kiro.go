@@ -45,29 +45,33 @@ var kiroEndpointsOverride []kiroEndpoint
 // per-account loop in CallKiroAPI tries each endpoint before surfacing a
 // QuotaError.
 //
-// Region defaults to us-east-1 if empty. Per research against jwadow
-// kiro-gateway issue #58 and source, the endpoint set is region-specific:
-//
-//   - "https://q.<region>.amazonaws.com/generateAssistantResponse"
-//     Works in us-east-1, eu-west-1, eu-central-1, and likely other Q
-//     Developer regions. Default Kiro IDE target.
-//
-//   - "https://codewhisperer.<region>.amazonaws.com/generateAssistantResponse"
-//     **Only resolves in us-east-1** — the codewhisperer.* hostname
-//     returns NXDOMAIN in every other region (jwadow #58). We skip this
-//     entry outside us-east-1 so we don't burn a network round-trip on
-//     a guaranteed DNS failure.
+// Region defaults to us-east-1 if empty. Per Kiro's published firewall
+// allowlist (https://kiro.dev/docs/privacy-and-security/firewalls/) the
+// CURRENT "Kiro service" inference host is runtime.<region>.kiro.dev, and
+// the q.<region>.amazonaws.com endpoints are documented there as LEGACY and
+// "will be deprecated in a future release." We therefore LEAD with the
+// runtime host and keep the legacy AWS endpoints as reactive 429/error
+// fallback (NOT removed — the operator asked to keep the legacy endpoint
+// reachable). The chain, in preference order:
 //
 //   - "https://runtime.<region>.kiro.dev/generateAssistantResponse"
-//     Universal Kiro runtime hostname used by jwadow as a regional
-//     replacement for codewhisperer.*. Works in any region where Kiro
-//     is provisioned. We append this for non-us-east-1 regions so the
-//     three-endpoint chain stays full-length.
+//     PRIMARY. The modern Kiro runtime host; the only one the firewall doc
+//     lists as the active "Kiro service". Resolves in every region Kiro is
+//     provisioned in.
+//
+//   - "https://q.<region>.amazonaws.com/generateAssistantResponse"
+//     LEGACY (kept as fallback). The previous Kiro IDE default; no
+//     X-Amz-Target. Still works today, deprecation pending.
+//
+//   - "https://codewhisperer.<region>.amazonaws.com/generateAssistantResponse"
+//     LEGACY (kept, us-east-1 ONLY). The codewhisperer.* hostname returns
+//     NXDOMAIN in every other region (jwadow #58), so it's appended only
+//     for us-east-1.
 //
 //   - q.<region>.amazonaws.com again with X-Amz-Target=AmazonQDeveloper-
-//     StreamingService.SendMessage.
+//     StreamingService.SendMessage. LEGACY (kept).
 //
-// All three are tried per-request with auto-fallback on 429.
+// All are tried per-request with auto-fallback on 429.
 func kiroEndpointsForRegion(region string) []kiroEndpoint {
 	if kiroEndpointsOverride != nil {
 		out := make([]kiroEndpoint, len(kiroEndpointsOverride))
@@ -78,44 +82,54 @@ func kiroEndpointsForRegion(region string) []kiroEndpoint {
 		region = "us-east-1"
 	}
 	endpoints := []kiroEndpoint{
+		// PRIMARY: the current Kiro runtime service host.
 		{
-			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "",
-			Name:      "Kiro IDE",
-		},
-	}
-	if region == "us-east-1" {
-		// codewhisperer.* only resolves in us-east-1.
-		endpoints = append(endpoints, kiroEndpoint{
-			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-			Name:      "CodeWhisperer",
-		})
-	} else {
-		// Use the runtime.<region>.kiro.dev hostname as the regional
-		// replacement for codewhisperer.*.
-		endpoints = append(endpoints, kiroEndpoint{
 			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
 			Origin:    "AI_EDITOR",
 			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			Name:      "Kiro Runtime",
+		},
+		// LEGACY (kept as fallback): the previous Kiro IDE default, no X-Amz-Target.
+		{
+			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "",
+			Name:      "Kiro IDE (legacy)",
+		},
+	}
+	if region == "us-east-1" {
+		// LEGACY (kept): codewhisperer.* only resolves in us-east-1.
+		endpoints = append(endpoints, kiroEndpoint{
+			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "CodeWhisperer (legacy)",
 		})
 	}
 	endpoints = append(endpoints, kiroEndpoint{
 		URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
 		Origin:    "AI_EDITOR",
 		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-		Name:      "AmazonQ",
+		Name:      "AmazonQ (legacy)",
 	})
 	return endpoints
 }
 
-// kiroRESTBaseForRegion returns the REST base URL for usage / profile
-// queries in a specific region. us-east-1 uses codewhisperer.<region>;
-// other regions fall back to runtime.<region>.kiro.dev because the
-// codewhisperer.* hostname doesn't resolve outside us-east-1.
+// kiroRESTBaseForRegion returns the REST base URL for the account-MANAGEMENT
+// calls (getUsageLimits / GetUserInfo / ListAvailableModels /
+// ListAvailableProfiles). These are AWS CodeWhisperer/Q API actions served by
+// the amazonaws.com hosts — NOT by runtime.<region>.kiro.dev, which only serves
+// the inference action (generateAssistantResponse). us-east-1 therefore uses
+// codewhisperer.us-east-1.amazonaws.com; other regions use
+// runtime.<region>.kiro.dev only because codewhisperer.* returns NXDOMAIN
+// outside us-east-1 (best-effort there).
+//
+// NOTE: this intentionally does NOT follow the streaming chain onto
+// runtime.us-east-1.kiro.dev. Pointing these REST paths at the runtime host
+// breaks account refresh (the host 4xxs the management paths), and unlike the
+// streaming chain the REST callers have no fallback. The firewall allowlist's
+// "Kiro service" = runtime host applies to inference traffic, which IS routed
+// there (see kiroEndpointsForRegion); the management API is a separate surface.
 func kiroRESTBaseForRegion(region string) string {
 	if region == "" {
 		region = "us-east-1"
@@ -546,29 +560,54 @@ func getSortedEndpoints(preferred string, account *config.Account) []kiroEndpoin
 
 // sortRegionalEndpoints orders one region's endpoints by the preferred
 // service target, then any others. Returns just the preferred entry when
-// fallback is disabled.
+// fallback is disabled. The primary is resolved by MATCHING the endpoint's
+// identity (not a hardcoded index), so it stays correct regardless of the
+// chain order:
+//
+//   - "kiro"          → the modern Kiro Runtime host (runtime.<region>.kiro.dev).
+//   - "codewhisperer" → the CodeWhisperer endpoint when present (us-east-1),
+//     else the runtime host (it carries the same
+//     GenerateAssistantResponse target outside us-east-1).
+//   - "amazonq"       → the AmazonQ SendMessage endpoint.
+//   - "auto" / other  → declared order (runtime first), all reactive 429-only.
 func sortRegionalEndpoints(endpoints []kiroEndpoint, preferred string, fallback bool) []kiroEndpoint {
-	var primary int
+	if len(endpoints) == 0 {
+		return endpoints
+	}
+
+	// findByName returns the first index whose Name contains sub, or -1.
+	findByName := func(sub string) int {
+		for i, ep := range endpoints {
+			if strings.Contains(ep.Name, sub) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	primary := -1
 	switch preferred {
 	case "kiro":
-		primary = 0
+		primary = findByName("Kiro Runtime")
 	case "codewhisperer":
-		// Position 1 is CodeWhisperer-style (or the regional Kiro Runtime
-		// replacement) regardless of region.
-		primary = 1
+		if i := findByName("CodeWhisperer"); i >= 0 {
+			primary = i
+		} else {
+			primary = findByName("Kiro Runtime") // regional equivalent
+		}
 	case "amazonq":
-		primary = 2
+		primary = findByName("AmazonQ")
 	default:
-		// "auto" — try in declared order. A healthy request always
-		// executes endpoint[0] (Kiro IDE generateAssistantResponse, no
-		// X-Amz-Target); endpoints 1/2 stay REACTIVE 429-only fallback.
-		// This keeps a single, consistent service action per request
-		// rather than rotating the X-Amz-Target every call.
+		// "auto" — try in declared order. A healthy request always executes
+		// endpoint[0] (the Kiro Runtime host, now the primary per the firewall
+		// allowlist); the legacy endpoints stay REACTIVE 429-only fallback. This
+		// keeps a single, consistent service action per request rather than
+		// rotating the X-Amz-Target every call.
 		out := make([]kiroEndpoint, len(endpoints))
 		copy(out, endpoints)
 		return out
 	}
-	if primary >= len(endpoints) {
+	if primary < 0 || primary >= len(endpoints) {
 		primary = 0
 	}
 	if !fallback {

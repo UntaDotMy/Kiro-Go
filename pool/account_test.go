@@ -221,8 +221,11 @@ func TestRecordErrorTieredCooldown(t *testing.T) {
 	if upper > softCooldownMax {
 		upper = softCooldownMax
 	}
-	if d1 < retryAfterMin-time.Second || d1 > upper+time.Second {
-		t.Fatalf("1st cooldown should land in [%s, %s], got %s", retryAfterMin, upper, d1)
+	// RecordError adds up to cooldownExpiryJitter of anti-stampede jitter on top
+	// of the computed backoff, so the realized cooldown can exceed `upper` by that
+	// much (plus a ±1s slop for time elapsed in the call).
+	if d1 < retryAfterMin-time.Second || d1 > upper+cooldownExpiryJitter+time.Second {
+		t.Fatalf("1st cooldown should land in [%s, %s], got %s", retryAfterMin, upper+cooldownExpiryJitter, d1)
 	}
 
 	// Many consecutive errors: cooldown ceiling grows but is clamped at softCooldownMax.
@@ -230,7 +233,8 @@ func TestRecordErrorTieredCooldown(t *testing.T) {
 		p.RecordError("a", true, 0)
 	}
 	dN := p.CooldownRemaining("a")
-	if dN > softCooldownMax+time.Second {
+	// Clamped at softCooldownMax, plus the same anti-stampede jitter on top.
+	if dN > softCooldownMax+cooldownExpiryJitter+time.Second {
 		t.Fatalf("cooldown should be clamped at %s, got %s", softCooldownMax, dN)
 	}
 }

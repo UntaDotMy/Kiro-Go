@@ -95,6 +95,15 @@ func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamW
 	return h.runWithFailoverCounted(model, apiKeyID, effort, worker, true)
 }
 
+// runWithFailoverBackend is the backend-scoped variant: failover and account
+// selection are restricted to accounts whose resolved backend matches. A "" or
+// "kiro" backend behaves exactly as runWithFailover did before this phase. Used
+// by the inference handlers once they resolve the request's backend from the
+// model string.
+func (h *Handler) runWithFailoverBackend(backend, model, apiKeyID, effort string, worker streamWorker) (committed bool, retryAfter time.Duration, err error) {
+	return h.runWithFailoverCountedBackend(backend, model, apiKeyID, effort, worker, true)
+}
+
 // runWithFailoverCounted is the implementation behind runWithFailover. When
 // countGlobalFailure is false, the terminal "all attempts failed" path does NOT
 // bump the global failed-request counter — used by the agentic loops
@@ -104,6 +113,13 @@ func (h *Handler) runWithFailover(model, apiKeyID, effort string, worker streamW
 // loop's own once-per-request success bump. Per-account cooldown bookkeeping
 // (recordAttemptError, inside the worker) runs regardless and is always correct.
 func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker streamWorker, countGlobalFailure bool) (committed bool, retryAfter time.Duration, err error) {
+	return h.runWithFailoverCountedBackend("", model, apiKeyID, effort, worker, countGlobalFailure)
+}
+
+// runWithFailoverCountedBackend is the backend-scoped implementation. backend ==
+// "" means "no constraint" (legacy behavior — every account is eligible). All
+// account selection goes through the backend-scoped reserving picker.
+func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort string, worker streamWorker, countGlobalFailure bool) (committed bool, retryAfter time.Duration, err error) {
 	tried := make(map[string]bool, maxFailoverAttempts)
 	var lastErr error
 	var lastRetryAfter time.Duration
@@ -119,7 +135,7 @@ func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker 
 	}
 
 	for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
-		account, poolRetryAfter, ok := h.acquireWithAdmissionWait(model, tried)
+		account, poolRetryAfter, ok := h.acquireWithAdmissionWaitBackend(backend, model, tried)
 		if !ok {
 			// No (more) eligible accounts. If the pool is merely cooling or
 			// saturated, surface the soonest recovery hint; otherwise it's a
@@ -197,10 +213,17 @@ func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker 
 // clock — so that recovery path must be re-checked on a timer. If the pool
 // exposes no signal channel, this degrades to pure polling.
 func (h *Handler) acquireWithAdmissionWait(model string, tried map[string]bool) (*config.Account, time.Duration, bool) {
+	return h.acquireWithAdmissionWaitBackend("", model, tried)
+}
+
+// acquireWithAdmissionWaitBackend is the backend-scoped admission wait. backend
+// == "" means no constraint (legacy). It uses the backend-scoped reserving
+// picker so selection + the bounded wait both honor the provider scope.
+func (h *Handler) acquireWithAdmissionWaitBackend(backend, model string, tried map[string]bool) (*config.Account, time.Duration, bool) {
 	deadline := time.Now().Add(admissionWaitBudget)
 	releaseCh := h.pool.ReleaseSignal()
 	for {
-		account, retryAfter, ok := h.pool.AcquireForModelExcluding(model, tried)
+		account, retryAfter, ok := h.pool.AcquireForBackendModelExcluding(backend, model, tried)
 		if ok {
 			return account, 0, true
 		}

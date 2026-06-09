@@ -333,12 +333,12 @@ func NewHandler() *Handler {
 		totalCredits = t.Credits
 	}
 	h := &Handler{
-		pool:            pool.GetPool(),
-		totalRequests:   int64(totalReq),
-		successRequests: int64(successReq),
-		failedRequests:  int64(failedReq),
-		totalTokens:     int64(totalTokens),
-		totalCredits:    totalCredits,
+		pool:                pool.GetPool(),
+		totalRequests:       int64(totalReq),
+		successRequests:     int64(successReq),
+		failedRequests:      int64(failedReq),
+		totalTokens:         int64(totalTokens),
+		totalCredits:        totalCredits,
 		startTime:           time.Now().Unix(),
 		stopRefresh:         make(chan struct{}),
 		stopStatsSaver:      make(chan struct{}),
@@ -525,6 +525,15 @@ func (h *Handler) refreshAllAccounts() {
 					logger.Errorf("[BackgroundRefresh] worker panic for %s: %v", account.Email, r)
 				}
 			}()
+
+			// Non-Kiro accounts don't use the AWS token-refresh + RefreshAccountInfo
+			// path (those call AWS endpoints and parse AWS-shaped JSON). Route them
+			// through their provider instead: refresh credentials via the provider,
+			// and for Codex poll the usage windows so quota-based routing stays fresh.
+			if config.GetAccountBackend(account) != "kiro" {
+				h.backgroundRefreshNonKiro(account)
+				return
+			}
 
 			// 检查 token 是否需要刷新
 			// Use the wider background skew (not the on-request 120s) so an idle
@@ -1336,7 +1345,12 @@ func (h *Handler) refreshModelsCache() {
 				results[i] = accountResult{account: account, err: fmt.Errorf("token refresh failed: %w", err)}
 				return
 			}
-			models, err := ListAvailableModels(account)
+			prov, perr := ProviderForOrErr(account)
+			if perr != nil {
+				results[i] = accountResult{account: account, err: perr}
+				return
+			}
+			models, err := prov.ListModels(account)
 			if err != nil {
 				results[i] = accountResult{account: account, err: err}
 				return
@@ -1415,7 +1429,11 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
-	models, err := ListAvailableModels(account)
+	prov, err := ProviderForOrErr(account)
+	if err != nil {
+		return err
+	}
+	models, err := prov.ListModels(account)
 	if err != nil {
 		return err
 	}
@@ -1763,6 +1781,35 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// matchedKeyID was resolved above (before the web-search branch) and is
 	// reused here for the per-key success debit on the normal path.
 
+	// Resolve the request's provider backend from the model string
+	// ("groq/llama-3.3", "or/...", or an unprefixed Kiro model). For Kiro the
+	// backend is "kiro" and routing/translation are byte-identical to before.
+	reqBackend, upstreamModel := ParseModelBackend(req.Model)
+
+	// poolModel is the id the pool's per-account model filter matches against.
+	// For Kiro it's the MAPPED upstream id (actualModel) the model cache stores;
+	// for a non-Kiro backend it's the DE-PREFIXED upstream id (e.g. the account's
+	// live /models entry "llama-3.3-70b", not the routed "groq/llama-3.3-70b").
+	// Passing the prefixed id here would never match a fetched catalog and shed
+	// the request as "no available accounts".
+	poolModel := actualModel
+	if reqBackend != "kiro" {
+		poolModel = upstreamModel
+	}
+
+	// Stash the original request + upstream model so the provider choke point can
+	// translate for a non-Kiro account. nr.Kiro is filled in per-attempt by
+	// callProviderForKiro. For a Kiro account this context value is harmless.
+	baseNR := &NormalizedRequest{
+		Model:         upstreamModel,
+		ClientDialect: DialectClaude,
+		Claude:        &req,
+		Thinking:      thinking,
+		Stream:        req.Stream,
+		Effort:        claudeEffort,
+	}
+	reqCtx := withNormalizedRequest(r.Context(), baseNR)
+
 	// Run the upstream call with multi-account failover. The worker is
 	// invoked once per attempt with a freshly-selected account; a retryable
 	// pre-commit failure rotates to a peer (see runWithFailover).
@@ -1773,12 +1820,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		// previous failed one.
 		kiroPayload.ProfileArn = ""
 		if req.Stream {
-			return h.handleClaudeStream(r.Context(), w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
+			return h.handleClaudeStream(reqCtx, w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
 		}
-		return h.handleClaudeNonStream(r.Context(), w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
+		return h.handleClaudeNonStream(reqCtx, w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile, matchedKeyID)
 	}
 
-	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
+	committed, retryAfter, err := h.runWithFailoverBackend(reqBackend, poolModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
 	if committed {
 		return // worker already wrote the full response (or a mid-stream error)
 	}
@@ -2099,7 +2146,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPIContext(ctx, account, payload, callback)
+	err := h.callProviderForKiro(ctx, account, payload, model, thinking, callback)
 	// Upstream is done (or failed). Stop the heartbeat BEFORE writing any
 	// terminal/error frame so a ping can never land after message_stop.
 	stopHB()
@@ -2423,7 +2470,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPIContext(ctx, account, payload, callback)
+	err := h.callProviderForKiro(ctx, account, payload, model, thinking, callback)
 	if err != nil {
 		// Nothing written to the client yet — let the dispatcher fail over.
 		// Cool this account (+ overage flip) now; the dispatcher records the
@@ -2576,15 +2623,34 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		matchedKeyID = k.ID
 	}
 
+	// Resolve the provider backend from the model string (e.g. "groq/llama-3.3").
+	// Unprefixed -> "kiro", byte-identical to the prior behavior.
+	reqBackend, upstreamModel := ParseModelBackend(req.Model)
+	// poolModel: mapped Kiro id for Kiro, de-prefixed upstream id for non-Kiro
+	// backends (so a fetched /models catalog matches). See the Claude handler.
+	poolModel := actualModel
+	if reqBackend != "kiro" {
+		poolModel = upstreamModel
+	}
+	baseNR := &NormalizedRequest{
+		Model:         upstreamModel,
+		ClientDialect: DialectOpenAI,
+		OpenAI:        &req,
+		Thinking:      thinking,
+		Stream:        req.Stream,
+		Effort:        req.ReasoningEffort,
+	}
+	reqCtx := withNormalizedRequest(r.Context(), baseNR)
+
 	worker := func(account *config.Account) (bool, error) {
 		kiroPayload.ProfileArn = "" // re-resolve per attempt account
 		if req.Stream {
-			return h.handleOpenAIStream(r.Context(), w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+			return h.handleOpenAIStream(reqCtx, w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
 		}
-		return h.handleOpenAINonStream(r.Context(), w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+		return h.handleOpenAINonStream(reqCtx, w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
 	}
 
-	committed, retryAfter, err := h.runWithFailover(actualModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
+	committed, retryAfter, err := h.runWithFailoverBackend(reqBackend, poolModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
 	if committed {
 		return
 	}
@@ -2847,7 +2913,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPIContext(ctx, account, payload, callback)
+	err := h.callProviderForKiro(ctx, account, payload, model, thinking, callback)
 	// Upstream is done (or failed). Stop the heartbeat BEFORE reading committed
 	// or writing any terminal frame so a ping can never land after [DONE].
 	stopHB()
@@ -2957,7 +3023,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	err := CallKiroAPIContext(ctx, account, payload, callback)
+	err := h.callProviderForKiro(ctx, account, payload, model, thinking, callback)
 	if err != nil {
 		// Nothing written yet — cool this account and let the dispatcher
 		// fail over (it records the single global failure on giving up).
@@ -3043,7 +3109,7 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 		}
 	}
 
-	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(account)
+	accessToken, refreshToken, expiresAt, profileArn, err := h.refreshAccountToken(account)
 	if err != nil {
 		return err
 	}
@@ -3064,6 +3130,88 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
 
 	return nil
+}
+
+// normalizedRequestCtxKey carries the per-request NormalizedRequest (the
+// original Claude/OpenAI request + resolved backend/upstream model) down to the
+// provider choke point, so the four large Kiro stream/non-stream handlers keep
+// their exact signatures (Kiro path unchanged) while a non-Kiro account selected
+// for the request still gets the original request to translate.
+type normalizedRequestCtxKey struct{}
+
+// withNormalizedRequest returns a child context carrying nr for callProviderForKiro
+// to read. The entry handlers build nr once (with the original request + backend)
+// and pass the enriched context into the per-account worker.
+func withNormalizedRequest(ctx context.Context, nr *NormalizedRequest) context.Context {
+	return context.WithValue(ctx, normalizedRequestCtxKey{}, nr)
+}
+
+// callProviderForKiro dispatches the request through the account's provider. For
+// a Kiro account this is byte-identical to the old direct CallKiroAPIContext call
+// (kiroProvider.Call uses the prebuilt Kiro payload verbatim). For a non-Kiro
+// account it reads the NormalizedRequest stashed on ctx (the original Claude /
+// OpenAI request + upstream model id) so the generic provider can translate and
+// call the right upstream. The prebuilt Kiro payload is always attached to the nr
+// copy so the kiro provider path is unaffected; a non-Kiro provider ignores it.
+// A nil provider (unknown backend) surfaces as a normal upstream error so the
+// dispatcher can fail over.
+func (h *Handler) callProviderForKiro(ctx context.Context, account *config.Account, payload *KiroPayload, model string, thinking bool, cb *KiroStreamCallback) error {
+	p, err := ProviderForOrErr(account)
+	if err != nil {
+		return err
+	}
+	// Base the dispatch on the stashed NormalizedRequest when present (carries the
+	// original request + upstream model for non-Kiro providers); fall back to a
+	// minimal Kiro-only nr otherwise (e.g. the admin test path / agentic loops).
+	var nr NormalizedRequest
+	if v, ok := ctx.Value(normalizedRequestCtxKey{}).(*NormalizedRequest); ok && v != nil {
+		nr = *v // copy so concurrent failover attempts don't race on the Kiro field
+	} else {
+		nr = NormalizedRequest{Model: model, Thinking: thinking}
+	}
+	nr.Kiro = payload
+	return p.Call(ctx, account, &nr, cb)
+}
+
+// refreshAccountToken renews an account's credentials through its provider,
+// returning the same 5-tuple shape the legacy auth.RefreshToken did so every
+// existing caller unpacks it unchanged. For a Kiro account this delegates to
+// auth.RefreshToken verbatim; for a non-Kiro provider it routes to that
+// provider's RefreshToken and also persists any provider-specific Extra fields
+// (e.g. Codex id_token / chatgpt-account-id) onto the account + config.
+func (h *Handler) refreshAccountToken(account *config.Account) (accessToken, refreshToken string, expiresAt int64, profileArn string, err error) {
+	p := ProviderFor(account)
+	if p == nil {
+		// Unknown backend — fall back to the Kiro path so a misconfigured
+		// account still behaves as before rather than hard-failing.
+		return auth.RefreshToken(account)
+	}
+	ts, err := p.RefreshToken(context.Background(), account)
+	if err != nil {
+		return "", "", 0, "", err
+	}
+	// Apply provider-specific extras (no-op for Kiro, which returns none).
+	if len(ts.Extra) > 0 {
+		applyTokenExtras(account, ts.Extra)
+	}
+	return ts.AccessToken, ts.RefreshToken, ts.ExpiresAt, ts.ProfileArn, nil
+}
+
+// applyTokenExtras copies provider-specific TokenSet.Extra fields onto the
+// account (in memory) so a refresh that re-derives identity (e.g. Codex decoding
+// a fresh id_token) keeps the account record current. Persistence of these
+// fields is handled by the provider's own admin/refresh path; this only ensures
+// the in-memory account used for the current request is consistent.
+func applyTokenExtras(account *config.Account, extra map[string]string) {
+	if v, ok := extra["idToken"]; ok && v != "" {
+		account.IDToken = v
+	}
+	if v, ok := extra["chatgptAccountId"]; ok && v != "" {
+		account.CodexAccountID = v
+	}
+	if v, ok := extra["planType"]; ok && v != "" {
+		account.CodexPlanType = v
+	}
 }
 
 // ==================== 管理 API ====================
@@ -3157,6 +3305,30 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/providers/catalog" && r.Method == "GET":
+		// List the available provider backends (built-in catalog + user-defined)
+		// so the dashboard can render an "Add provider account" picker.
+		h.apiGetProviderCatalog(w, r)
+	case path == "/providers/account" && r.Method == "POST":
+		// Add a non-Kiro provider account (api-key backends: groq, openai,
+		// anthropic, gemini, deepseek, ...). Kiro accounts keep using /accounts.
+		h.apiAddProviderAccount(w, r)
+	case path == "/providers" && r.Method == "GET":
+		h.apiListCustomProviders(w, r)
+	case path == "/providers" && r.Method == "POST":
+		// Register a custom OpenAI-/Anthropic-/Gemini-compatible provider
+		// (base URL + dialect) so accounts can target it.
+		h.apiAddCustomProvider(w, r)
+	case path == "/auth/codex/start" && r.Method == "POST":
+		h.apiStartCodexLogin(w, r)
+	case path == "/auth/codex/poll" && r.Method == "POST":
+		h.apiPollCodexLogin(w, r)
+	case path == "/auth/codex/token" && r.Method == "POST":
+		h.apiImportCodexToken(w, r)
+	case path == "/auth/qoder/start" && r.Method == "POST":
+		h.apiStartQoderLogin(w, r)
+	case path == "/auth/qoder/poll" && r.Method == "POST":
+		h.apiPollQoderLogin(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -3238,6 +3410,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
 		pacedRate, observedRate := h.pool.RateState(a.ID)
 		ttft := h.pool.TTFTState(a.ID)
+		modelCount := len(h.pool.GetModelList(a.ID))
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -3246,6 +3419,10 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"nickname":          a.Nickname,
 			"authMethod":        a.AuthMethod,
 			"provider":          a.Provider,
+			"modelCount":        modelCount,
+			"backend":           config.GetAccountBackend(&a),
+			"hasApiKey":         a.APIKey != "",
+			"codexPlanType":     a.CodexPlanType,
 			"region":            a.Region,
 			"enabled":           a.Enabled,
 			"banStatus":         a.BanStatus,
@@ -4090,12 +4267,12 @@ func (h *Handler) apiProbeWebSearch(w http.ResponseWriter, r *http.Request) {
 	logWebSearch(req.Query, len(results), err)
 	if err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ok":          false,
-			"stage":       "mcp_call",
-			"error":       err.Error(),
-			"accountId":   account.ID,
-			"region":      config.GetKiroAPIRegion(),
-			"hint":        "If this is a 404/400, the /mcp web_search endpoint may not be enabled for this account tier or region.",
+			"ok":        false,
+			"stage":     "mcp_call",
+			"error":     err.Error(),
+			"accountId": account.ID,
+			"region":    config.GetKiroAPIRegion(),
+			"hint":      "If this is a 404/400, the /mcp web_search endpoint may not be enabled for this account tier or region.",
 		})
 		return
 	}
@@ -4315,7 +4492,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnStopReason:   func(r string) {},
 	}
 
-	err := CallKiroAPI(account, kiroPayload, callback)
+	err := h.callProviderForKiro(context.Background(), account, kiroPayload, actualModel, thinking, callback)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -4625,7 +4802,13 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models, err := ListAvailableModels(account)
+	prov, err := ProviderForOrErr(account)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	models, err := prov.ListModels(account)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -4734,6 +4917,7 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 		"region":                 config.GetKiroAPIRegion(),
 		"regions":                config.GetKiroAPIRegions(),
 		"poolStrategy":           config.GetPoolStrategy(),
+		"poolStickyLimit":        config.GetPoolStickyLimit(),
 		"poolInitialConcurrency": config.GetPoolInitialConcurrency(),
 		"poolMaxConcurrency":     config.GetPoolMaxConcurrency(),
 	})
@@ -4747,6 +4931,7 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		Region                 *string   `json:"region,omitempty"`
 		Regions                *[]string `json:"regions,omitempty"`
 		PoolStrategy           *string   `json:"poolStrategy,omitempty"`
+		PoolStickyLimit        *int      `json:"poolStickyLimit,omitempty"`
 		PoolInitialConcurrency *int      `json:"poolInitialConcurrency,omitempty"`
 		PoolMaxConcurrency     *int      `json:"poolMaxConcurrency,omitempty"`
 	}
@@ -4812,10 +4997,10 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 
 	if req.PoolStrategy != nil {
 		strat := strings.ToLower(strings.TrimSpace(*req.PoolStrategy))
-		validStrats := map[string]bool{"": true, "least-request": true, "swr": true, "least-used": true, "random": true}
+		validStrats := map[string]bool{"": true, "fast": true, "least-request": true, "swr": true, "least-used": true, "random": true}
 		if !validStrats[strat] {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid poolStrategy, must be: least-request, swr, least-used, or random"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid poolStrategy, must be: fast, least-request, swr, least-used, or random"})
 			return
 		}
 		if err := config.UpdatePoolStrategy(strat); err != nil {
@@ -4823,6 +5008,20 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		// Apply mid-run so the next pick uses the new strategy (and the pool
+		// caches the resolved sticky limit for the fast path).
+		h.pool.Reload()
+	}
+
+	// Sticky-use cap for the "fast" strategy. Optional; nil leaves it untouched.
+	// 0 resets to the default (3). Applied mid-run via Reload.
+	if req.PoolStickyLimit != nil {
+		if err := config.UpdatePoolStickyLimit(*req.PoolStickyLimit); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
 	}
 
 	// Adaptive-concurrency knobs (least-request strategy). Both are optional; a
