@@ -47,6 +47,15 @@ type Account struct {
 	UserId   string `json:"userId,omitempty"`   // Kiro user ID
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
+	// Backend is the UPSTREAM PROVIDER this account talks to. Empty == "kiro"
+	// (AWS CodeWhisperer / Amazon Q), so every pre-existing config.json — which
+	// has no such field — and the entire Kiro add/login/refresh flow behave
+	// exactly as before. Other values select a non-Kiro provider implementation
+	// (e.g. "codex", "openai", "anthropic", "gemini", "groq", "qoder", or any
+	// ProviderConfig.ID). NOTE: this is distinct from the Provider field below,
+	// which is the IdP NAME ("BuilderId"/"GitHub") for Kiro social/IdC login.
+	Backend string `json:"backend,omitempty"`
+
 	// Authentication credentials
 	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
@@ -121,6 +130,136 @@ type Account struct {
 	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+
+	// ---- Non-Kiro provider credentials (Backend != "kiro") ----
+	// These are inert for Kiro accounts (Backend empty/"kiro"). They carry the
+	// credentials a non-Kiro provider needs; AccessToken/RefreshToken/ExpiresAt
+	// above are REUSED for OAuth-style providers (e.g. Codex) so the existing
+	// token-refresh plumbing applies unchanged.
+
+	// APIKey is the raw upstream key for api-key providers (OpenAI, Groq,
+	// Cerebras, DeepSeek, Mistral, OpenRouter, Anthropic, Gemini, ...). Sent per
+	// the provider's auth header (bearer / x-api-key / x-goog-api-key).
+	APIKey string `json:"apiKey,omitempty"`
+
+	// ProviderRef points at a Config.Providers[].ID for a custom/generic
+	// provider, supplying BaseURL/Dialect/Headers when Backend itself is a
+	// generic id. Empty for built-in backends.
+	ProviderRef string `json:"providerRef,omitempty"`
+
+	// BaseURLOverride lets a single api-key account target a custom base URL
+	// (e.g. a self-hosted OpenAI-compatible gateway) without defining a whole
+	// ProviderConfig. Empty = use the provider's default base URL.
+	BaseURLOverride string `json:"baseURLOverride,omitempty"`
+
+	// Codex/ChatGPT (Backend == "codex"). The OAuth tokens live in
+	// AccessToken/RefreshToken/ExpiresAt; these add the upstream identity decoded
+	// from the id_token JWT and the quota signal polled from the usage endpoint.
+	IDToken        string `json:"idToken,omitempty"`        // last id_token (re-decoded on refresh)
+	CodexAccountID string `json:"codexAccountId,omitempty"` // chatgpt-account-id header value
+	CodexPlanType  string `json:"codexPlanType,omitempty"`  // plus/pro/team/... (model availability + capacity)
+	// Codex usage windows, polled from GET /backend-api/wham/usage (codex-lb
+	// parity). Drive the codex-specific capacity-weighted routing.
+	CodexPrimaryUsedPct   float64 `json:"codexPrimaryUsedPct,omitempty"`   // 5h window used %
+	CodexPrimaryResetAt   int64   `json:"codexPrimaryResetAt,omitempty"`   // Unix seconds
+	CodexSecondaryUsedPct float64 `json:"codexSecondaryUsedPct,omitempty"` // weekly window used %
+	CodexSecondaryResetAt int64   `json:"codexSecondaryResetAt,omitempty"` // Unix seconds
+	CodexUsageCheckedAt   int64   `json:"codexUsageCheckedAt,omitempty"`   // last successful usage poll (Unix s)
+
+	// Qoder (Backend == "qoder"). The device access token lives in AccessToken;
+	// these carry the stable identity COSY signing needs per request.
+	QoderUserID    string `json:"qoderUserId,omitempty"`
+	QoderMachineID string `json:"qoderMachineId,omitempty"`
+}
+
+// ProviderConfig defines a generic / user-added upstream provider. Built-in
+// backends are registered in code (proxy package); this struct is the on-disk
+// shape for custom additions and the runtime registry the provider layer reads.
+//
+// Dialect selects the request/response translator and the URL/header/auth
+// conventions:
+//   - "openai"    — OpenAI Chat Completions ({BaseURL}/chat/completions), Bearer
+//     auth. Covers Groq, Cerebras, DeepSeek, Mistral, OpenRouter,
+//     Together, Fireworks, Cohere, Nebius, SiliconFlow, xAI, ...
+//   - "anthropic" — Anthropic Messages ({BaseURL}/messages), x-api-key auth.
+//   - "gemini"    — Google generateContent, x-goog-api-key auth.
+type ProviderConfig struct {
+	ID          string            `json:"id"`                    // registry key & Account.Backend value (e.g. "openrouter")
+	Alias       string            `json:"alias,omitempty"`       // short routing prefix (e.g. "or", "ds")
+	Name        string            `json:"name,omitempty"`        // display name
+	Dialect     string            `json:"dialect"`               // "openai" | "anthropic" | "gemini"
+	BaseURL     string            `json:"baseURL"`               // e.g. https://openrouter.ai/api/v1
+	AuthHeader  string            `json:"authHeader,omitempty"`  // override: "bearer" | "x-api-key" | "x-goog-api-key" (default by dialect)
+	Headers     map[string]string `json:"headers,omitempty"`     // static headers merged into every request
+	Models      []string          `json:"models,omitempty"`      // static catalog when no /models endpoint
+	FetchModels bool              `json:"fetchModels,omitempty"` // GET {BaseURL}/models to populate catalog
+}
+
+// GetProviders returns a copy of the user-defined provider configs.
+func GetProviders() []ProviderConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	out := make([]ProviderConfig, len(cfg.Providers))
+	copy(out, cfg.Providers)
+	return out
+}
+
+// GetProviderConfig looks up a user-defined provider by id (case-insensitive).
+func GetProviderConfig(id string) (ProviderConfig, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ProviderConfig{}, false
+	}
+	key := strings.ToLower(strings.TrimSpace(id))
+	for _, p := range cfg.Providers {
+		if strings.ToLower(strings.TrimSpace(p.ID)) == key {
+			return p, true
+		}
+	}
+	return ProviderConfig{}, false
+}
+
+// AddProvider appends or replaces (by id) a user-defined provider config.
+func AddProvider(p ProviderConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	key := strings.ToLower(strings.TrimSpace(p.ID))
+	for i := range cfg.Providers {
+		if strings.ToLower(strings.TrimSpace(cfg.Providers[i].ID)) == key {
+			cfg.Providers[i] = p
+			return Save()
+		}
+	}
+	cfg.Providers = append(cfg.Providers, p)
+	return Save()
+}
+
+// UpdateCodexUsage merges polled Codex usage-window fields into the matching
+// account (by ID) and persists. Only the Codex* usage fields and plan type are
+// copied from `info`; all other account state is left untouched. No-op if the
+// account is gone. Used by the Codex usage poller (proxy/codex_usage.go).
+func UpdateCodexUsage(id string, info Account) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID != id {
+			continue
+		}
+		cfg.Accounts[i].CodexUsageCheckedAt = info.CodexUsageCheckedAt
+		if info.CodexPlanType != "" {
+			cfg.Accounts[i].CodexPlanType = info.CodexPlanType
+		}
+		cfg.Accounts[i].CodexPrimaryUsedPct = info.CodexPrimaryUsedPct
+		cfg.Accounts[i].CodexPrimaryResetAt = info.CodexPrimaryResetAt
+		cfg.Accounts[i].CodexSecondaryUsedPct = info.CodexSecondaryUsedPct
+		cfg.Accounts[i].CodexSecondaryResetAt = info.CodexSecondaryResetAt
+		_ = Save()
+		return
+	}
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -148,6 +287,15 @@ type Config struct {
 	SystemVersion string    `json:"systemVersion,omitempty"`
 	NodeVersion   string    `json:"nodeVersion,omitempty"`
 	Accounts      []Account `json:"accounts"` // Registered Kiro accounts
+
+	// Providers holds user-defined / generic upstream provider definitions
+	// (OpenAI-compatible, Anthropic-compatible, Gemini, or custom base URLs).
+	// Built-in backends (kiro, codex, qoder, and the bundled api-key providers
+	// like groq/cerebras/...) are registered in code and do NOT need an entry
+	// here; this list is for custom additions or per-deploy overrides. An account
+	// references one of these via Account.Backend == ProviderConfig.ID (or
+	// Account.ProviderRef).
+	Providers []ProviderConfig `json:"providers,omitempty"`
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -193,16 +341,27 @@ type Config struct {
 	// PoolStrategy chooses how the account pool picks the next account for a
 	// request. Recognized values:
 	//
-	//   "least-request" / "" — least-outstanding-request (DEFAULT). Picks the
-	//                      eligible account with the fewest in-flight requests
-	//                      (Envoy's weighted form: score = weight/(inflight+1)),
-	//                      and applies an AIMD per-account concurrency limit that
-	//                      grows on success and halves on a 429. Best for bursty
-	//                      parallel load (agent fan-out) against per-identity
-	//                      rate limits — it prevents the whole pool throttling at
-	//                      once. This is the only strategy that reserves in-flight
-	//                      slots and gates admission.
-	//   "swr"            — smooth weighted round-robin (previous default).
+	//   "fast" / ""      — 9router-style instant selection (DEFAULT). Picks an
+	//                      eligible account immediately by weight/priority
+	//                      (fill-first) or, with stickiness, stays on the current
+	//                      account for up to PoolStickyLimit consecutive requests
+	//                      before rotating to the least-recently-used peer. Does
+	//                      NOT reserve in-flight slots, gate admission, or pace the
+	//                      request rate — it relies purely on the reactive cooldown
+	//                      (429 -> exponential backoff) for throttle avoidance.
+	//                      This is the low-latency default: it avoids the
+	//                      admission-wait stall and AIMD/GCRA overhead that made
+	//                      least-request slow under light/interactive load.
+	//   "least-request"  — least-outstanding-request. Picks the eligible account
+	//                      with the fewest in-flight requests (Envoy's weighted
+	//                      form: score = weight/(inflight+1)), and applies an AIMD
+	//                      per-account concurrency limit that grows on success and
+	//                      halves on a 429, plus a GCRA rate pacer and TTFT-aware
+	//                      scoring. Best for sustained bursty parallel load (agent
+	//                      fan-out) against per-identity rate limits. This is the
+	//                      only strategy that reserves in-flight slots and gates
+	//                      admission (so it can add latency under light load).
+	//   "swr"            — smooth weighted round-robin (legacy default).
 	//                      Balances assignment rate with predictable interleaving
 	//                      but is blind to concurrency, so a simultaneous burst
 	//                      can throttle every account at once. No in-flight gate.
@@ -218,6 +377,13 @@ type Config struct {
 	// picker among the eligible subset (and whether the AIMD gate applies)
 	// differs.
 	PoolStrategy string `json:"poolStrategy,omitempty"`
+
+	// PoolStickyLimit is the maximum number of consecutive requests the "fast"
+	// strategy keeps routing to the same account before rotating to the
+	// least-recently-used peer (9router's sticky-round-robin). 0 (the zero value)
+	// resolves to the built-in default (3). 1 disables stickiness (rotate every
+	// request). Ignored by every other strategy.
+	PoolStickyLimit int `json:"poolStickyLimit,omitempty"`
 
 	// PoolInitialConcurrency and PoolMaxConcurrency tune the per-account adaptive
 	// concurrency limiter used by the least-request strategy. InitialConcurrency
@@ -362,7 +528,7 @@ type AccountInfo struct {
 
 // Version current version
 // Version current version
-const Version = "1.0.10-A22"
+const Version = "1.0.10-A23"
 
 var (
 	cfg     *Config
@@ -434,10 +600,10 @@ func Load() error {
 			starterKey, _ := generateAPIKeySecret()
 			firstRunStarterKey = starterKey
 			cfg = &Config{
-				Password:              "changeme",
-				Port:                  8080,
-				Host:                  "0.0.0.0",
-				RequireApiKey:         true,
+				Password:      "changeme",
+				Port:          8080,
+				Host:          "0.0.0.0",
+				RequireApiKey: true,
 				APIKeys: []APIKey{{
 					ID:        generateAPIKeyID(),
 					Name:      "default",
@@ -683,6 +849,17 @@ func GetAccounts() []Account {
 	accounts := make([]Account, len(cfg.Accounts))
 	copy(accounts, cfg.Accounts)
 	return accounts
+}
+
+// GetAccountBackend returns the upstream provider id for an account, defaulting
+// an empty Backend to "kiro". This is the single source of truth for the
+// provider discriminator, so every call site treats a pre-existing (Backend-less)
+// account as a Kiro account.
+func GetAccountBackend(a *Account) string {
+	if a == nil || strings.TrimSpace(a.Backend) == "" {
+		return "kiro"
+	}
+	return strings.ToLower(strings.TrimSpace(a.Backend))
 }
 
 func GetEnabledAccounts() []Account {
@@ -1397,6 +1574,8 @@ func GetPoolStrategy() string {
 		return "swr"
 	}
 	switch strings.ToLower(strings.TrimSpace(cfg.PoolStrategy)) {
+	case "fast", "fill-first", "fillfirst", "fill_first", "9router":
+		return "fast"
 	case "swr", "swrr":
 		return "swr"
 	case "least-used", "leastused", "least_used":
@@ -1406,7 +1585,12 @@ func GetPoolStrategy() string {
 	case "least-request", "least-conn", "leastrequest", "least_request", "lor":
 		return "least-request"
 	default:
-		return "least-request"
+		// "fast" is the production default: a 9router-style instant pick with no
+		// proactive concurrency/rate gating. It avoids the admission-wait stall
+		// and AIMD/GCRA pacing that made the least-request path slow under light
+		// load, while keeping the same reactive cooldown on a 429. Operators who
+		// want the adaptive concurrency limiter can still opt into "least-request".
+		return "fast"
 	}
 }
 
@@ -1494,6 +1678,39 @@ func clampInt(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+// defaultPoolStickyLimit is the consecutive-use cap for the "fast" strategy's
+// sticky-round-robin when PoolStickyLimit is unset. Matches 9router's default
+// stickyRoundRobinLimit (3): keep a warm account for a few requests before
+// rotating, which preserves prompt-cache locality without pinning all traffic
+// to one identity.
+const defaultPoolStickyLimit = 3
+
+// GetPoolStickyLimit returns the consecutive-use cap for the "fast" strategy,
+// resolving an unset (0) value — or cfg==nil before Init() — to the built-in
+// default (3). A value of 1 disables stickiness (rotate every request). Clamped
+// to a sane upper bound so a typo can't pin the pool to one account effectively
+// forever.
+func GetPoolStickyLimit() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PoolStickyLimit == 0 {
+		return defaultPoolStickyLimit
+	}
+	return clampInt(cfg.PoolStickyLimit, 1, 1000)
+}
+
+// UpdatePoolStickyLimit persists the "fast" strategy sticky-use cap. Pass 0 to
+// reset to the default. Caller should call pool.Reload() to apply mid-run.
+func UpdatePoolStickyLimit(limit int) error {
+	if limit != 0 && (limit < 1 || limit > 1000) {
+		return fmt.Errorf("sticky limit must be between 1 and 1000 (or 0 for default)")
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PoolStickyLimit = limit
+	return Save()
 }
 
 // GetWebSearchEnabled reports whether proxy-side web_search emulation is on.

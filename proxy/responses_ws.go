@@ -84,7 +84,9 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	conn, err := responsesWsUpgrader.Upgrade(w, r, nil)
-	if err == nil { conn.SetReadLimit(maxRequestBodyBytes) }
+	if err == nil {
+		conn.SetReadLimit(maxRequestBodyBytes)
+	}
 	if err != nil {
 		logger.Warnf("[ResponsesWS] upgrade failed: %v", err)
 		return
@@ -132,7 +134,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		if rejected, reason := config.CheckAPIKeyLimit(apiKeyID, req.Model); rejected {
 			_ = conn.WriteJSON(map[string]interface{}{
 				"event": "error",
-				"data": map[string]interface{}{"type": "rate_limit_error", "message": "API key limit reached: " + reason},
+				"data":  map[string]interface{}{"type": "rate_limit_error", "message": "API key limit reached: " + reason},
 			})
 			return
 		}
@@ -149,12 +151,25 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 	thinking := resolveThinkingWithEffort(suffixThinking, effort)
 
+	// Resolve the request's provider backend from the model string so a
+	// non-Kiro model (e.g. "groq/..." or "cx/...") on the WS path selects the
+	// right account and is translated correctly. Unprefixed -> "kiro", which
+	// keeps the existing Kiro-only behavior byte-identical.
+	reqBackend, upstreamModel := ParseModelBackend(req.Model)
+
+	// poolModel: mapped Kiro id for Kiro, de-prefixed upstream id for a non-Kiro
+	// backend (so a fetched /models catalog matches). See the Claude handler.
+	poolModel := mappedModel
+	if reqBackend != "kiro" {
+		poolModel = upstreamModel
+	}
+
 	// Reserve an in-flight slot via the AIMD-aware picker so the Codex WS path
 	// participates in the same per-account concurrency gate as every other path
 	// (it previously used the non-reserving picker and bypassed the gate). No
 	// failover on this path, so a single Acquire/Release pair is correct; the
-	// slot is released when the handler returns.
-	account, retryAfter, ok := h.pool.AcquireForModelExcluding(mappedModel, nil)
+	// slot is released when the handler returns. Scoped to the resolved backend.
+	account, retryAfter, ok := h.pool.AcquireForBackendModelExcluding(reqBackend, poolModel, nil)
 	if !ok {
 		errMsg := "No available accounts"
 		errType := "server_error"
@@ -248,7 +263,21 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
-	if err := CallKiroAPIContext(r.Context(), account, kiroPayload, callback); err != nil {
+	// Thread the originating request onto the context so a non-Kiro account
+	// selected for this model is translated correctly (a Kiro account ignores it
+	// and uses the prebuilt kiroPayload). ClientDialect is "responses" since the
+	// inbound request funnels through ResponsesToClaudeRequest.
+	baseNR := &NormalizedRequest{
+		Model:         upstreamModel,
+		ClientDialect: DialectResponses,
+		Claude:        claudeReq,
+		Thinking:      thinking,
+		Stream:        true,
+		Effort:        effort,
+	}
+	wsCtx := withNormalizedRequest(r.Context(), baseNR)
+
+	if err := h.callProviderForKiro(wsCtx, account, kiroPayload, mappedModel, thinking, callback); err != nil {
 		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID, kiroPayload.ResolvedEffort)
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
@@ -270,7 +299,9 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 	h.recordSuccess(req.Model, apiKeyID, kiroPayload.ResolvedEffort, inputTokens, outputTokens, credits)
 	h.triggerAccountRefresh(account.ID)
-	if apiKeyID != "" { _, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model) }
+	if apiKeyID != "" {
+		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, req.Model)
+	}
 
 	completedStatus := "completed"
 	completedPayload := map[string]interface{}{

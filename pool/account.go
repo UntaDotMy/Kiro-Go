@@ -228,6 +228,12 @@ type cooldownEntry struct {
 	// concurrency gates — the "best lane" choice, which never overrides 429
 	// safety because the gates run first.
 	ttftEWMA float64
+
+	// lastPickSeq is the value of AccountPool.pickSeq at the moment the "fast"
+	// strategy last selected this account. Used for pick-time LRU rotation (see
+	// pickFastLocked) so a burst rotates across accounts even before any request
+	// completes. 0 = never picked by the fast path (sorts oldest -> filled first).
+	lastPickSeq uint64
 }
 
 // AccountPool 账号池
@@ -262,6 +268,27 @@ type AccountPool struct {
 	// loaded" — resolved lazily to the built-in defaults via concurrencyBounds.
 	initialLimit int
 	maxLimit     int
+
+	// stickyID / stickyCount implement the "fast" strategy's sticky-round-robin
+	// (9router parity): stickyID is the account the previous "fast" pick landed
+	// on, and stickyCount is how many consecutive picks have stayed on it. While
+	// stickyCount < the configured sticky limit AND that account is still
+	// eligible, the next "fast" pick stays on it (prompt-cache locality); past
+	// the limit (or if it falls out of eligibility) the pick rotates to the
+	// least-recently-used eligible peer and the counter resets. Guarded by p.mu
+	// like all other selection state.
+	stickyID    string
+	stickyCount int
+	stickyLimit int // cached from config on Reload; 0 => resolved lazily
+
+	// pickSeq is a monotonic counter stamped onto an account's cooldownEntry each
+	// time the "fast" strategy selects it (cd.lastPickSeq). It drives pick-time
+	// LRU rotation independent of the persisted Account.LastUsed (which only
+	// updates on request COMPLETION, so it can't rotate a burst that is dispatched
+	// before any request finishes — 9router updates recency at selection time for
+	// the same reason). An account with no entry / lastPickSeq 0 is "never picked"
+	// and sorts oldest, so fresh accounts are filled first.
+	pickSeq uint64
 }
 
 var (
@@ -329,6 +356,10 @@ func (p *AccountPool) Reload() {
 	if p.maxLimit < p.initialLimit {
 		p.maxLimit = p.initialLimit
 	}
+	// Cache the "fast" strategy sticky-use cap too, so the hot path reads it under
+	// p.mu without nesting the config lock. Resolved lazily (see stickyLimitLocked)
+	// when zero, e.g. a pool built in tests without Reload.
+	p.stickyLimit = stickyLimitResolver()
 
 	enabled := config.GetEnabledAccounts()
 	accounts := make([]config.Account, 0, len(enabled))
@@ -475,6 +506,20 @@ func SetConcurrencyResolverForTesting(fn func() (int, int)) (restore func()) {
 	return func() { concurrencyResolver = prev }
 }
 
+// stickyLimitResolver returns the configured sticky-use cap for the "fast"
+// strategy. Indirection via a package-level variable lets tests pin the limit
+// without bringing up a full config; production points it at config.
+var stickyLimitResolver = func() int { return config.GetPoolStickyLimit() }
+
+// SetStickyLimitResolverForTesting replaces the sticky-limit resolver so unit
+// tests can drive the "fast" strategy's rotation deterministically. Tests
+// restore the previous resolver in a defer/cleanup.
+func SetStickyLimitResolverForTesting(fn func() int) (restore func()) {
+	prev := stickyLimitResolver
+	stickyLimitResolver = fn
+	return func() { stickyLimitResolver = prev }
+}
+
 // concurrencyBounds returns the pool's cached (initial, max) concurrency limits,
 // lazily resolving them from config on first use so a pool built without Reload
 // (unit tests, NewForTesting) still gets sane non-zero bounds. Caller must hold
@@ -616,14 +661,23 @@ func allDigits(s string) bool {
 //
 // model may be empty to skip the model-list filter.
 func (p *AccountPool) GetNextForModel(model string) (*config.Account, time.Duration, bool) {
-	return p.pick(model, nil, false)
+	return p.pick("", model, nil, false)
 }
 
 // GetNextForModelExcluding is the failover-aware NON-RESERVING variant. The
 // exclude set holds account IDs the caller has already tried, so the picker
 // skips them. Pass nil for the first pick.
 func (p *AccountPool) GetNextForModelExcluding(model string, exclude map[string]bool) (*config.Account, time.Duration, bool) {
-	return p.pick(model, exclude, false)
+	return p.pick("", model, exclude, false)
+}
+
+// GetNextForBackendModelExcluding is the backend-scoped NON-RESERVING variant:
+// it only considers accounts whose resolved backend matches `backend` (""
+// = no constraint, identical to GetNextForModelExcluding). Used by non-Kiro
+// provider request paths so a Codex/OpenAI/etc. request never lands on a Kiro
+// account.
+func (p *AccountPool) GetNextForBackendModelExcluding(backend, model string, exclude map[string]bool) (*config.Account, time.Duration, bool) {
+	return p.pick(backend, model, exclude, false)
 }
 
 // AcquireForModelExcluding is the RESERVING picker used by the failover
@@ -638,7 +692,16 @@ func (p *AccountPool) GetNextForModelExcluding(model string, exclude map[string]
 // it returns ok=false with retryAfter=saturationPollInterval so the caller can
 // wait briefly for a slot to free instead of shedding immediately.
 func (p *AccountPool) AcquireForModelExcluding(model string, exclude map[string]bool) (*config.Account, time.Duration, bool) {
-	return p.pick(model, exclude, true)
+	return p.pick("", model, exclude, true)
+}
+
+// AcquireForBackendModelExcluding is the backend-scoped RESERVING picker: it
+// only considers accounts whose resolved backend matches `backend` ("" = no
+// constraint, identical to AcquireForModelExcluding). The failover dispatcher
+// uses this so a request for a given provider reserves a slot on (and fails over
+// among) only that provider's accounts.
+func (p *AccountPool) AcquireForBackendModelExcluding(backend, model string, exclude map[string]bool) (*config.Account, time.Duration, bool) {
+	return p.pick(backend, model, exclude, true)
 }
 
 // Release frees an in-flight slot previously reserved by AcquireForModelExcluding.
@@ -750,7 +813,15 @@ func (p *AccountPool) ConcurrencyState(id string) (inflight, limit int) {
 
 // pick is the shared selection core. reserve=true applies the AIMD concurrency
 // gate and increments the winner's in-flight counter (least-request only).
-func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) (*config.Account, time.Duration, bool) {
+//
+// backend scopes selection to accounts whose resolved backend matches: ""
+// means "no constraint" (legacy behavior — every account is eligible), while a
+// concrete value (e.g. "kiro", "codex", "openai") restricts the eligible set so
+// a request for one provider never lands on another provider's account. Because
+// a Backend-less account resolves to "kiro" (config.GetAccountBackend), a pool
+// of only pre-existing Kiro accounts behaves identically whether backend is ""
+// or "kiro".
+func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reserve bool) (*config.Account, time.Duration, bool) {
 	// Resolve the strategy BEFORE taking the pool lock. strategyResolver ->
 	// config.GetPoolStrategy acquires the config lock; doing it under p.mu
 	// nested two locks on every pick (a contention + lock-ordering hazard on
@@ -771,15 +842,19 @@ func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) 
 	// Normalize once before the per-slot walk so accountHasModel doesn't pay
 	// strings.ToLower + TrimSpace per candidate.
 	modelKey := strings.ToLower(strings.TrimSpace(model))
+	backendKey := strings.ToLower(strings.TrimSpace(backend))
 
-	// Collect indices of slots that are currently eligible (model match, not
-	// excluded, no cooldown, token not about to expire). Ineligible slots don't
-	// accumulate SWRR currentWeight, so they don't bias future picks.
+	// Collect indices of slots that are currently eligible (backend match, model
+	// match, not excluded, no cooldown, token not about to expire). Ineligible
+	// slots don't accumulate SWRR currentWeight, so they don't bias future picks.
 	var eligible []int
 	var soonest time.Time
 	for i := range p.slots {
 		acc := &p.accounts[i]
 		if exclude != nil && exclude[acc.ID] {
+			continue
+		}
+		if backendKey != "" && config.GetAccountBackend(acc) != backendKey {
 			continue
 		}
 		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {
@@ -815,6 +890,29 @@ func (p *AccountPool) pick(model string, exclude map[string]bool, reserve bool) 
 	// guarantees.
 	winner := -1
 	switch strategy {
+	case "fast":
+		// 9router-style instant selection: no in-flight reservation, no rate
+		// pacing, no TTFT scoring — just pick an eligible account immediately and
+		// rely on the reactive cooldown for throttle avoidance. This is the
+		// low-latency default. Two sub-modes, chosen by the sticky limit:
+		//
+		//   stickyLimit <= 1 — pure fill-first: pick the highest-weight eligible
+		//                       account (ties broken by least-recently-used), and
+		//                       rotate every request.
+		//   stickyLimit  > 1 — sticky-round-robin: stay on the current account for
+		//                       up to stickyLimit consecutive picks (prompt-cache
+		//                       locality), then rotate to the least-recently-used
+		//                       eligible peer and reset the counter.
+		//
+		// reserve is honored only insofar as the winner's selection is recorded;
+		// "fast" never gates on a concurrency limit, so a burst is admitted in full
+		// and the cooldown state machine (RecordError) is the sole backpressure.
+		winner = p.pickFastLocked(eligible)
+		if winner >= 0 && reserve {
+			// Keep the in-flight counter meaningful for diagnostics / the dashboard
+			// even though "fast" never gates on it. Release still decrements it.
+			p.reserveLocked(p.accounts[winner].ID)
+		}
 	case "least-used":
 		// Pick the eligible account with the lowest RequestCount. When counts
 		// tie, fall back to LastUsed (older = preferred).
@@ -943,6 +1041,114 @@ func (p *AccountPool) inflightLocked(id string) int {
 		return cd.inflight
 	}
 	return 0
+}
+
+// stickyLimitLocked returns the cached "fast" strategy sticky-use cap, lazily
+// resolving it from config on first use so a pool built without Reload (tests,
+// NewForTesting) still gets a sane non-zero value. Floored at 1 (stickiness off
+// = rotate every request). Caller must hold p.mu.
+func (p *AccountPool) stickyLimitLocked() int {
+	if p.stickyLimit <= 0 {
+		p.stickyLimit = stickyLimitResolver()
+	}
+	if p.stickyLimit < 1 {
+		p.stickyLimit = 1
+	}
+	return p.stickyLimit
+}
+
+// pickFastLocked implements the "fast" strategy's selection over the eligible
+// slot indices. Returns the winning index, or -1 if eligible is empty. It also
+// updates the pool's sticky state (stickyID / stickyCount) and stamps the
+// winner's pick recency (cd.lastPickSeq) so subsequent picks rotate correctly
+// even under a burst that hasn't completed yet. Caller must hold p.mu and must
+// have ensured len(eligible) > 0 for a meaningful result.
+//
+// Selection:
+//   - fillFirst (the tie-break and the stickyLimit<=1 mode): highest effective
+//     weight wins; ties broken by least-recently-PICKED (smaller lastPickSeq
+//     first) so equal-weight accounts rotate instead of pinning to slot 0.
+//   - sticky mode (stickyLimit>1): if the previous winner is still eligible and
+//     hasn't hit the consecutive-use cap, stay on it and bump the counter;
+//     otherwise pick the least-recently-PICKED eligible account (fresh rotation)
+//     and reset the counter to 1.
+func (p *AccountPool) pickFastLocked(eligible []int) int {
+	if len(eligible) == 0 {
+		return -1
+	}
+
+	limit := p.stickyLimitLocked()
+
+	// pickRecency returns the account's last fast-pick sequence (0 = never).
+	pickRecency := func(i int) uint64 {
+		if cd, ok := p.cooldowns[p.accounts[i].ID]; ok {
+			return cd.lastPickSeq
+		}
+		return 0
+	}
+	// stamp records that index i was just selected, advancing the pool's pick
+	// sequence and the sticky state.
+	stamp := func(i int) int {
+		p.pickSeq++
+		id := p.accounts[i].ID
+		cd := p.cooldowns[id]
+		if cd == nil {
+			cd = &cooldownEntry{}
+			p.cooldowns[id] = cd
+		}
+		cd.lastPickSeq = p.pickSeq
+		return i
+	}
+
+	// fillFirst: highest weight, ties -> least-recently-picked (smaller seq).
+	fillFirst := func() int {
+		best := eligible[0]
+		for _, i := range eligible[1:] {
+			w := p.slots[i].effectiveWeight
+			bw := p.slots[best].effectiveWeight
+			if w > bw || (w == bw && pickRecency(i) < pickRecency(best)) {
+				best = i
+			}
+		}
+		return best
+	}
+	// leastRecentlyPicked: smallest pick seq wins; ties -> higher weight.
+	leastRecentlyPicked := func() int {
+		best := eligible[0]
+		for _, i := range eligible[1:] {
+			r := pickRecency(i)
+			br := pickRecency(best)
+			if r < br || (r == br && p.slots[i].effectiveWeight > p.slots[best].effectiveWeight) {
+				best = i
+			}
+		}
+		return best
+	}
+
+	if limit <= 1 {
+		// Stickiness disabled — rotate every request: weight is the primary key,
+		// least-recently-picked breaks ties so equal-weight pools spread evenly.
+		winner := fillFirst()
+		p.stickyID = p.accounts[winner].ID
+		p.stickyCount = 1
+		return stamp(winner)
+	}
+
+	// Sticky mode: stay on the current account if it's still eligible and under
+	// the cap.
+	if p.stickyID != "" && p.stickyCount < limit {
+		for _, i := range eligible {
+			if p.accounts[i].ID == p.stickyID {
+				p.stickyCount++
+				return stamp(i)
+			}
+		}
+	}
+	// Rotate: pick the least-recently-picked eligible account and reset the counter.
+	winner := leastRecentlyPicked()
+	p.stickyID = p.accounts[winner].ID
+	p.stickyCount = 1
+	return stamp(winner)
 }
 
 // limitLocked returns the account's current concurrency limit, treating an
