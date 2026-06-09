@@ -1376,7 +1376,14 @@ func (h *Handler) refreshModelsCache() {
 		}
 		// 缓存每账号可用模型，用于路由时过滤
 		h.pool.SetModelList(r.account.ID, r.modelIDs)
-		aggregated = mergeUniqueModels(aggregated, r.models)
+		// Aggregate into the SHARED /v1/models catalog ONLY for Kiro accounts.
+		// A non-Kiro provider's bare ids route via the "provider/model" prefix
+		// only, so listing them unprefixed in the global catalog would mis-route
+		// a Kiro client to Kiro. Their per-account routing list (SetModelList
+		// above) is all the pool filter needs.
+		if config.GetAccountBackend(r.account) == "kiro" {
+			aggregated = mergeUniqueModels(aggregated, r.models)
+		}
 	}
 
 	if len(aggregated) > 0 {
@@ -1443,11 +1450,18 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	}
 	h.pool.SetModelList(account.ID, modelIDs)
 
-	// 合并到聚合缓存
-	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
-	h.modelsCacheMu.Unlock()
+	// Merge into the SHARED /v1/models catalog ONLY for Kiro accounts. A non-Kiro
+	// provider's ids are BARE (e.g. "llama-3.3-70b"); they route only via the
+	// "provider/model" prefix (ParseModelBackend), so listing them unprefixed in
+	// the global catalog would make a Kiro client request them with no prefix and
+	// mis-route to Kiro. Non-Kiro models stay in the per-account routing list
+	// above (SetModelList), which is all the pool filter needs.
+	if config.GetAccountBackend(account) == "kiro" {
+		h.modelsCacheMu.Lock()
+		h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+		h.modelsCacheTime = time.Now().Unix()
+		h.modelsCacheMu.Unlock()
+	}
 
 	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
 	return nil
@@ -3408,8 +3422,6 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		// 获取运行时统计
 		stats := statsMap[a.ID]
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
-		pacedRate, observedRate := h.pool.RateState(a.ID)
-		ttft := h.pool.TTFTState(a.ID)
 		modelCount := len(h.pool.GetModelList(a.ID))
 
 		result[i] = map[string]interface{}{
@@ -3461,9 +3473,6 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"lastUsed":          stats.LastUsed,
 			"inflight":          inflight,
 			"concurrencyLimit":  concurrencyLimit,
-			"pacedRate":         pacedRate,
-			"observedRate":      observedRate,
-			"ttftMs":            ttft,
 			"cooldownSecs":      int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds()),
 			"overQuota":         a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit,
 		}
@@ -4917,7 +4926,7 @@ func (h *Handler) apiGetEndpointConfig(w http.ResponseWriter, r *http.Request) {
 		"region":                 config.GetKiroAPIRegion(),
 		"regions":                config.GetKiroAPIRegions(),
 		"poolStrategy":           config.GetPoolStrategy(),
-		"poolStickyLimit":        config.GetPoolStickyLimit(),
+		"poolFastConcurrency":    config.GetPoolFastConcurrency(),
 		"poolInitialConcurrency": config.GetPoolInitialConcurrency(),
 		"poolMaxConcurrency":     config.GetPoolMaxConcurrency(),
 	})
@@ -4931,7 +4940,7 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		Region                 *string   `json:"region,omitempty"`
 		Regions                *[]string `json:"regions,omitempty"`
 		PoolStrategy           *string   `json:"poolStrategy,omitempty"`
-		PoolStickyLimit        *int      `json:"poolStickyLimit,omitempty"`
+		PoolFastConcurrency    *int      `json:"poolFastConcurrency,omitempty"`
 		PoolInitialConcurrency *int      `json:"poolInitialConcurrency,omitempty"`
 		PoolMaxConcurrency     *int      `json:"poolMaxConcurrency,omitempty"`
 	}
@@ -5013,10 +5022,11 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		h.pool.Reload()
 	}
 
-	// Sticky-use cap for the "fast" strategy. Optional; nil leaves it untouched.
-	// 0 resets to the default (3). Applied mid-run via Reload.
-	if req.PoolStickyLimit != nil {
-		if err := config.UpdatePoolStickyLimit(*req.PoolStickyLimit); err != nil {
+	// Per-account concurrency cap for the "fast" strategy (the per-account "rotate
+	// number"). Optional; nil leaves it untouched. 0 resets to the default (1 =
+	// send-and-ack). Applied mid-run via Reload.
+	if req.PoolFastConcurrency != nil {
+		if err := config.UpdatePoolFastConcurrency(*req.PoolFastConcurrency); err != nil {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

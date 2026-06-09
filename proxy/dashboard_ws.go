@@ -277,8 +277,6 @@ func (h *Handler) dashboardSnapshot() []byte {
 		}
 		st := poolStats[a.ID]
 		inflight, concurrencyLimit := h.pool.ConcurrencyState(a.ID)
-		pacedRate, observedRate := h.pool.RateState(a.ID)
-		ttft := h.pool.TTFTState(a.ID)
 		cooldownSecs := int(h.pool.CooldownRemaining(a.ID).Round(time.Second).Seconds())
 		overQuota := a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit
 		accountList = append(accountList, map[string]interface{}{
@@ -301,9 +299,6 @@ func (h *Handler) dashboardSnapshot() []byte {
 			"lastRefresh":       a.LastRefresh,
 			"inflight":          inflight,
 			"concurrencyLimit":  concurrencyLimit,
-			"pacedRate":         pacedRate,
-			"observedRate":      observedRate,
-			"ttftMs":            ttft,
 			"cooldownSecs":      cooldownSecs,
 			"overQuota":         overQuota,
 		})

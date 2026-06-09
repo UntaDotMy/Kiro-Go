@@ -77,13 +77,13 @@ const (
 	// AWS's throttling layer with values as small as ~1s during light
 	// throttling) bypass this floor — clamping a server-supplied 1s up to
 	// 5s wasted four free seconds of capacity per recovery.
-	softCooldownBase    = 5 * time.Second
-	softCooldownMax     = 5 * time.Minute
-	retryAfterMin       = 5 * time.Second
-	retryAfterMax       = 5 * time.Minute
+	softCooldownBase      = 5 * time.Second
+	softCooldownMax       = 5 * time.Minute
+	retryAfterMin         = 5 * time.Second
+	retryAfterMax         = 5 * time.Minute
 	retryAfterAbsoluteMin = 1 * time.Second
-	nonQuotaCooldown    = 60 * time.Second
-	errorCounterDecay   = 5 * time.Minute
+	nonQuotaCooldown      = 60 * time.Second
+	errorCounterDecay     = 5 * time.Minute
 
 	// quotaExhaustedCooldown is the cooldown applied when the upstream
 	// returns 402 OVERAGE / monthly-quota exhaustion. These are not
@@ -95,31 +95,20 @@ const (
 	// ---- Adaptive concurrency (least-request strategy only) ----
 	//
 	// Each account carries a self-tuning in-flight limit that converges on AWS's
-	// unpublished per-identity token bucket. The earlier revision used plain AIMD
+	// unpublished per-identity token bucket. The earliest revision used plain AIMD
 	// (start at 2, +1 per success, ×3/4 on a 429); that was SAFE but SLOW — a
 	// fresh account admitted only 2 parallel requests and climbed +1 per *streaming
 	// completion*, so 2→12 took ~10 serialized completions (tens of seconds) and a
 	// healthy identity sat throttled far below what AWS actually allowed.
 	//
-	// ---- Adaptive concurrency (least-request strategy only) ----
-	//
-	// Each account carries a self-tuning in-flight limit that converges on AWS's
-	// unpublished per-identity token bucket. TWO mechanisms cooperate:
-	//
-	//   - The RATE pacer (rate_pacer.go) is the PROACTIVE 429-guard: it paces each
-	//     account just below its learned refill rate, so throttle-avoidance does
-	//     not rest on the concurrency limit. Because the pacer holds the rate line,
-	//     this concurrency limit is the BURST gate, not the rate gate, and can
-	//     afford to be generous.
-	//   - The concurrency limit grows with TCP-style slow-start + congestion-
-	//     avoidance and a remembered ceiling (ssthresh): it opens FAST (geometric)
-	//     on a healthy account and, after a 429, snaps back near the last-known-good
-	//     ceiling instead of re-climbing linearly from the floor.
-	//
-	// The original revision grew +1 per streaming completion from an initial 2, so
-	// a cold account sat throttled for tens of seconds. Slow-start (limit += limit/2
-	// below ssthresh, +1 above) reaches the ceiling in a handful of successes;
-	// ssthresh memory makes recovery near-instant.
+	// The concurrency limit now grows with TCP-style slow-start + congestion-
+	// avoidance and a remembered ceiling (ssthresh): it opens FAST (geometric) on a
+	// healthy account and, after a 429, snaps back near the last-known-good ceiling
+	// (limit += limit/2 below ssthresh, +1 above) instead of re-climbing linearly
+	// from the floor. It is the SOLE per-account throttle-guard for the
+	// least-request strategy: both the rate gate and the burst gate (an earlier
+	// revision had a separate GCRA rate pacer; that was removed, so the limit now
+	// carries both roles). The soft 429 cooldown backs it up reactively.
 	//
 	// aimdInitialLimit / aimdMaxLimit are the BUILT-IN DEFAULTS used when config
 	// supplies nothing (and by unit tests that build a pool without Reload). The
@@ -132,15 +121,13 @@ const (
 	// Overload".
 	aimdInitialLimit = 12
 	// aimdMinLimit is the floor — never drop below this on a 429. A 3-slot floor
-	// keeps a recovered account productive immediately under a burst: the rate
-	// pacer (not a concurrency collapse to 1) is what prevents an immediate
-	// re-trip, while the multiplicative-decrease path still lets the limit
-	// self-tune down toward this floor.
+	// keeps a recovered account productive immediately under a burst, while the
+	// multiplicative-decrease path still lets the limit self-tune down toward this
+	// floor; only a sustained run of 429s collapses it this far.
 	aimdMinLimit = 3
-	// aimdMaxLimit caps how far the ramp can climb. Generous (48) because the rate
-	// pacer is the real throttle-guard; a high concurrency ceiling lets a small
-	// pool use its burst headroom without itself causing a storm. Larger pools
-	// rarely reach it because load spreads across accounts.
+	// aimdMaxLimit caps how far the ramp can climb. Generous (48) so a small pool
+	// can use its burst headroom without a single account causing a storm; larger
+	// pools rarely reach it because load spreads across accounts.
 	aimdMaxLimit = 48
 	// aimdDecreaseNum/Den is the multiplicative-decrease factor on a 429 (×3/4),
 	// applied to BOTH the limit and the remembered ssthresh. A token bucket is a
@@ -164,6 +151,14 @@ const (
 	// on Release; until then, a tighter poll is the cheap latency win.
 	saturationPollInterval = 25 * time.Millisecond
 )
+
+// SaturationPollInterval is the exported value of saturationPollInterval — the
+// "busy, slot will free shortly" retryAfter the reserving picker returns when
+// every eligible account is at its concurrency cap. The proxy's failover
+// dispatcher uses it to keep its own saturation threshold (saturationPollHint)
+// at or above this value via a compile-time invariant, so a future change to one
+// constant can't silently break the "wait for a slot" path.
+const SaturationPollInterval = saturationPollInterval
 
 // accountSlot is one entry in the SWRR scheduler. The slot is keyed
 // positionally to AccountPool.accounts, so we don't store the account ID here.
@@ -197,38 +192,6 @@ type cooldownEntry struct {
 	limit    int
 	ssthresh int
 
-	// Adaptive RATE pacing (least-request strategy). See rate_pacer.go for the
-	// full design. These implement a per-account GCRA pacer whose rate is learned
-	// by AIMD ("discover then pace"): unpaced until the first 429, then paced just
-	// below the observed achieved rate and probed back up on sustained success.
-	//
-	//   rateEstimate  — learned paced rate (req/sec); 0 means UNPACED (run full
-	//                   speed, gated only by concurrency).
-	//   tat           — GCRA Theoretical Arrival Time; the pacer admits a request
-	//                   only when now >= tat - τ. Zero until first advance.
-	//   observedRate  — EWMA of achieved success throughput, used to seed the
-	//                   snap-down on a 429.
-	//   lastSuccessAt — timestamp of the previous success, for the inter-success
-	//                   interval that feeds observedRate.
-	//   lastProbeAt   — last time the paced rate was probed upward, to rate-limit
-	//                   probing to rateProbeInterval.
-	rateEstimate  float64
-	tat           time.Time
-	observedRate  float64
-	lastSuccessAt time.Time
-	lastProbeAt   time.Time
-
-	// ttftEWMA is the exponentially-weighted moving average of TIME-TO-FIRST-TOKEN
-	// for this account, in milliseconds (0 = no measurement yet). TTFT is the
-	// load-bearing latency signal: it reflects this account's queueing / warmth /
-	// remaining capacity, unlike total completion time which is dominated by the
-	// response's output length and would mis-steer traffic away from a healthy
-	// account that simply got a long answer. The scorer prefers the account with
-	// the LOWEST ttftEWMA among those that already passed the rate-headroom and
-	// concurrency gates — the "best lane" choice, which never overrides 429
-	// safety because the gates run first.
-	ttftEWMA float64
-
 	// lastPickSeq is the value of AccountPool.pickSeq at the moment the "fast"
 	// strategy last selected this account. Used for pick-time LRU rotation (see
 	// pickFastLocked) so a burst rotates across accounts even before any request
@@ -257,9 +220,8 @@ type AccountPool struct {
 	// a non-blocking send in Release: concurrent releases coalesce into a single
 	// wakeup (the woken waiter re-attempts Acquire and re-waits if it still can't
 	// get one), and a send that finds the buffer full is simply dropped. Waiters
-	// MUST still use a bounded fallback timer because a RATE-paced account frees
-	// no slot on Release — its GCRA bucket refills on a clock, not on completion —
-	// so the signal alone can't cover that recovery path.
+	// still use a bounded fallback timer as a safety net in case a wakeup is
+	// missed.
 	releaseCh chan struct{}
 
 	// initialLimit / maxLimit are the per-account adaptive-concurrency bounds,
@@ -269,25 +231,18 @@ type AccountPool struct {
 	initialLimit int
 	maxLimit     int
 
-	// stickyID / stickyCount implement the "fast" strategy's sticky-round-robin
-	// (9router parity): stickyID is the account the previous "fast" pick landed
-	// on, and stickyCount is how many consecutive picks have stayed on it. While
-	// stickyCount < the configured sticky limit AND that account is still
-	// eligible, the next "fast" pick stays on it (prompt-cache locality); past
-	// the limit (or if it falls out of eligibility) the pick rotates to the
-	// least-recently-used eligible peer and the counter resets. Guarded by p.mu
-	// like all other selection state.
-	stickyID    string
-	stickyCount int
-	stickyLimit int // cached from config on Reload; 0 => resolved lazily
+	// fastConcurrency is the per-account concurrent-request cap for the "fast"
+	// strategy — how many requests one account handles at once before the next
+	// request fans out to a free peer (and waits when all are at the cap). Cached
+	// from config on Reload (and lazily on first use). 0 => resolved lazily;
+	// floored at 1.
+	fastConcurrency int
 
 	// pickSeq is a monotonic counter stamped onto an account's cooldownEntry each
-	// time the "fast" strategy selects it (cd.lastPickSeq). It drives pick-time
-	// LRU rotation independent of the persisted Account.LastUsed (which only
-	// updates on request COMPLETION, so it can't rotate a burst that is dispatched
-	// before any request finishes — 9router updates recency at selection time for
-	// the same reason). An account with no entry / lastPickSeq 0 is "never picked"
-	// and sorts oldest, so fresh accounts are filled first.
+	// time the "fast" strategy selects it (cd.lastPickSeq). It breaks ties between
+	// equally-loaded accounts by least-recently-PICKED, so a burst rotates evenly
+	// across free accounts at selection time (before any request completes), not
+	// pinning to the lowest-index account.
 	pickSeq uint64
 }
 
@@ -356,10 +311,10 @@ func (p *AccountPool) Reload() {
 	if p.maxLimit < p.initialLimit {
 		p.maxLimit = p.initialLimit
 	}
-	// Cache the "fast" strategy sticky-use cap too, so the hot path reads it under
-	// p.mu without nesting the config lock. Resolved lazily (see stickyLimitLocked)
-	// when zero, e.g. a pool built in tests without Reload.
-	p.stickyLimit = stickyLimitResolver()
+	// Cache the "fast" strategy per-account concurrency cap too, so the hot path
+	// reads it under p.mu without nesting the config lock. Resolved lazily (see
+	// fastConcurrencyLocked) when zero, e.g. a pool built in tests without Reload.
+	p.fastConcurrency = fastConcurrencyResolver()
 
 	enabled := config.GetEnabledAccounts()
 	accounts := make([]config.Account, 0, len(enabled))
@@ -506,18 +461,18 @@ func SetConcurrencyResolverForTesting(fn func() (int, int)) (restore func()) {
 	return func() { concurrencyResolver = prev }
 }
 
-// stickyLimitResolver returns the configured sticky-use cap for the "fast"
-// strategy. Indirection via a package-level variable lets tests pin the limit
-// without bringing up a full config; production points it at config.
-var stickyLimitResolver = func() int { return config.GetPoolStickyLimit() }
+// fastConcurrencyResolver returns the configured per-account concurrency cap for
+// the "fast" strategy. Indirection via a package-level variable lets tests pin
+// the cap without bringing up a full config; production points it at config.
+var fastConcurrencyResolver = func() int { return config.GetPoolFastConcurrency() }
 
-// SetStickyLimitResolverForTesting replaces the sticky-limit resolver so unit
-// tests can drive the "fast" strategy's rotation deterministically. Tests
+// SetFastConcurrencyResolverForTesting replaces the fast-concurrency resolver so
+// unit tests can drive the "fast" strategy's fan-out deterministically. Tests
 // restore the previous resolver in a defer/cleanup.
-func SetStickyLimitResolverForTesting(fn func() int) (restore func()) {
-	prev := stickyLimitResolver
-	stickyLimitResolver = fn
-	return func() { stickyLimitResolver = prev }
+func SetFastConcurrencyResolverForTesting(fn func() int) (restore func()) {
+	prev := fastConcurrencyResolver
+	fastConcurrencyResolver = fn
+	return func() { fastConcurrencyResolver = prev }
 }
 
 // concurrencyBounds returns the pool's cached (initial, max) concurrency limits,
@@ -740,11 +695,10 @@ func (p *AccountPool) signalRelease() {
 }
 
 // ReleaseSignal returns the channel an admission waiter selects on to be woken
-// the instant an in-flight slot frees. Always pair a receive on it with a
-// bounded fallback timer: a RATE-paced account frees no slot on Release (its
-// GCRA bucket refills on a clock), so the signal alone does not cover that
-// recovery path. Returns nil for a pool built without the channel, in which
-// case the caller falls back to pure polling.
+// the instant an in-flight slot frees. Pair a receive on it with a bounded
+// fallback timer as a safety net in case a wakeup is missed. Returns nil for a
+// pool built without the channel, in which case the caller falls back to pure
+// polling.
 func (p *AccountPool) ReleaseSignal() <-chan struct{} {
 	return p.releaseCh
 }
@@ -756,32 +710,6 @@ func (p *AccountPool) InflightCount(id string) int {
 	defer p.mu.RUnlock()
 	if cd, ok := p.cooldowns[id]; ok {
 		return cd.inflight
-	}
-	return 0
-}
-
-// RateState reports an account's adaptive RATE-pacer state under a single lock,
-// for the dashboard's realtime display and for tests. pacedRate is the learned
-// GCRA rate in requests/sec (0 = UNPACED, running full speed gated only by
-// concurrency); observedRate is the EWMA of achieved success throughput
-// (req/sec) used to seed the snap-down on a 429. See rate_pacer.go.
-func (p *AccountPool) RateState(id string) (pacedRate, observedRate float64) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if cd, ok := p.cooldowns[id]; ok {
-		return cd.rateEstimate, cd.observedRate
-	}
-	return 0, 0
-}
-
-// TTFTState reports an account's EWMA time-to-first-token in milliseconds (0 =
-// not measured yet), for the dashboard's realtime latency display and tests.
-// This is the load signal the latency-aware scorer steers by.
-func (p *AccountPool) TTFTState(id string) float64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if cd, ok := p.cooldowns[id]; ok {
-		return cd.ttftEWMA
 	}
 	return 0
 }
@@ -863,11 +791,24 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			continue
 		}
-		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.until) {
-			if soonest.IsZero() || cd.until.Before(soonest) {
-				soonest = cd.until
+		// Soft 429 cooldown is honored by every strategy EXCEPT "fast", which
+		// routes purely by free capacity — an in-use account simply isn't picked
+		// until it frees, and a 429'd account is steered around by load, not by a
+		// timed cooldown. This bypass is bounded because hard-disable is enforced
+		// independently of cd.until: an account whose quota is exhausted WITHOUT an
+		// overage allowance gets computeEffectiveWeight==0 and is dropped from
+		// p.slots on the next Reload, so it never reaches this eligible walk at all.
+		// The remaining case — an OVERAGE-ALLOWED account that returned 402 — is
+		// deliberately kept in fast rotation (overage is permitted), so fast will
+		// route to it again before its 1h RecordQuotaExhaustion cooldown expires;
+		// the other strategies still skip it for that hour.
+		if strategy != "fast" {
+			if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.until) {
+				if soonest.IsZero() || cd.until.Before(soonest) {
+					soonest = cd.until
+				}
+				continue
 			}
-			continue
 		}
 		eligible = append(eligible, i)
 	}
@@ -891,26 +832,22 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 	winner := -1
 	switch strategy {
 	case "fast":
-		// 9router-style instant selection: no in-flight reservation, no rate
-		// pacing, no TTFT scoring — just pick an eligible account immediately and
-		// rely on the reactive cooldown for throttle avoidance. This is the
-		// low-latency default. Two sub-modes, chosen by the sticky limit:
-		//
-		//   stickyLimit <= 1 — pure fill-first: pick the highest-weight eligible
-		//                       account (ties broken by least-recently-used), and
-		//                       rotate every request.
-		//   stickyLimit  > 1 — sticky-round-robin: stay on the current account for
-		//                       up to stickyLimit consecutive picks (prompt-cache
-		//                       locality), then rotate to the least-recently-used
-		//                       eligible peer and reset the counter.
-		//
-		// reserve is honored only insofar as the winner's selection is recorded;
-		// "fast" never gates on a concurrency limit, so a burst is admitted in full
-		// and the cooldown state machine (RecordError) is the sole backpressure.
-		winner = p.pickFastLocked(eligible)
+		// Parallel-spread selection (WiFi-7 multi-link). Each eligible account
+		// holds up to fastConcurrency concurrent requests (the per-account "rotate
+		// number", default 1 = send-and-ack). A burst fans OUT across the
+		// least-loaded free accounts so N concurrent requests land on N distinct
+		// accounts in parallel instead of queueing on one. When reserving and EVERY
+		// eligible account is at its cap, we return the saturation poll hint so the
+		// dispatcher WAITS for a slot to free (woken the instant one does) and
+		// routes there — no request is dropped just because the pool is momentarily
+		// full. No cooldown gate and no AIMD limit on this path: an in-use account
+		// simply isn't picked until it frees.
+		w, saturated := p.pickFastLocked(eligible, reserve)
+		if saturated {
+			return nil, saturationPollInterval, false
+		}
+		winner = w
 		if winner >= 0 && reserve {
-			// Keep the in-flight counter meaningful for diagnostics / the dashboard
-			// even though "fast" never gates on it. Release still decrements it.
 			p.reserveLocked(p.accounts[winner].ID)
 		}
 	case "least-used":
@@ -957,7 +894,6 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 		candidates := eligible
 		if reserve {
 			admittable := candidates[:0:0] // fresh slice; don't alias eligible
-			rateSaturated := false
 			for _, i := range eligible {
 				id := p.accounts[i].ID
 				// Concurrency gate: skip accounts already at their AIMD in-flight
@@ -965,57 +901,22 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 				if p.inflightLocked(id) >= p.limitLocked(id) {
 					continue
 				}
-				// Rate gate (GCRA): skip accounts whose paced bucket says "too
-				// early". Unpaced accounts (rateEstimate==0) always pass — we only
-				// pace an account after it has taught us its rate via a 429.
-				if !p.rateAdmitLocked(id, now) {
-					rateSaturated = true
-					continue
-				}
 				admittable = append(admittable, i)
 			}
 			if len(admittable) == 0 {
-				// Every eligible account is busy — either at its concurrency limit
-				// or rate-paced (not cooling). Ask the caller to retry shortly; a
-				// concurrency slot frees as requests complete, and a paced bucket
-				// refills within an emission interval. Either way the existing
-				// admission-wait budget in the dispatcher smooths this into a short
-				// delay instead of a 429. rateSaturated is folded in implicitly:
-				// the same saturationPollInterval hint applies.
-				_ = rateSaturated
+				// Every eligible account is at its concurrency limit (busy, not
+				// cooling). Ask the caller to retry shortly; a slot frees as
+				// requests complete, and the dispatcher's admission-wait budget
+				// smooths this into a short delay instead of a 429.
 				return nil, saturationPollInterval, false
 			}
 			candidates = admittable
 		}
 		winner = candidates[0]
 		bestScore := -1.0
-		// Latency-aware "smart laning": among the candidates that already passed
-		// the rate-headroom + concurrency gates (so this can never override 429
-		// safety), prefer the account with the lowest time-to-first-token. We
-		// penalize each candidate's score by how much slower its TTFT is than the
-		// FASTEST candidate's, bounded so one slow reading can't starve an account.
-		// minTTFT is the fastest measured candidate (0 if none measured yet).
-		minTTFT := 0.0
-		for _, i := range candidates {
-			if tt := p.ttftLocked(p.accounts[i].ID); tt > 0 && (minTTFT == 0 || tt < minTTFT) {
-				minTTFT = tt
-			}
-		}
 		for _, i := range candidates {
 			inflight := p.inflightLocked(p.accounts[i].ID)
 			score := float64(p.slots[i].effectiveWeight) / float64(inflight+1)
-			// ttftFactor >= 1: 1.0 for the fastest (or any unmeasured) account, up
-			// to ttftPenaltyCap for the slowest. An unmeasured account stays at 1.0
-			// so a fresh account still gets traffic to learn its TTFT (explore).
-			if minTTFT > 0 {
-				if tt := p.ttftLocked(p.accounts[i].ID); tt > 0 {
-					factor := tt / minTTFT
-					if factor > ttftPenaltyCap {
-						factor = ttftPenaltyCap
-					}
-					score /= factor
-				}
-			}
 			if score > bestScore {
 				bestScore = score
 				winner = i
@@ -1023,9 +924,6 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 		}
 		if reserve {
 			p.reserveLocked(p.accounts[winner].ID)
-			// Advance the GCRA TAT for the paced account so the next pick sees the
-			// consumed token. No-op for an unpaced account (rateEstimate==0).
-			p.rateAdvanceLocked(p.accounts[winner].ID, now)
 		}
 	}
 
@@ -1043,41 +941,48 @@ func (p *AccountPool) inflightLocked(id string) int {
 	return 0
 }
 
-// stickyLimitLocked returns the cached "fast" strategy sticky-use cap, lazily
-// resolving it from config on first use so a pool built without Reload (tests,
-// NewForTesting) still gets a sane non-zero value. Floored at 1 (stickiness off
-// = rotate every request). Caller must hold p.mu.
-func (p *AccountPool) stickyLimitLocked() int {
-	if p.stickyLimit <= 0 {
-		p.stickyLimit = stickyLimitResolver()
+// fastConcurrencyLocked returns the cached "fast" strategy per-account
+// concurrency cap, lazily resolving it from config on first use so a pool built
+// without Reload (tests, NewForTesting) still gets a sane non-zero value.
+// Floored at 1 (send-and-ack — one request per account at a time). Caller must
+// hold p.mu.
+func (p *AccountPool) fastConcurrencyLocked() int {
+	if p.fastConcurrency <= 0 {
+		p.fastConcurrency = fastConcurrencyResolver()
 	}
-	if p.stickyLimit < 1 {
-		p.stickyLimit = 1
+	if p.fastConcurrency < 1 {
+		p.fastConcurrency = 1
 	}
-	return p.stickyLimit
+	return p.fastConcurrency
 }
 
-// pickFastLocked implements the "fast" strategy's selection over the eligible
-// slot indices. Returns the winning index, or -1 if eligible is empty. It also
-// updates the pool's sticky state (stickyID / stickyCount) and stamps the
-// winner's pick recency (cd.lastPickSeq) so subsequent picks rotate correctly
-// even under a burst that hasn't completed yet. Caller must hold p.mu and must
-// have ensured len(eligible) > 0 for a meaningful result.
+// pickFastLocked implements the "fast" strategy's parallel-spread selection over
+// the eligible slot indices. It models WiFi-7 multi-link: a burst of N requests
+// fans OUT across the N least-loaded free accounts so each goes to a distinct
+// account in parallel, instead of queueing on one.
 //
-// Selection:
-//   - fillFirst (the tie-break and the stickyLimit<=1 mode): highest effective
-//     weight wins; ties broken by least-recently-PICKED (smaller lastPickSeq
-//     first) so equal-weight accounts rotate instead of pinning to slot 0.
-//   - sticky mode (stickyLimit>1): if the previous winner is still eligible and
-//     hasn't hit the consecutive-use cap, stay on it and bump the counter;
-//     otherwise pick the least-recently-PICKED eligible account (fresh rotation)
-//     and reset the counter to 1.
-func (p *AccountPool) pickFastLocked(eligible []int) int {
+// Selection, among accounts BELOW their per-account fast-concurrency cap:
+//   - fewest in-flight wins (spread the load) — this is what turns 4 concurrent
+//     requests across 4 free accounts into one-each;
+//   - ties broken by higher effective weight (prefer stronger accounts);
+//   - then by least-recently-PICKED (cd.lastPickSeq) so equal accounts rotate at
+//     SELECTION time, before any request completes, instead of pinning to slot 0.
+//
+// Returns (winningIndex, saturated):
+//   - (i, false): account i was selected.
+//   - (-1, true): reserve was requested and EVERY eligible account is already at
+//     its fast cap (all busy, not cooling). The caller turns this into the
+//     saturation poll hint so the dispatcher waits for a slot to free.
+//   - (i, false) with reserve=false always returns a pick (the non-reserving
+//     picker doesn't gate on the cap — it's used by diagnostics / single-account
+//     paths where there's no slot to reserve).
+//
+// Caller must hold p.mu and must have ensured len(eligible) > 0.
+func (p *AccountPool) pickFastLocked(eligible []int, reserve bool) (int, bool) {
 	if len(eligible) == 0 {
-		return -1
+		return -1, false
 	}
-
-	limit := p.stickyLimitLocked()
+	fastCap := p.fastConcurrencyLocked()
 
 	// pickRecency returns the account's last fast-pick sequence (0 = never).
 	pickRecency := func(i int) uint64 {
@@ -1087,8 +992,8 @@ func (p *AccountPool) pickFastLocked(eligible []int) int {
 		return 0
 	}
 	// stamp records that index i was just selected, advancing the pool's pick
-	// sequence and the sticky state.
-	stamp := func(i int) int {
+	// sequence so the next pick rotates off it under a same-instant burst.
+	stamp := func(i int) (int, bool) {
 		p.pickSeq++
 		id := p.accounts[i].ID
 		cd := p.cooldowns[id]
@@ -1097,58 +1002,39 @@ func (p *AccountPool) pickFastLocked(eligible []int) int {
 			p.cooldowns[id] = cd
 		}
 		cd.lastPickSeq = p.pickSeq
-		return i
+		return i, false
 	}
 
-	// fillFirst: highest weight, ties -> least-recently-picked (smaller seq).
-	fillFirst := func() int {
-		best := eligible[0]
-		for _, i := range eligible[1:] {
-			w := p.slots[i].effectiveWeight
-			bw := p.slots[best].effectiveWeight
-			if w > bw || (w == bw && pickRecency(i) < pickRecency(best)) {
-				best = i
-			}
+	// better reports whether candidate i should beat the current best j:
+	// fewer in-flight, then higher weight, then least-recently-picked.
+	better := func(i, j int) bool {
+		ii, ij := p.inflightLocked(p.accounts[i].ID), p.inflightLocked(p.accounts[j].ID)
+		if ii != ij {
+			return ii < ij
 		}
-		return best
-	}
-	// leastRecentlyPicked: smallest pick seq wins; ties -> higher weight.
-	leastRecentlyPicked := func() int {
-		best := eligible[0]
-		for _, i := range eligible[1:] {
-			r := pickRecency(i)
-			br := pickRecency(best)
-			if r < br || (r == br && p.slots[i].effectiveWeight > p.slots[best].effectiveWeight) {
-				best = i
-			}
+		wi, wj := p.slots[i].effectiveWeight, p.slots[j].effectiveWeight
+		if wi != wj {
+			return wi > wj
 		}
-		return best
+		return pickRecency(i) < pickRecency(j)
 	}
 
-	if limit <= 1 {
-		// Stickiness disabled — rotate every request: weight is the primary key,
-		// least-recently-picked breaks ties so equal-weight pools spread evenly.
-		winner := fillFirst()
-		p.stickyID = p.accounts[winner].ID
-		p.stickyCount = 1
-		return stamp(winner)
-	}
-
-	// Sticky mode: stay on the current account if it's still eligible and under
-	// the cap.
-	if p.stickyID != "" && p.stickyCount < limit {
-		for _, i := range eligible {
-			if p.accounts[i].ID == p.stickyID {
-				p.stickyCount++
-				return stamp(i)
-			}
+	best := -1
+	for _, i := range eligible {
+		// When reserving, only accounts BELOW their fast cap are admittable, so a
+		// burst spreads to a free peer instead of doubling up on a busy account.
+		if reserve && p.inflightLocked(p.accounts[i].ID) >= fastCap {
+			continue
+		}
+		if best == -1 || better(i, best) {
+			best = i
 		}
 	}
-	// Rotate: pick the least-recently-picked eligible account and reset the counter.
-	winner := leastRecentlyPicked()
-	p.stickyID = p.accounts[winner].ID
-	p.stickyCount = 1
-	return stamp(winner)
+	if best == -1 {
+		// reserve was requested and every eligible account is at its cap.
+		return -1, true
+	}
+	return stamp(best)
 }
 
 // limitLocked returns the account's current concurrency limit, treating an
@@ -1159,15 +1045,6 @@ func (p *AccountPool) limitLocked(id string) int {
 	}
 	initial, _ := p.concurrencyBounds()
 	return initial
-}
-
-// ttftLocked returns the account's EWMA time-to-first-token in milliseconds, or
-// 0 when no measurement exists yet. Caller must hold p.mu.
-func (p *AccountPool) ttftLocked(id string) float64 {
-	if cd, ok := p.cooldowns[id]; ok {
-		return cd.ttftEWMA
-	}
-	return 0
 }
 
 // reserveLocked increments an account's in-flight counter, creating the entry
@@ -1183,39 +1060,6 @@ func (p *AccountPool) reserveLocked(id string) {
 		cd.limit = initial
 	}
 	cd.inflight++
-}
-
-// rateAdmitLocked reports whether the GCRA pacer admits a request for this
-// account at `now`. An account with no learned rate (rateEstimate <= 0) is
-// UNPACED and always admitted — we only pace after a 429 has taught us the
-// rate. Caller must hold p.mu.
-func (p *AccountPool) rateAdmitLocked(id string, now time.Time) bool {
-	cd := p.cooldowns[id]
-	if cd == nil || cd.rateEstimate <= 0 {
-		return true
-	}
-	emission := emissionInterval(cd.rateEstimate)
-	tau := time.Duration(rateBurstTolerance * float64(emission))
-	return gcraAdmit(now, cd.tat, tau)
-}
-
-// rateAdvanceLocked steps the GCRA TAT forward by one emission interval for a
-// paced account, recording that a token was consumed. A per-account phase
-// offset is applied on the FIRST advance (when tat is zero) so two accounts'
-// pacing cycles are staggered and a synchronized client burst doesn't drain
-// both buckets at the same instant. No-op for an unpaced account. Caller must
-// hold p.mu.
-func (p *AccountPool) rateAdvanceLocked(id string, now time.Time) {
-	cd := p.cooldowns[id]
-	if cd == nil || cd.rateEstimate <= 0 {
-		return
-	}
-	emission := emissionInterval(cd.rateEstimate)
-	if cd.tat.IsZero() {
-		// Seed the cycle at a staggered phase so peers don't fire in lockstep.
-		cd.tat = now.Add(phaseOffset(id, emission))
-	}
-	cd.tat = gcraAdvance(now, cd.tat, emission)
 }
 
 // decayCountersLocked drops cooldown state for accounts whose last error is
@@ -1246,29 +1090,6 @@ func (p *AccountPool) decayCountersLocked(now time.Time) {
 			cd.consecutiveErrs = 0
 			continue
 		}
-		// Don't drop an entry that carries a LEARNED PACED RATE. Deleting it
-		// would reset the account to unpaced (full-speed), so the next burst
-		// would re-trip the 429 we already learned to avoid — a sawtooth at the
-		// decay period. The probe-up path (RecordSuccess) keeps climbing the
-		// rate back toward the true ceiling at +5%/probe, so a stale-but-low
-		// estimate self-corrects without ever needing to re-discover via a 429.
-		// Age out only the error history.
-		if cd.rateEstimate > 0 {
-			cd.lastErrorAt = time.Time{}
-			cd.lastSleep = 0
-			cd.consecutiveErrs = 0
-			continue
-		}
-		// Likewise preserve a learned TTFT measurement: an account whose error
-		// history has aged out but which we've measured latency for should keep
-		// that EWMA so the latency-aware scorer doesn't lose its "fast lane"
-		// signal and have to re-learn from scratch. Age out only the error fields.
-		if cd.ttftEWMA > 0 {
-			cd.lastErrorAt = time.Time{}
-			cd.lastSleep = 0
-			cd.consecutiveErrs = 0
-			continue
-		}
 		delete(p.cooldowns, id)
 	}
 }
@@ -1286,26 +1107,6 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 	return nil
 }
 
-// RecordTTFT folds a time-to-first-token sample (milliseconds) into the
-// account's EWMA, the load signal the latency-aware scorer steers by. Called
-// once per request when the first content byte/token arrives upstream. Creates
-// the cooldown entry if needed (an account we've only ever measured latency for
-// still needs somewhere to keep it). A non-positive or absent sample is ignored
-// by updateTTFT, so a request that produced no token never corrupts the EWMA.
-func (p *AccountPool) RecordTTFT(id string, ms float64) {
-	if ms <= 0 {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	cd := p.cooldowns[id]
-	if cd == nil {
-		cd = &cooldownEntry{limit: aimdInitialLimit}
-		p.cooldowns[id] = cd
-	}
-	cd.ttftEWMA = updateTTFT(cd.ttftEWMA, ms)
-}
-
 // RecordSuccess clears soft cooldown and resets the consecutive error counter.
 // It also grows the account's concurrency limit using TCP-style slow-start /
 // congestion-avoidance, but only while the account is actually USING its limit
@@ -1318,39 +1119,18 @@ func (p *AccountPool) RecordTTFT(id string, ms float64) {
 // is unaffected and continues to be enforced by computeEffectiveWeight on the
 // next Reload.
 //
-//
-// It also feeds the RATE pacer (see rate_pacer.go): every success folds the
-// inter-success interval into the achieved-throughput EWMA (used to seed the
-// snap-down on a future 429), and — if the account is currently paced — probes
-// the paced rate upward once per rateProbeInterval so it climbs back toward the
-// true ceiling instead of staying pinned low.
-//
 // We preserve the cooldown entry (rather than deleting it) so the concurrency
-// limit, the remembered ssthresh, AND the learned paced rate survive across
-// requests; the soft-cooldown fields are cleared instead.
+// limit and the remembered ssthresh survive across requests; the soft-cooldown
+// fields are cleared instead.
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cd := p.cooldowns[id]
 	if cd == nil {
 		// No prior state: nothing to clear, and a fresh account starts at the
-		// initial limit implicitly (limitLocked treats absent as initial). We
-		// create an entry to begin observing throughput so a later 429 has a
-		// measured rate to snap down from instead of falling to the floor blind.
+		// initial limit implicitly (limitLocked treats absent as initial).
 		cd = &cooldownEntry{limit: aimdInitialLimit}
 		p.cooldowns[id] = cd
-	}
-	now := time.Now()
-	// Observe achieved throughput: fold the inter-success interval into the EWMA.
-	if !cd.lastSuccessAt.IsZero() {
-		cd.observedRate = updateObservedRate(cd.observedRate, now.Sub(cd.lastSuccessAt))
-	}
-	cd.lastSuccessAt = now
-	// Probe the paced rate upward on sustained success (AIMD additive-increase),
-	// rate-limited to once per rateProbeInterval. Only when actually paced.
-	if cd.rateEstimate > 0 && now.Sub(cd.lastProbeAt) >= rateProbeInterval {
-		cd.rateEstimate = aimdRateProbe(cd.rateEstimate)
-		cd.lastProbeAt = now
 	}
 	initial, max := p.concurrencyBounds()
 	// Clear soft-cooldown / error state.
@@ -1387,16 +1167,10 @@ func (p *AccountPool) RecordSuccess(id string) {
 		}
 	}
 	cd.limit = limit
-	// Drop the entry only when it carries NO useful state at all. A lastSuccessAt
-	// measurement must survive so the NEXT success can compute the inter-success
-	// interval that feeds observedRate (the foundation of "discover then pace") —
-	// deleting it here was silently resetting the measurement between every pair
-	// of successes. A remembered ssthresh must likewise survive so recovery snaps
-	// back to the known-good ceiling. Idle measurement-only entries are reaped
-	// later by decayCountersLocked.
-	if cd.inflight == 0 && cd.limit == initial && cd.ssthresh == 0 && cd.lastErrorAt.IsZero() &&
-		cd.rateEstimate == 0 && cd.observedRate == 0 && cd.lastSuccessAt.IsZero() &&
-		cd.ttftEWMA == 0 {
+	// Drop the entry only when it carries NO useful state at all. A remembered
+	// ssthresh must survive so recovery snaps back to the known-good ceiling.
+	// Idle measurement-only entries are reaped later by decayCountersLocked.
+	if cd.inflight == 0 && cd.limit == initial && cd.ssthresh == 0 && cd.lastErrorAt.IsZero() {
 		delete(p.cooldowns, id)
 	}
 }
@@ -1449,7 +1223,6 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 		cd.lastSleep = clamped
 		cd.consecutiveErrs = 0
 		p.aimdDecreaseLocked(cd)
-		p.rateDecreaseLocked(cd)
 
 	case isQuotaError:
 		// Decorrelated jitter: sleep = random(base, min(cap, prev × 3)).
@@ -1472,7 +1245,6 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool, retryAfter time.
 		cd.lastSleep = jittered
 		cd.consecutiveErrs = 0
 		p.aimdDecreaseLocked(cd)
-		p.rateDecreaseLocked(cd)
 
 	default:
 		cd.consecutiveErrs++
@@ -1516,25 +1288,6 @@ func (p *AccountPool) aimdDecreaseLocked(cd *cooldownEntry) {
 	// returns near the discovered ceiling and then probes additively above it.
 	cd.ssthresh = limit
 	cd.limit = limit
-}
-
-// rateDecreaseLocked applies the AIMD multiplicative-decrease to the learned
-// PACED RATE on a quota error: rate = max(rateMinPaced, observedRate × 0.5).
-// This is the "discover then pace" snap-down — the first 429 AFTER we have
-// measured throughput turns an unpaced account into a paced one at half the
-// rate it was actually achieving; a subsequent 429 cuts further. When no
-// throughput was ever measured (observedRate == 0) aimdRateDecrease returns 0
-// and the account stays UNPACED — the cooldown + concurrency AIMD handle that
-// case, exactly as before the pacer existed. The TAT is reset so pacing starts
-// cleanly from the new rate on the next pick. Caller must hold p.mu.
-func (p *AccountPool) rateDecreaseLocked(cd *cooldownEntry) {
-	newRate := aimdRateDecrease(cd.observedRate)
-	if newRate <= 0 {
-		return // unmeasured: stay unpaced
-	}
-	cd.rateEstimate = newRate
-	cd.tat = time.Time{}
-	cd.lastProbeAt = time.Now()
 }
 
 // cooldownExpiryJitterDuration returns a random duration in [0, cooldownExpiryJitter)
