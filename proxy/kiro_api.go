@@ -12,6 +12,8 @@ import (
 	neturl "net/url"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // kiroRestBase resolves the REST base URL for the active region. Read at
@@ -218,6 +220,13 @@ func setKiroHeaders(req *http.Request, account *config.Account) {
 
 	req.Header.Set("Accept", "application/json")
 	applyKiroBaseHeaders(req, account, headerValues)
+	// AWS SDK retry-metrics / observability headers, matching what the real Kiro
+	// client (and the in-tree kiro2api reference) send on these management calls.
+	// amz-sdk-invocation-id is a per-call UUID; amz-sdk-request reports the
+	// attempt counter — "attempt=1; max=1" because these REST calls are
+	// single-shot (no SDK-level retry on this path).
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=1")
 }
 
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）

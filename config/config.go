@@ -302,12 +302,13 @@ type Config struct {
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
-	// PreferredEndpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
+	// PreferredEndpoint / EndpointFallback are DEPRECATED and unused as of the
+	// runtime-only inference change: streaming targets runtime.<region>.kiro.dev
+	// with no fallback chain, so there is nothing to "prefer" or "fall back" to.
+	// The fields are retained (json tags kept) ONLY so an older config.json that
+	// still carries these keys parses without error; nothing reads them.
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
-
-	// EndpointFallback controls whether to try other endpoints when the preferred one fails.
-	// Defaults to true. Set to false to only use the preferred endpoint.
-	EndpointFallback *bool `json:"endpointFallback,omitempty"`
+	EndpointFallback  *bool  `json:"endpointFallback,omitempty"`
 
 	// KiroAPIRegion is the AWS region used when constructing the streaming +
 	// REST endpoints (e.g. "us-east-1", "eu-west-1"). Defaults to "us-east-1"
@@ -530,7 +531,7 @@ type AccountInfo struct {
 
 // Version current version
 // Version current version
-const Version = "1.0.10-A24"
+const Version = "1.0.10-A25"
 
 var (
 	cfg     *Config
@@ -1378,42 +1379,6 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
-	return Save()
-}
-
-// GetPreferredEndpoint 获取首选端点配置
-func GetPreferredEndpoint() string {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.PreferredEndpoint == "" {
-		return "auto"
-	}
-	return cfg.PreferredEndpoint
-}
-
-// UpdatePreferredEndpoint 更新首选端点配置
-func UpdatePreferredEndpoint(endpoint string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.PreferredEndpoint = endpoint
-	return Save()
-}
-
-// GetEndpointFallback returns whether endpoint fallback is enabled. Defaults to true.
-func GetEndpointFallback() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.EndpointFallback == nil {
-		return true
-	}
-	return *cfg.EndpointFallback
-}
-
-// UpdateEndpointFallback sets the endpoint fallback switch and persists the change.
-func UpdateEndpointFallback(enabled bool) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.EndpointFallback = &enabled
 	return Save()
 }
 

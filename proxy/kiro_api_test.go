@@ -94,3 +94,29 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
+
+// TestSetKiroHeadersIncludesAmzSdkHeaders verifies the account-MANAGEMENT REST
+// path carries the AWS SDK retry-metrics headers the real Kiro client (and the
+// in-tree kiro2api reference) send: a per-call amz-sdk-invocation-id UUID and
+// amz-sdk-request="attempt=1; max=1" (single-shot — no SDK-level retry here).
+func TestSetKiroHeadersIncludesAmzSdkHeaders(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	setKiroHeaders(req, &config.Account{ID: "acct", AccessToken: "tok"})
+
+	if got := req.Header.Get("Amz-Sdk-Request"); got != "attempt=1; max=1" {
+		t.Fatalf("expected amz-sdk-request=\"attempt=1; max=1\", got %q", got)
+	}
+	inv := req.Header.Get("Amz-Sdk-Invocation-Id")
+	if strings.TrimSpace(inv) == "" {
+		t.Fatal("expected a non-empty amz-sdk-invocation-id")
+	}
+	// Two calls must produce distinct invocation ids (it's per-call).
+	req2, _ := http.NewRequest(http.MethodGet, "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits", nil)
+	setKiroHeaders(req2, &config.Account{ID: "acct", AccessToken: "tok"})
+	if req2.Header.Get("Amz-Sdk-Invocation-Id") == inv {
+		t.Fatal("amz-sdk-invocation-id must be unique per call")
+	}
+}
