@@ -133,7 +133,13 @@
 
         .num { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 
-        ::selection { background: var(--accent-soft); }
+        /* Text selection. Force BOTH a saturated background and an explicit
+           text color: setting background alone (the old rule) left selected
+           text in its own color — muted grays and colored badges then vanished
+           against the soft tint. Indigo + white reads clearly in light AND dark
+           and overrides each element's own color while selected. */
+        ::selection { background: var(--accent); color: var(--on-accent); }
+        ::-moz-selection { background: var(--accent); color: var(--on-accent); }
 
         /* Scrollbars */
         * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
@@ -1325,6 +1331,8 @@
                 'providers.modelsHint': '从该提供商实时获取的模型',
                 'providers.noModels': '无模型',
                 'providers.noModelsHint': '尚未缓存模型——请刷新模型或发起一次请求',
+                'providers.anyModel': '任意模型',
+                'providers.anyModelHint': '未固定模型列表——该账号可路由任意模型，上游在请求时校验模型 id。可点“刷新模型”尝试拉取列表。',
                 'providers.refreshModels': '刷新模型',
                 'tabs.analytics': '分析',
                 'apikeys.title': 'API 密钥',
@@ -1607,6 +1615,8 @@
                 'export.copyJson': '复制 JSON',
                 'export.copied': '已复制到剪贴板',
                 'export.noSelection': '请至少选择一个账号',
+                'export.ninerouter': '导出为 9router',
+                'export.ninerouterHint': '导出为 9router 备份格式（可导入 9router）',
                 'import.title': '导入账号',
                 'import.pickFile': '选择 JSON 文件',
                 'import.orPaste': '或粘贴 JSON',
@@ -1629,6 +1639,11 @@
                 'import.noSelection': '请至少选择一个待导入的账号',
                 'import.requestFailed': '请求失败：{0}',
                 'import.tokenLines': 'RefreshToken 列表（每行一个）',
+                'import.ninerouter': '导入 9router 备份',
+                'import.ninerouterHint': '导入 9router 配置/备份（providerConnections、providerNodes、apiKeys）',
+                'import.ninerouterNotDetected': '未检测到 9router 备份格式（缺少 providerConnections/providerNodes/combos）',
+                'import.ninerouterDone': '9router 导入完成：账号 {0}、提供商 {1}、密钥 {2}、跳过 {3}、失败 {4}',
+                'import.ninerouterUnsupported': '无法映射的提供商：{0}',
                 'update.title': '版本更新',
                 'update.current': '当前版本',
                 'update.latest': '最新版本',
@@ -1756,6 +1771,8 @@
                 'providers.modelsHint': 'Models fetched live from this provider',
                 'providers.noModels': 'no models',
                 'providers.noModelsHint': 'No models cached yet — refresh models or send a request',
+                'providers.anyModel': 'any model',
+                'providers.anyModelHint': 'No model list pinned — this account routes any model; the upstream validates the id at request time. Click "Refresh models" to try fetching a list.',
                 'providers.refreshModels': 'Refresh models',
                 'tabs.analytics': 'Analytics',
                 'apikeys.title': 'API Keys',
@@ -2038,6 +2055,8 @@
                 'export.copyJson': 'Copy JSON',
                 'export.copied': 'Copied to clipboard',
                 'export.noSelection': 'Please select at least one account',
+                'export.ninerouter': 'Export as 9router',
+                'export.ninerouterHint': 'Export as a 9router backup (importable into 9router)',
                 'import.title': 'Import Accounts',
                 'import.pickFile': 'Choose JSON File',
                 'import.orPaste': 'or paste JSON',
@@ -2060,6 +2079,11 @@
                 'import.noSelection': 'Please select at least one account to import',
                 'import.requestFailed': 'Request failed: {0}',
                 'import.tokenLines': 'RefreshToken list (one per line)',
+                'import.ninerouter': 'Import 9router Backup',
+                'import.ninerouterHint': 'Import a 9router config/backup (providerConnections, providerNodes, apiKeys)',
+                'import.ninerouterNotDetected': 'Not a 9router backup (missing providerConnections/providerNodes/combos)',
+                'import.ninerouterDone': '9router import done: {0} accounts, {1} providers, {2} keys, {3} skipped, {4} failed',
+                'import.ninerouterUnsupported': 'Could not map providers: {0}',
                 'update.title': 'Version Update',
                 'update.current': 'Current',
                 'update.latest': 'Latest',
@@ -3958,6 +3982,7 @@
                 '  <div class="form-group"><label>API Base URL <span style="font-weight:normal;color:#64748b;font-size:12px">(not the /chat/completions URL — just the base)</span></label><input type="text" id="provCustomBase" placeholder="https://api.example.com/v1"></div>' +
                 '  <div class="form-group"><label>Dialect</label><select id="provCustomDialect"><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic-compatible</option><option value="gemini">Gemini</option></select></div>' +
                 '  <div class="form-group"><label>Route Prefix <span style="font-weight:normal;color:#64748b;font-size:12px">(optional; defaults to a slug of the name)</span></label><input type="text" id="provCustomAlias" placeholder="mygw"></div>' +
+                '  <div class="form-group"><label>Models <span style="font-weight:normal;color:#64748b;font-size:12px">(optional; comma-separated. Use this if the endpoint has no /models list)</span></label><input type="text" id="provCustomModels" placeholder="gpt-4o, llama-3.3-70b"></div>' +
                 '</div>' +
                 '<div class="form-group"><label>API Key</label><input type="password" id="provApiKey" placeholder="sk-..."></div>' +
                 '<div class="form-group" id="provNameRow"><label>Name <span style="font-weight:normal;color:#64748b;font-size:12px">(optional)</span></label><input type="text" id="provName" placeholder="My Groq key"></div>' +
@@ -3987,6 +4012,10 @@
                 payload.baseURL = document.getElementById('provCustomBase').value.trim();
                 payload.dialect = document.getElementById('provCustomDialect').value;
                 payload.alias = document.getElementById('provCustomAlias').value.trim();
+                const modelsRaw = (document.getElementById('provCustomModels').value || '').trim();
+                if (modelsRaw) {
+                    payload.models = modelsRaw.split(',').map(s => s.trim()).filter(Boolean);
+                }
                 if (!payload.baseURL) { alert('API Base URL is required for a custom provider'); return; }
             } else {
                 payload.name = document.getElementById('provName').value.trim();
@@ -4061,7 +4090,7 @@
                         : '<span class="badge badge-warning">' + t('accounts.disabled') + '</span>';
                     const modelsBadge = a.modelCount
                         ? '<span class="badge badge-success" title="' + t('providers.modelsHint') + '">' + a.modelCount + ' ' + t('providers.models') + '</span>'
-                        : '<span class="badge badge-warning" title="' + t('providers.noModelsHint') + '">' + t('providers.noModels') + '</span>';
+                        : '<span class="badge badge-info" title="' + t('providers.anyModelHint') + '">' + t('providers.anyModel') + '</span>';
                     const planBadge = a.codexPlanType ? '<span class="badge badge-pro">' + a.codexPlanType + '</span>' : '';
                     const name = a.nickname || a.email || a.id.slice(0, 8);
                     const actions = '<div class="row-actions">' +
@@ -4615,6 +4644,7 @@
                 '<button class="btn btn-secondary" onclick="closeExportModal()">' + t('common.cancel') + '</button>' +
                 '<button class="btn btn-secondary" onclick="exportShowJson()">' + t('export.showJson') + '</button>' +
                 '<button class="btn btn-secondary" onclick="exportCopyJson()">' + t('export.copyJson') + '</button>' +
+                '<button class="btn btn-secondary" onclick="exportDownloadNineRouter()" title="' + t('export.ninerouterHint') + '">' + t('export.ninerouter') + '</button>' +
                 '<button class="btn btn-primary" onclick="exportDownloadJson()">' + t('export.downloadJson') + '</button>' +
                 '</div>';
         }
@@ -4678,6 +4708,31 @@
             URL.revokeObjectURL(url);
         }
 
+        // Export the selected accounts as a 9router logical backup (the shape
+        // 9router's GET /api/settings/database returns). Empty selection = all.
+        async function exportDownloadNineRouter() {
+            if (exportSelectedIds.size === 0) { alert(t('export.noSelection')); return; }
+            const res = await fetch('/admin/api/export/9router', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ ids: Array.from(exportSelectedIds) })
+            });
+            if (!res.ok) {
+                let msg = 'Unknown error';
+                try { msg = (await res.json()).error || msg; } catch (e) { }
+                alert(t('common.failed') + ': ' + msg);
+                return;
+            }
+            const text = await res.text();
+            const blob = new Blob([text], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '9router-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
         // ==================== 导入功能 ====================
         // 解析后的待导入条目，每项 {refreshToken, accessToken?, clientId?, clientSecret?, authMethod?, provider?, region?, email?, nickname?, userId?, machineId?, idx, selected, status?, reason?}
         let importParsedRows = [];
@@ -4718,7 +4773,8 @@
                 '<span style="font-size:12px;color:#64748b">' + t('import.orPaste') + '</span>' +
                 '</div>' +
                 '<div class="form-group"><textarea id="importJsonText" placeholder="' + t('import.parsePlaceholder') + '" style="min-height:140px;font-family:monospace;font-size:11px"></textarea></div>' +
-                '<div style="margin-bottom:8px"><button class="btn btn-secondary btn-sm" onclick="importParse()">' + t('import.parse') + '</button></div>' +
+                '<div style="margin-bottom:8px"><button class="btn btn-secondary btn-sm" onclick="importParse()">' + t('import.parse') + '</button>' +
+                ' <button class="btn btn-secondary btn-sm" onclick="importNineRouter()" title="' + t('import.ninerouterHint') + '">' + t('import.ninerouter') + '</button></div>' +
                 listHtml +
                 '<div class="modal-footer">' +
                 '<button class="btn btn-secondary" onclick="closeImportModal()">' + t('common.cancel') + '</button>' +
@@ -4916,6 +4972,50 @@
                 loadAccounts();
                 loadStats();
                 newAccountIds.forEach(id => autoRefreshNewAccount(id));
+            }
+        }
+
+        // Import a 9router logical backup (the JSON 9router's
+        // GET /api/settings/database returns). Sends the raw textarea/file body
+        // to /admin/api/import/9router, which registers custom providers +
+        // accounts + inbound keys for Kiro/Codex/Qoder/custom providers.
+        async function importNineRouter() {
+            const raw = (document.getElementById('importJsonText').value || '').trim();
+            if (!raw) { alert(t('import.parseEmpty')); return; }
+            // Sanity check: must parse and look like a 9router envelope.
+            let probe;
+            try { probe = JSON.parse(raw); }
+            catch (e) { alert(t('import.parseError', e.message || e)); return; }
+            if (!probe || (!Array.isArray(probe.providerConnections) && !Array.isArray(probe.providerNodes) && !Array.isArray(probe.combos))) {
+                alert(t('import.ninerouterNotDetected'));
+                return;
+            }
+
+            let data;
+            try {
+                const res = await fetch('/admin/api/import/9router', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: raw
+                });
+                data = await res.json();
+                if (!res.ok) {
+                    alert(t('import.requestFailed', data && data.error ? data.error : res.status));
+                    return;
+                }
+            } catch (e) {
+                alert(t('import.requestFailed', e.message || e));
+                return;
+            }
+
+            const unsupported = (data.unsupportedSlugs || []);
+            alert(t('import.ninerouterDone',
+                data.accounts || 0, data.providers || 0, data.apiKeys || 0, data.skipped || 0, data.failed || 0)
+                + (unsupported.length ? '\n' + t('import.ninerouterUnsupported', unsupported.join(', ')) : ''));
+
+            if ((data.accounts || 0) > 0 || (data.providers || 0) > 0) {
+                loadAccounts();
+                loadStats();
             }
         }
 

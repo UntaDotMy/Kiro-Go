@@ -88,8 +88,9 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 		// ProviderConfig on the fly — no separate provider-registration step. This
 		// is the "add any OpenAI-compatible endpoint" path: it does NOT reuse the
 		// Kiro account schema.
-		Dialect string `json:"dialect"` // openai | anthropic | gemini (custom only)
-		Alias   string `json:"alias"`   // optional routing prefix (custom only)
+		Dialect string   `json:"dialect"` // openai | anthropic | gemini (custom only)
+		Alias   string   `json:"alias"`   // optional routing prefix (custom only)
+		Models  []string `json:"models"`  // optional static model list (custom only)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -170,6 +171,7 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			Name:        name,
 			Dialect:     dialect,
 			BaseURL:     base,
+			Models:      sanitizeModelList(req.Models),
 			FetchModels: true,
 		}
 		if err := config.AddProvider(pc); err != nil {
@@ -235,24 +237,62 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 	// failure here doesn't fail the add — the account is created either way and a
 	// later models-refresh / first request will populate it. This is what makes
 	// "add your OpenAI-compatible endpoint and it gets the models" work on add.
+	//
+	// Fallback order: live /models fetch → the provider's configured static list
+	// (a custom provider can pin one when its endpoint has no /models). An empty
+	// final list is harmless — the pool treats "no cached models" as "serves any
+	// model", so routing still works and the upstream validates the id at call
+	// time. We surface modelSource so the dashboard can explain a 0 count.
 	models := []string{}
+	modelSource := "none"
 	if prov, ok := ProviderForBackend(backend).(*genericProvider); ok {
 		if ids, ferr := prov.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
 			models = ids
-			h.pool.SetModelList(acct.ID, ids)
+			modelSource = "fetched"
 			logger.Infof("[Providers] %s account %s: fetched %d models", backend, acct.ID, len(ids))
 		} else if ferr != nil {
 			logger.Warnf("[Providers] %s account %s: model fetch failed (account still added): %v", backend, acct.ID, ferr)
 		}
 	}
+	// Fall back to the provider's static model list when the live fetch found
+	// nothing (offline endpoint, no /models route, or a non-generic provider).
+	if len(models) == 0 {
+		if pc, ok := config.GetProviderConfig(backend); ok && len(pc.Models) > 0 {
+			models = append(models, pc.Models...)
+			modelSource = "static"
+		}
+	}
+	if len(models) > 0 {
+		h.pool.SetModelList(acct.ID, models)
+	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":    true,
-		"id":         acct.ID,
-		"backend":    backend,
-		"modelCount": len(models),
-		"models":     models,
+		"success":     true,
+		"id":          acct.ID,
+		"backend":     backend,
+		"modelCount":  len(models),
+		"models":      models,
+		"modelSource": modelSource,
 	})
+}
+
+// sanitizeModelList trims, de-dupes, and drops empty entries from a
+// user-supplied model id list (custom-provider "Models" field).
+func sanitizeModelList(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, m := range in {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[strings.ToLower(m)] {
+			continue
+		}
+		seen[strings.ToLower(m)] = true
+		out = append(out, m)
+	}
+	return out
 }
 
 // slugifyProviderID turns a display name into a lowercase, dash-separated id
@@ -342,6 +382,32 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// seedProviderModelList populates the pool's per-account model filter (and the
+// global models cache) right after a non-Kiro account is created, so the
+// dashboard shows the real model count immediately instead of "0 models".
+// Best-effort: a provider whose ListModels needs the network (generic) is
+// handled by the add path's own live fetch; this covers the static-catalog
+// providers (codex, qoder) whose ListModels is local and never fails.
+func (h *Handler) seedProviderModelList(acct *config.Account) {
+	prov := ProviderFor(acct)
+	if prov == nil {
+		return
+	}
+	models, err := prov.ListModels(acct)
+	if err != nil || len(models) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		ids = append(ids, m.ModelId)
+	}
+	h.pool.SetModelList(acct.ID, ids)
+	h.modelsCacheMu.Lock()
+	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.modelsCacheTime = nowUnixSeconds()
+	h.modelsCacheMu.Unlock()
 }
 
 // ---- Codex (ChatGPT) OAuth admin endpoints --------------------------------
@@ -454,6 +520,7 @@ func (h *Handler) createCodexAccount(t *auth.CodexTokens, name string) (string, 
 		return "", err
 	}
 	h.pool.Reload()
+	h.seedProviderModelList(&acct)
 	logger.Infof("[Codex] Added account %s (%s, plan=%s)", acct.ID, nm, t.PlanType)
 	// Kick off an initial usage poll in the background so routing has the quota
 	// windows promptly.
@@ -545,6 +612,7 @@ func (h *Handler) apiPollQoderLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.pool.Reload()
+	h.seedProviderModelList(&acct)
 	qoderSessionsMu.Lock()
 	delete(qoderSessions, req.SessionID)
 	qoderSessionsMu.Unlock()

@@ -468,20 +468,24 @@ func TestBuildAnthropicModelsResponseHandlesAutoAndKnownAliases(t *testing.T) {
 }
 
 // TestBuildAnthropicModelsResponseContextWindowFromKiro pins the compaction
-// fix: the advertised context_window must come from Kiro's tokenLimits, never a
-// guess derived from the model id's version number. A model WITHOUT tokenLimits
-// must fall back to the safe 200K default — NOT the old fabricated 1M for >=4.6
-// ids, which set a context-aware client's auto-compaction threshold near ~920K
-// so it never compacted while the usage gauge passed 100%.
+// fix: the advertised context_window is sourced from Kiro's tokenLimits when
+// present, and otherwise falls back to a version-parse of the model id (Claude
+// >= 4.6 and any major >= 5 are 1M; earlier are 200K). Advertising the TRUE
+// window keeps a context-aware client's (Claude Code) usage numerator and window
+// denominator consistent so its ~95%-of-window auto-compaction threshold fires
+// at the right point rather than the gauge sailing past 100% with no compaction.
 func TestBuildAnthropicModelsResponseContextWindowFromKiro(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{
 		// Kiro reports a real 1M window for this model — honor it.
 		{ModelId: "claude-sonnet-4-6", InputTypes: []string{"text"}, TokenLimits: tokenLimits(1_000_000, 8192)},
-		// Kiro reports a 200K window — honor it.
-		{ModelId: "claude-opus-4-5", InputTypes: []string{"text"}, TokenLimits: tokenLimits(200_000, 32000)},
-		// No tokenLimits at all — must fall back to the safe default, even
-		// though the id parses as >=4.6 (the old code fabricated 1M here).
+		// Kiro reports a 200K window — honor it (authoritative, even though the
+		// id parses as >=4.6: the upstream's explicit figure always wins).
+		{ModelId: "claude-opus-4-6", InputTypes: []string{"text"}, TokenLimits: tokenLimits(200_000, 32000)},
+		// No tokenLimits at all — fall back to the version parse: opus-4-8 is
+		// >=4.6 so it resolves to the 1M window.
 		{ModelId: "claude-opus-4-8", InputTypes: []string{"text"}},
+		// No tokenLimits, id parses < 4.6 — fall back to the 200K default.
+		{ModelId: "claude-opus-4-5", InputTypes: []string{"text"}},
 	}, "-thinking")
 
 	got := map[string]int{}
@@ -498,11 +502,14 @@ func TestBuildAnthropicModelsResponseContextWindowFromKiro(t *testing.T) {
 	if got["claude-sonnet-4-6"] != 1_000_000 {
 		t.Errorf("sonnet-4-6 should report Kiro's 1M window, got %d", got["claude-sonnet-4-6"])
 	}
-	if got["claude-opus-4-5"] != 200_000 {
-		t.Errorf("opus-4-5 should report Kiro's 200K window, got %d", got["claude-opus-4-5"])
+	if got["claude-opus-4-6"] != 200_000 {
+		t.Errorf("opus-4-6 should report Kiro's authoritative 200K window, got %d", got["claude-opus-4-6"])
 	}
-	if got["claude-opus-4-8"] != defaultContextWindow {
-		t.Errorf("opus-4-8 WITHOUT tokenLimits must fall back to the safe %d default (not a fabricated 1M), got %d", defaultContextWindow, got["claude-opus-4-8"])
+	if got["claude-opus-4-8"] != 1_000_000 {
+		t.Errorf("opus-4-8 WITHOUT tokenLimits must version-parse to the 1M window, got %d", got["claude-opus-4-8"])
+	}
+	if got["claude-opus-4-5"] != defaultContextWindow {
+		t.Errorf("opus-4-5 WITHOUT tokenLimits must fall back to the %d default, got %d", defaultContextWindow, got["claude-opus-4-5"])
 	}
 }
 
