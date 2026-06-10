@@ -3455,6 +3455,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiExportAccounts(w, r)
 	case path == "/import" && r.Method == "POST":
 		h.apiImportAccounts(w, r)
+	case path == "/export/9router" && r.Method == "POST":
+		h.apiExportNineRouter(w, r)
+	case path == "/import/9router" && r.Method == "POST":
+		h.apiImportNineRouter(w, r)
 	case path == "/websearch/probe" && r.Method == "POST":
 		h.apiProbeWebSearch(w, r)
 	default:
@@ -4532,21 +4536,57 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		Model string `json:"model"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+
+	backend := config.GetAccountBackend(account)
+
+	// Default test model is backend-aware: a Kiro model id is meaningless to a
+	// Codex/Qoder/custom provider and would fail upstream. Pick the first model
+	// the account's provider advertises, falling back to a per-backend default.
 	if req.Model == "" {
-		req.Model = "claude-sonnet-4"
+		req.Model = h.defaultTestModel(account, backend)
 	}
 
-	// Build a minimal chat payload
+	// Build a minimal chat payload. For NON-Kiro backends we must stash a
+	// NormalizedRequest on the context so the provider choke point
+	// (callProviderForKiro) has a real request to translate — otherwise Qoder /
+	// Codex / generic providers receive an empty message list and fail. For Kiro
+	// the prebuilt KiroPayload path is unchanged.
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 
+	// For a non-Kiro backend the upstream model is the de-prefixed id (strip any
+	// "qoder/"/"groq/" routing prefix the caller may have typed).
+	reqBackend, upstreamModel := ParseModelBackend(req.Model)
+	if reqBackend == "kiro" {
+		// No provider prefix typed; the account's own backend governs routing.
+		upstreamModel = actualModel
+	} else {
+		backend = reqBackend
+	}
+
 	openaiReq := &OpenAIRequest{
-		Model:     actualModel,
+		Model:     upstreamModel,
 		Messages:  []OpenAIMessage{{Role: "user", Content: "say ok"}},
-		MaxTokens: 5,
+		MaxTokens: 16,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+
+	ctx := context.Background()
+	var kiroPayload *KiroPayload
+	if backend == "kiro" {
+		kiroPayload = OpenAIToKiro(openaiReq, thinking)
+	} else {
+		// Stash the originating request so the generic / codex / qoder provider
+		// can build its own upstream body from it.
+		nr := &NormalizedRequest{
+			Model:         upstreamModel,
+			ClientDialect: DialectOpenAI,
+			OpenAI:        openaiReq,
+			Thinking:      thinking,
+			Stream:        false,
+		}
+		ctx = withNormalizedRequest(ctx, nr)
+	}
 
 	var content string
 	callback := &KiroStreamCallback{
@@ -4558,7 +4598,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnStopReason:   func(r string) {},
 	}
 
-	err := h.callProviderForKiro(context.Background(), account, kiroPayload, actualModel, thinking, callback)
+	err := h.callProviderForKiro(ctx, account, kiroPayload, upstreamModel, thinking, callback)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -4570,6 +4610,38 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		"reply":   content,
 		"model":   req.Model,
 	})
+}
+
+// defaultTestModel returns a sensible model id to exercise an account's backend.
+// It prefers the first id the provider advertises (via the cached pool list,
+// then a live ListModels), and falls back to a known-good per-backend default so
+// the Test button works even before any model refresh has run.
+func (h *Handler) defaultTestModel(account *config.Account, backend string) string {
+	if cached := h.pool.GetModelList(account.ID); len(cached) > 0 {
+		return cached[0]
+	}
+	if prov := ProviderFor(account); prov != nil {
+		if models, err := prov.ListModels(account); err == nil && len(models) > 0 {
+			return models[0].ModelId
+		}
+	}
+	switch backend {
+	case "codex":
+		return "gpt-5-codex"
+	case "qoder":
+		return "auto"
+	case "anthropic":
+		return "claude-sonnet-4-5"
+	case "gemini":
+		return "gemini-2.5-flash"
+	case "openai":
+		return "gpt-4o-mini"
+	case "kiro", "":
+		return "claude-sonnet-4"
+	}
+	// Generic/custom providers: no safe universal default — let the upstream
+	// validate. An empty id would be rejected, so use a common OpenAI id.
+	return "gpt-4o-mini"
 }
 
 // apiGetAccountOverage GET /admin/api/accounts/{id}/overage — reads the REAL

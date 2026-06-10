@@ -282,6 +282,42 @@ func GetAPIKeys() []APIKey {
 	return out
 }
 
+// AddRawAPIKey appends a fully-formed APIKey record verbatim (id + secret value
+// supplied by the caller), used by the 9router import path where the inbound key
+// value is preserved as-is rather than minted. Fills in a sane CreatedAt /
+// ResetPeriod / CountersDate when the caller left them zero, so the periodic
+// limiter behaves like a natively-created key. Deduplicates on the literal key
+// value: a record whose Key already exists is a no-op (returns nil).
+func AddRawAPIKey(k APIKey) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if strings.TrimSpace(k.Key) == "" {
+		return fmt.Errorf("key value is required")
+	}
+	for i := range cfg.APIKeys {
+		if cfg.APIKeys[i].Key == k.Key {
+			return nil // already present; idempotent import
+		}
+	}
+	if strings.TrimSpace(k.ID) == "" {
+		k.ID = generateAPIKeyID()
+	}
+	if k.CreatedAt == 0 {
+		k.CreatedAt = time.Now().Unix()
+	}
+	if k.ResetPeriod == "" {
+		k.ResetPeriod = "daily"
+	}
+	if k.ResetTZ == "" {
+		k.ResetTZ = "UTC"
+	}
+	if k.CountersDate == "" {
+		k.CountersDate = periodBucketKey(k.ResetPeriod, k.ResetTZ)
+	}
+	cfg.APIKeys = append(cfg.APIKeys, k)
+	return Save()
+}
+
 // AddAPIKey appends a new key with a freshly generated id+secret.
 func AddAPIKey(name string, models []string, reqLimit, tokLimit int, credLimit float64, expiresAt int64) (*APIKey, error) {
 	cfgLock.Lock()

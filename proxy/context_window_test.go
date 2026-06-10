@@ -2,37 +2,43 @@ package proxy
 
 import "testing"
 
-// TestGetContextWindowSize verifies the FALLBACK context window is always the
-// safe 200K default, regardless of the model id's version number.
+// TestGetContextWindowSize verifies the FALLBACK context window resolution used
+// when Kiro reports no authoritative tokenLimits for a model.
 //
-// This drives the input-token count clients use to decide when to compact. The
-// previous implementation version-parsed the id and returned 1_000_000 for any
-// Claude >= 4.6 — a FABRICATED window not backed by Kiro. That made /v1/models
-// advertise a 1M window for sonnet-4.6 / opus-4.8, which pushed a context-aware
-// client's (Claude Code) auto-compaction threshold to ~920K so it never
-// compacted in a normal session while the usage gauge sailed past 100%. The
-// authoritative non-default window now comes ONLY from Kiro's
-// tokenLimits.maxInputTokens (see contextWindowFromTokenLimits); this helper is
-// the safe fallback and never guesses 1M from an id.
+// This drives both the advertised /v1/models window and the pct×window input-
+// token back-conversion clients use to decide when to compact. The fallback
+// version-PARSES the id: Claude Opus/Sonnet/Haiku >= 4.6 (and any major >= 5)
+// have a 1M window; earlier versions are 200K. Advertising the TRUE window keeps
+// a context-aware client's (Claude Code) usage numerator and window denominator
+// consistent so its ~95%-of-window auto-compaction threshold fires at the right
+// point. The authoritative non-default window still comes from Kiro's
+// tokenLimits.maxInputTokens first (see contextWindowFromTokenLimits); this
+// helper is only reached when the upstream reports nothing.
 func TestGetContextWindowSize(t *testing.T) {
-	cases := []string{
-		"claude-opus-4.6",
-		"claude-opus-4-6",
-		"claude-opus-4.8",
-		"claude-opus-4-8",
-		"claude-sonnet-4.6",
-		"claude-sonnet-4-6",
-		"claude-opus-5.0",
-		"claude-opus-4.5",
-		"claude-sonnet-4.5",
-		"claude-haiku-4-5",
-		"claude-3-5-sonnet",
-		"unknown-model",
-		"",
+	cases := []struct {
+		model string
+		want  int
+	}{
+		// >= 4.6 (and major >= 5): 1M window, dotted and dashed forms.
+		{"claude-opus-4.6", 1_000_000},
+		{"claude-opus-4-6", 1_000_000},
+		{"claude-opus-4.8", 1_000_000},
+		{"claude-opus-4-8", 1_000_000},
+		{"claude-sonnet-4.6", 1_000_000},
+		{"claude-sonnet-4-6", 1_000_000},
+		{"claude-opus-5.0", 1_000_000},
+		// < 4.6: 200K window.
+		{"claude-opus-4.5", defaultContextWindow},
+		{"claude-sonnet-4.5", defaultContextWindow},
+		{"claude-haiku-4-5", defaultContextWindow},
+		{"claude-3-5-sonnet", defaultContextWindow},
+		// Unparseable / unknown ids fall back to the safe default.
+		{"unknown-model", defaultContextWindow},
+		{"", defaultContextWindow},
 	}
-	for _, model := range cases {
-		if got := getContextWindowSize(model); got != defaultContextWindow {
-			t.Errorf("getContextWindowSize(%q) = %d, want %d (fallback must never guess a larger window from the id)", model, got, defaultContextWindow)
+	for _, c := range cases {
+		if got := getContextWindowSize(c.model); got != c.want {
+			t.Errorf("getContextWindowSize(%q) = %d, want %d", c.model, got, c.want)
 		}
 	}
 }

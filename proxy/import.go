@@ -115,10 +115,33 @@ type importResponse struct {
 // crash leaves the previously-imported rows persisted. This matches the
 // pattern apiImportSsoToken / the existing UI loop already use.
 func (h *Handler) apiImportAccounts(w http.ResponseWriter, r *http.Request) {
-	body := http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
-	defer body.Close()
+	limited := http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	defer limited.Close()
 
-	creds, err := decodeImportBody(body)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "read body: " + err.Error()})
+		return
+	}
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
+
+	// Auto-route a 9router logical backup so a user can paste it into the same
+	// "Import" box. The native Kiro-only forms (export envelope / credential
+	// array / single credential) fall through to decodeImportBody below.
+	if looksLikeNineRouterBackup(raw) {
+		res, ierr := h.importNineRouterBackup(raw)
+		w.Header().Set("Content-Type", "application/json")
+		if ierr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": ierr.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(res)
+		return
+	}
+
+	creds, err := decodeImportBody(bytes.NewReader(raw))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

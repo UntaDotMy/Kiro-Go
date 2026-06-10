@@ -1136,20 +1136,107 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 const defaultContextWindow = 200_000
 
 // getContextWindowSize returns the FALLBACK context window (in tokens) for a
-// model id when no authoritative upstream figure is available. It always
-// returns defaultContextWindow (200K).
+// model id when no authoritative upstream figure is available.
 //
-// IMPORTANT: this used to version-parse the id and return 1_000_000 for any
-// Claude >= 4.6. That was a fabricated guess: it made /v1/models advertise a 1M
-// window for sonnet-4.6 / opus-4.8 and made the pct×window input-token
-// back-conversion compute against 1M. A client (e.g. Claude Code) that derives
-// its auto-compaction threshold from the window then sets it near ~920K and
-// NEVER compacts in a normal session, while its usage gauge — fed by the exact
-// upstream input_tokens — sails past 100%. The authoritative per-model window
-// now comes from Kiro's ListAvailableModels.tokenLimits.maxInputTokens via
-// Handler.contextWindowForModel; this pure helper is only the safe fallback.
+// Priority is always tokenLimits-first: Handler.contextWindowForModel consults
+// Kiro's ListAvailableModels.tokenLimits.maxInputTokens and only calls this
+// helper when the upstream reports nothing for the model. In that case we
+// version-PARSE the id: Claude Opus/Sonnet/Haiku >= 4.6 (and any major >= 5)
+// have a 1M-token window; earlier versions are 200K.
+//
+// A26 briefly collapsed this to a flat 200K, reasoning that a fabricated 1M
+// window pushed Claude Code's auto-compaction threshold to ~920K so it never
+// compacted. But for a genuinely-1M model that ~920K trigger is CORRECT, and
+// the flat-200K form created the opposite defect: the proxy forwards the exact
+// upstream input_tokens (which legitimately climbs past 200K on a 1M model)
+// while advertising only a 200K window, so Claude Code's usage gauge sails past
+// 100% and — because its threshold tracks the real opus window, not 200K —
+// compaction silently never fires. Restoring the version parse advertises the
+// TRUE window so numerator (real tokens) and denominator (window) agree again.
+//
+// This is a fallback only: when Kiro reports tokenLimits for the model, that
+// authoritative value wins and this function is never reached.
 func getContextWindowSize(model string) int {
+	if isLargeContextModel(model) {
+		return 1_000_000
+	}
 	return defaultContextWindow
+}
+
+// isLargeContextModel reports whether a Claude model has the 1M-token context
+// window. Claude Opus/Sonnet/Haiku >= 4.6 (and any major >= 5) are 1M; earlier
+// versions are 200K.
+//
+// We version-PARSE rather than substring-match a fixed "4.6"/"4.7" list so new
+// minors (4.8, 4.9, 4.10) and majors (5.x) are classified correctly without a
+// code change. The previous fixed-list form under-reported 4.8+ as 200K — a ~5x
+// under-count of input tokens — even though our model router resolves those ids.
+// A substring fallback covers non-standard identifiers that don't parse cleanly.
+func isLargeContextModel(model string) bool {
+	m := strings.ToLower(model)
+	if major, minor, ok := parseClaudeVersion(m); ok {
+		if major > 4 {
+			return true
+		}
+		if major == 4 && minor >= 6 {
+			return true
+		}
+		return false
+	}
+	// Fallback for ids that don't match the family-version shape.
+	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
+		if strings.Contains(m, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseClaudeVersion extracts the major.minor version from a
+// "claude-<family>-<major>.<minor>" (dot or dash) id without a regexp
+// dependency. Returns ok=false if the id doesn't match that shape.
+func parseClaudeVersion(m string) (major, minor int, ok bool) {
+	const prefix = "claude-"
+	if !strings.HasPrefix(m, prefix) {
+		return 0, 0, false
+	}
+	rest := m[len(prefix):]
+	for _, fam := range []string{"opus", "sonnet", "haiku"} {
+		famPrefix := fam + "-"
+		if !strings.HasPrefix(rest, famPrefix) {
+			continue
+		}
+		ver := rest[len(famPrefix):]
+		// Locate the major/minor separator ('.' or '-').
+		sep := -1
+		for i := 0; i < len(ver); i++ {
+			if ver[i] == '.' || ver[i] == '-' {
+				sep = i
+				break
+			}
+		}
+		if sep < 1 {
+			return 0, 0, false
+		}
+		majStr := ver[:sep]
+		// Minor is the run of digits after the separator (stop at next non-digit).
+		rem := ver[sep+1:]
+		end := 0
+		for end < len(rem) && rem[end] >= '0' && rem[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return 0, 0, false
+		}
+		minStr := rem[:end]
+		maj, errMaj := strconv.Atoi(majStr)
+		min, errMin := strconv.Atoi(minStr)
+		if errMaj != nil || errMin != nil {
+			return 0, 0, false
+		}
+		return maj, min, true
+	}
+	return 0, 0, false
 }
 
 // clampPercent bounds a context-usage percentage to [0,100]. Kiro forwards its

@@ -54,11 +54,38 @@ var builtinProviders = []builtinProvider{
 	{ID: "sambanova", Alias: "sambanova", Name: "SambaNova", Dialect: DialectOpenAI, BaseURL: "https://api.sambanova.ai/v1/chat/completions"},
 	{ID: "vercel-ai-gateway", Alias: "vercel", Name: "Vercel AI Gateway", Dialect: DialectOpenAI, BaseURL: "https://ai-gateway.vercel.sh/v1/chat/completions"},
 
+	// ---- Coding-assistant OpenAI-compatible providers (ported from 9router) ----
+	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v1/chat/completions"},
+	{ID: "qwen", Alias: "qwen", Name: "Qwen (Alibaba)", Dialect: DialectOpenAI, BaseURL: "https://portal.qwen.ai/v1/chat/completions"},
+	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions"},
+	{ID: "glm-cn", Alias: "glmcn", Name: "GLM (bigmodel.cn)", Dialect: DialectOpenAI, BaseURL: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"},
+	{ID: "kilocode", Alias: "kilo", Name: "Kilo Code", Dialect: DialectOpenAI, BaseURL: "https://api.kilo.ai/api/openrouter/chat/completions"},
+	{ID: "cline", Alias: "cline", Name: "Cline", Dialect: DialectOpenAI, BaseURL: "https://api.cline.bot/api/v1/chat/completions"},
+	{ID: "longcat", Alias: "longcat", Name: "LongCat (Meituan)", Dialect: DialectOpenAI, BaseURL: "https://api.longcat.chat/openai/v1/chat/completions"},
+	{ID: "alicode", Alias: "alicode", Name: "Alibaba Code", Dialect: DialectOpenAI, BaseURL: "https://coding.dashscope.aliyuncs.com/v1/chat/completions"},
+	{ID: "alicode-intl", Alias: "alicodeintl", Name: "Alibaba Code (Intl)", Dialect: DialectOpenAI, BaseURL: "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions"},
+	{ID: "gitlab", Alias: "gitlab", Name: "GitLab Duo", Dialect: DialectOpenAI, BaseURL: "https://gitlab.com/api/v4/chat/completions"},
+
+	// ---- Additional OpenAI-compatible inference providers (ported from 9router) ----
+	{ID: "novita", Alias: "novita", Name: "Novita AI", Dialect: DialectOpenAI, BaseURL: "https://api.novita.ai/v3/openai/chat/completions"},
+	{ID: "aimlapi", Alias: "aiml", Name: "AI/ML API", Dialect: DialectOpenAI, BaseURL: "https://api.aimlapi.com/v1/chat/completions"},
+	{ID: "baseten", Alias: "baseten", Name: "Baseten", Dialect: DialectOpenAI, BaseURL: "https://inference.baseten.co/v1/chat/completions"},
+	{ID: "scaleway", Alias: "scaleway", Name: "Scaleway", Dialect: DialectOpenAI, BaseURL: "https://api.scaleway.ai/v1/chat/completions"},
+	{ID: "nscale", Alias: "nscale", Name: "nscale", Dialect: DialectOpenAI, BaseURL: "https://inference.api.nscale.com/v1/chat/completions"},
+	{ID: "modal", Alias: "modal", Name: "Modal", Dialect: DialectOpenAI, BaseURL: "https://api.modal.com/v1/chat/completions"},
+	{ID: "ai21", Alias: "ai21", Name: "AI21 Labs", Dialect: DialectOpenAI, BaseURL: "https://api.ai21.com/studio/v1/chat/completions"},
+	{ID: "inference-net", Alias: "inferencenet", Name: "Inference.net", Dialect: DialectOpenAI, BaseURL: "https://api.inference.net/v1/chat/completions"},
+	{ID: "kluster", Alias: "kluster", Name: "Kluster AI", Dialect: DialectOpenAI, BaseURL: "https://api.kluster.ai/v1/chat/completions"},
+	{ID: "morph", Alias: "morph", Name: "Morph", Dialect: DialectOpenAI, BaseURL: "https://api.morphllm.com/v1/chat/completions"},
+	{ID: "xiaomi-mimo", Alias: "mimo", Name: "Xiaomi MiMo", Dialect: DialectOpenAI, BaseURL: "https://api.xiaomimimo.com/v1/chat/completions"},
+
 	// ---- Anthropic Messages dialect (x-api-key auth) ----
 	{ID: "anthropic", Alias: "anthropic", Name: "Anthropic", Dialect: DialectAnthropic, BaseURL: "https://api.anthropic.com/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "glm", Alias: "glm", Name: "GLM Coding", Dialect: DialectAnthropic, BaseURL: "https://api.z.ai/api/anthropic/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "kimi", Alias: "kimi", Name: "Kimi", Dialect: DialectAnthropic, BaseURL: "https://api.kimi.com/coding/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "minimax", Alias: "minimax", Name: "MiniMax", Dialect: DialectAnthropic, BaseURL: "https://api.minimax.io/anthropic/v1/messages", Headers: sharedClaudeHeaders},
+	{ID: "minimax-cn", Alias: "minimaxcn", Name: "MiniMax (CN)", Dialect: DialectAnthropic, BaseURL: "https://api.minimaxi.com/anthropic/v1/messages", Headers: sharedClaudeHeaders},
+	{ID: "agentrouter", Alias: "ar", Name: "AgentRouter", Dialect: DialectAnthropic, BaseURL: "https://agentrouter.org/v1/messages", Headers: sharedClaudeHeaders},
 
 	// ---- Google Gemini dialect (x-goog-api-key auth) ----
 	{ID: "gemini", Alias: "gemini", Name: "Gemini", Dialect: DialectGemini, BaseURL: "https://generativelanguage.googleapis.com/v1beta/models"},
