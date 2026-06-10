@@ -981,6 +981,22 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		models = append(models, buildModelInfo(alias, "kiro-proxy", true, 0))
 	}
 
+	// Append NON-Kiro provider models, each carrying its routing prefix
+	// ("<backend>/<model>", e.g. "groq/llama-3.3-70b", "codebuddy/gpt-4"). Their
+	// bare ids are deliberately kept out of the shared Kiro catalog — an
+	// unprefixed "llama-3.3-70b" would mis-route to Kiro — but the prefixed id is
+	// exactly what ParseModelBackend routes back to the provider, so it's both
+	// discoverable in the picker AND correct. This is what makes an added
+	// provider's working models actually show up in the list.
+	for _, pm := range h.providerPrefixedModelEntries() {
+		id, _ := pm["id"].(string)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		models = append(models, pm)
+	}
+
 	// Per-key model whitelist filter. When the caller authenticated with an
 	// API key that has a non-empty Models list, restrict the /v1/models
 	// response to entries on that list. Empty list (or no key, e.g.
@@ -1010,6 +1026,79 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"data":   models,
 	})
 	return
+}
+
+// providerPrefixedModelEntries builds /v1/models entries for every NON-Kiro
+// provider account, with each model id carrying the account's routing prefix
+// ("<backend>/<model>"). This is what surfaces an added provider's models in the
+// picker without polluting the shared Kiro catalog: the bare id stays private to
+// the pool's per-account routing filter (so an unprefixed request can't
+// mis-route to Kiro), while the prefixed id listed here is exactly what
+// ParseModelBackend resolves back to this provider.
+//
+// The prefix is the provider's short alias when one exists (e.g. "cb" for
+// codebuddy, "or" for openrouter), else the backend id itself. Models come from
+// the pool's cached per-account list (populated on add / refresh); an account
+// with no cached models contributes nothing here (it still "serves anything" at
+// call time, but there's no concrete id to advertise).
+func (h *Handler) providerPrefixedModelEntries() []map[string]interface{} {
+	accounts := config.GetEnabledAccounts()
+	if len(accounts) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0)
+	seen := make(map[string]bool)
+	for i := range accounts {
+		acct := &accounts[i]
+		backend := config.GetAccountBackend(acct)
+		if backend == "kiro" {
+			continue // Kiro models are already in the shared catalog.
+		}
+		prefix := routingPrefixForBackend(backend)
+		if prefix == "" {
+			continue
+		}
+		for _, bare := range h.pool.GetModelList(acct.ID) {
+			bare = strings.TrimSpace(bare)
+			if bare == "" {
+				continue
+			}
+			id := prefix + "/" + bare
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			// owned_by = backend so the picker can group/label by provider.
+			out = append(out, buildModelInfo(id, backend, false, 0))
+		}
+	}
+	return out
+}
+
+// routingPrefixForBackend returns the prefix a client uses to address a model on
+// a given backend: the provider's short alias when defined (built-in catalog or
+// a user ProviderConfig), else the backend id itself. The bespoke OAuth backends
+// (codex/qoder) use their canonical ids, which resolveProviderPrefix also
+// accepts.
+func routingPrefixForBackend(backend string) string {
+	b := strings.ToLower(strings.TrimSpace(backend))
+	if b == "" || b == "kiro" {
+		return ""
+	}
+	if bp, ok := resolveBuiltinProvider(b); ok {
+		if bp.Alias != "" {
+			return bp.Alias
+		}
+		return bp.ID
+	}
+	if pc, ok := config.GetProviderConfig(b); ok {
+		if strings.TrimSpace(pc.Alias) != "" {
+			return strings.ToLower(strings.TrimSpace(pc.Alias))
+		}
+		return strings.ToLower(strings.TrimSpace(pc.ID))
+	}
+	// Bespoke backends (codex, qoder) and anything else: address by the id.
+	return b
 }
 
 func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
@@ -3486,15 +3575,23 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		modelCount := len(h.pool.GetModelList(a.ID))
 
 		result[i] = map[string]interface{}{
-			"id":                a.ID,
-			"email":             a.Email,
-			"userId":            a.UserId,
-			"nickname":          a.Nickname,
-			"authMethod":        a.AuthMethod,
-			"provider":          a.Provider,
-			"modelCount":        modelCount,
-			"backend":           config.GetAccountBackend(&a),
-			"hasApiKey":         a.APIKey != "",
+			"id":         a.ID,
+			"email":      a.Email,
+			"userId":     a.UserId,
+			"nickname":   a.Nickname,
+			"authMethod": a.AuthMethod,
+			"provider":   a.Provider,
+			"modelCount": modelCount,
+			"backend":    config.GetAccountBackend(&a),
+			"hasApiKey":  a.APIKey != "",
+			// baseURLOverride/customDialect/customModels are returned (not masked)
+			// so the dashboard edit form can prefill them. They are NOT credentials
+			// — the API key itself is exposed only as the hasApiKey bool. This
+			// endpoint is admin-auth gated like every /admin/api route.
+			"baseURLOverride":   a.BaseURLOverride,
+			"customDialect":     a.CustomDialect,
+			"customModels":      a.CustomModels,
+			"modelList":         h.pool.GetModelList(a.ID),
 			"codexPlanType":     a.CodexPlanType,
 			"region":            a.Region,
 			"enabled":           a.Enabled,
@@ -3651,6 +3748,59 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 		existing.ProxyURL = v
 	}
 
+	// ---- Non-Kiro provider account fields (api key / base URL / models) ----
+	// Editable so an operator can rotate a leaked key, repoint a moved endpoint,
+	// or pin a model list after the fact — without deleting and re-adding. These
+	// are inert for Kiro accounts (a Kiro account has no APIKey and ignores
+	// BaseURLOverride/CustomModels), but we still guard the backend so a stray
+	// field on a Kiro PUT can't accidentally turn it into a custom provider.
+	isKiro := config.GetAccountBackend(existing) == "kiro"
+	modelsChanged := false
+	if v, ok := updates["apiKey"].(string); ok && !isKiro {
+		// Empty string means "leave unchanged" (the UI sends the masked field
+		// blank when the operator didn't touch it); a non-empty value rotates.
+		if tv := strings.TrimSpace(v); tv != "" {
+			existing.APIKey = tv
+		}
+	}
+	if v, ok := updates["baseURL"].(string); ok && !isKiro {
+		tv := strings.TrimSpace(v)
+		if tv != "" && !strings.HasPrefix(strings.ToLower(tv), "https://") {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+			return
+		}
+		// A self-contained custom account's BaseURLOverride is its ONLY URL —
+		// clearing it would strand the account unreachable (resolveProviderSettings
+		// requires both CustomDialect and BaseURLOverride). Reject the empty clear
+		// for custom accounts; named-provider accounts may clear their override.
+		if tv == "" && strings.TrimSpace(existing.CustomDialect) != "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL cannot be cleared for a custom provider account"})
+			return
+		}
+		existing.BaseURLOverride = tv
+	}
+	if raw, ok := updates["models"]; ok && !isKiro {
+		// Accept an array of strings or a comma-separated string; empty clears
+		// the pinned list (account reverts to "serves any model").
+		var list []string
+		switch mv := raw.(type) {
+		case []interface{}:
+			for _, it := range mv {
+				if s, ok := it.(string); ok {
+					list = append(list, s)
+				}
+			}
+		case string:
+			for _, s := range strings.Split(mv, ",") {
+				list = append(list, s)
+			}
+		}
+		existing.CustomModels = sanitizeModelList(list)
+		modelsChanged = true
+	}
+
 	if err := config.UpdateAccount(id, *existing); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -3658,6 +3808,12 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	h.pool.Reload()
+	// When the operator pinned/cleared a model list, push it to the pool's
+	// per-account routing filter immediately so /v1/models and routing reflect it
+	// without waiting for a refresh.
+	if modelsChanged {
+		h.pool.SetModelList(id, existing.CustomModels)
+	}
 	// 账号从禁用→启用时，自动拉取并缓存模型列表
 	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
 		safeGoArg("updateAccount-modelsRefresh", *existing, func(acc config.Account) {

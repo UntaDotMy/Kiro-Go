@@ -67,5 +67,9 @@ func resolveProviderPrefix(prefix string) (string, bool) {
 			return pc.ID, true
 		}
 	}
+	// Self-contained custom account whose Backend id IS the routing prefix.
+	if _, ok := config.GetCustomAccountByBackend(p); ok {
+		return p, true
+	}
 	return "", false
 }

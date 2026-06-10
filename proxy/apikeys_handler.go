@@ -248,6 +248,20 @@ func (h *Handler) apiGetAvailableModels(w http.ResponseWriter, r *http.Request) 
 		seen[alias] = true
 		models = append(models, buildModelInfo(alias, "kiro-proxy", true, 0))
 	}
+	// Include NON-Kiro provider models with their routing prefix (e.g.
+	// "groq/llama-3.3-70b", "cb/gpt-4o", "mygw/...") so the API-key editor can
+	// allowlist them too. This mirrors handleModels: the bare ids stay private to
+	// per-account routing, but the prefixed id is what a client actually sends.
+	// Without this, an operator could never restrict a key TO a provider model
+	// because it never appeared as a checkbox.
+	for _, pm := range h.providerPrefixedModelEntries() {
+		id, _ := pm["id"].(string)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		models = append(models, pm)
+	}
 	// Surface a flat list of ids — the form only needs the id strings,
 	// and the existing /v1/models response shape (full objects with
 	// owned_by, supportsImage, etc.) carries fields the checkbox form

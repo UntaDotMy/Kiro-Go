@@ -124,11 +124,14 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// "custom" backend: register a ProviderConfig on the fly from the supplied
-	// base URL + dialect, then point the account at it. This is the
-	// bring-your-own OpenAI-compatible endpoint flow — base URL is an API BASE
-	// (e.g. https://api.example.com/v1), NOT a full /chat/completions URL; the
-	// generic provider derives /chat/completions and /models from it.
+	// "custom" backend: a bring-your-own OpenAI/Anthropic/Gemini endpoint. Per
+	// the operator's choice we do NOT register a reusable Config.Providers[]
+	// entry — everything (dialect, base URL, optional pinned models) is stored
+	// INLINE on the account, and the account's Backend id is its own routing
+	// prefix. Base URL is an API BASE (e.g. https://api.example.com/v1), not a
+	// full /chat/completions URL; the generic provider derives the endpoints.
+	var customDialect string
+	var customModels []string
 	if backend == "custom" {
 		dialect := strings.ToLower(strings.TrimSpace(req.Dialect))
 		if dialect == "" {
@@ -152,39 +155,25 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
 			return
 		}
-		name := strings.TrimSpace(req.Name)
-		if name == "" {
-			name = "Custom Provider"
-		}
-		// Derive a stable id from the name (slug); ensure it doesn't collide with a
-		// built-in.
-		id := slugifyProviderID(name)
+		// Routing id/prefix: prefer the operator-supplied alias, else a slug of
+		// the name, else a generated id. Must not collide with a built-in id, a
+		// registered ProviderConfig, or an existing custom account's backend.
+		id := slugifyProviderID(firstNonEmpty(strings.TrimSpace(req.Alias), strings.TrimSpace(req.Name)))
 		if id == "" {
 			id = "custom-" + auth.GenerateAccountID()[:8]
 		}
-		if _, clash := resolveBuiltinProvider(id); clash {
-			id = id + "-" + auth.GenerateAccountID()[:6]
-		}
-		pc := config.ProviderConfig{
-			ID:          id,
-			Alias:       strings.ToLower(strings.TrimSpace(req.Alias)),
-			Name:        name,
-			Dialect:     dialect,
-			BaseURL:     base,
-			Models:      sanitizeModelList(req.Models),
-			FetchModels: true,
-		}
-		if err := config.AddProvider(pc); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		backend = id // the account points at the freshly-registered provider
+		id = ensureUniqueBackendID(id)
+		backend = id
+		customDialect = dialect
+		customModels = sanitizeModelList(req.Models)
+		// Stash base + models inline on the account below.
+		req.BaseURL = base
 	} else {
 		// Named (built-in or previously-registered custom) provider.
 		_, builtinOK := resolveBuiltinProvider(backend)
 		_, customOK := config.GetProviderConfig(backend)
-		if !builtinOK && !customOK {
+		_, inlineOK := config.GetCustomAccountByBackend(backend)
+		if !builtinOK && !customOK && !inlineOK {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(map[string]string{"error": "unknown provider backend: " + backend})
 			return
@@ -208,12 +197,9 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// For a "custom" add the base URL is already baked into the ProviderConfig,
-	// so don't also stamp it as a per-account override (that would double-apply).
-	baseOverride := ""
-	if req.Backend != "" && strings.ToLower(strings.TrimSpace(req.Backend)) != "custom" {
-		baseOverride = strings.TrimSpace(req.BaseURL)
-	}
+	// For a custom (inline) account the base URL goes in BaseURLOverride and is
+	// paired with CustomDialect; for a named provider it's an optional override.
+	baseOverride := strings.TrimSpace(req.BaseURL)
 
 	acct := config.Account{
 		ID:              auth.GenerateAccountID(),
@@ -221,6 +207,8 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 		APIKey:          strings.TrimSpace(req.APIKey),
 		Nickname:        name,
 		BaseURLOverride: baseOverride,
+		CustomDialect:   customDialect,
+		CustomModels:    customModels,
 		Weight:          req.Weight,
 		Enabled:         true,
 	}
@@ -235,11 +223,10 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 	// Fetch the live model catalog so the response can report what the endpoint
 	// offers (and seed the pool's per-account model filter). Best-effort: a
 	// failure here doesn't fail the add — the account is created either way and a
-	// later models-refresh / first request will populate it. This is what makes
-	// "add your OpenAI-compatible endpoint and it gets the models" work on add.
+	// later models-refresh / first request will populate it.
 	//
-	// Fallback order: live /models fetch → the provider's configured static list
-	// (a custom provider can pin one when its endpoint has no /models). An empty
+	// Fallback order: live /models fetch → the account's pinned CustomModels (a
+	// custom account can pin a list when its endpoint has no /models). An empty
 	// final list is harmless — the pool treats "no cached models" as "serves any
 	// model", so routing still works and the upstream validates the id at call
 	// time. We surface modelSource so the dashboard can explain a 0 count.
@@ -254,13 +241,10 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			logger.Warnf("[Providers] %s account %s: model fetch failed (account still added): %v", backend, acct.ID, ferr)
 		}
 	}
-	// Fall back to the provider's static model list when the live fetch found
-	// nothing (offline endpoint, no /models route, or a non-generic provider).
-	if len(models) == 0 {
-		if pc, ok := config.GetProviderConfig(backend); ok && len(pc.Models) > 0 {
-			models = append(models, pc.Models...)
-			modelSource = "static"
-		}
+	// Fall back to the account's pinned models when the live fetch found nothing.
+	if len(models) == 0 && len(customModels) > 0 {
+		models = append(models, customModels...)
+		modelSource = "static"
 	}
 	if len(models) > 0 {
 		h.pool.SetModelList(acct.ID, models)
@@ -274,6 +258,36 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 		"models":      models,
 		"modelSource": modelSource,
 	})
+}
+
+// ensureUniqueBackendID returns a routing id derived from base that does not
+// collide with a reserved bespoke backend (kiro/codex/qoder), a built-in
+// provider, a registered ProviderConfig, or an existing self-contained custom
+// account's backend. Loops until a free id is found (a 6-char random suffix
+// makes a second collision astronomically unlikely, but we never return a taken
+// id — a duplicate backend would strand the second account, unreachable).
+func ensureUniqueBackendID(base string) string {
+	taken := func(candidate string) bool {
+		switch candidate {
+		case "kiro", "codex", "qoder":
+			return true // reserved bespoke backends
+		}
+		if _, ok := resolveBuiltinProvider(candidate); ok {
+			return true
+		}
+		if _, ok := config.GetProviderConfig(candidate); ok {
+			return true
+		}
+		if _, ok := config.GetCustomAccountByBackend(candidate); ok {
+			return true
+		}
+		return false
+	}
+	id := base
+	for taken(id) {
+		id = base + "-" + auth.GenerateAccountID()[:6]
+	}
+	return id
 }
 
 // sanitizeModelList trims, de-dupes, and drops empty entries from a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"kiro-go/config"
+	"strings"
 )
 
 // Dialect identifies the wire format a provider speaks upstream. It selects the
@@ -115,6 +116,13 @@ func ProviderForBackend(backend string) Provider {
 	// dialect, if that provider has been registered (Phase 3).
 	if pc, ok := config.GetProviderConfig(backend); ok {
 		if p, ok := providerRegistry["generic:"+pc.Dialect]; ok {
+			return p
+		}
+	}
+	// A self-contained custom account (inline dialect + base URL, no shared
+	// ProviderConfig) resolves to the generic provider for its inline dialect.
+	if acct, ok := config.GetCustomAccountByBackend(backend); ok {
+		if p, ok := providerRegistry["generic:"+strings.ToLower(strings.TrimSpace(acct.CustomDialect))]; ok {
 			return p
 		}
 	}

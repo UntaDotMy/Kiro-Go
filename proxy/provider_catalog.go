@@ -130,6 +130,10 @@ func dialectFor(backend string) Dialect {
 	case "codex":
 		return DialectCodex
 	}
+	// Self-contained custom account carrying an inline dialect.
+	if acct, ok := config.GetCustomAccountByBackend(key); ok {
+		return Dialect(strings.ToLower(strings.TrimSpace(acct.CustomDialect)))
+	}
 	return ""
 }
 
