@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 )
@@ -46,6 +47,11 @@ func buildGeminiBody(nr *NormalizedRequest, upstreamModel string) ([]byte, error
 		body["contents"] = contents
 		if tools := openAIToolsToGemini(req.Tools); tools != nil {
 			body["tools"] = tools
+			if ti, ok := parseOpenAIToolChoice(req.ToolChoice); ok {
+				if tc := ti.toGeminiToolConfig(); tc != nil {
+					body["toolConfig"] = tc
+				}
+			}
 		}
 	case nr.Claude != nil:
 		req := nr.Claude
@@ -56,6 +62,11 @@ func buildGeminiBody(nr *NormalizedRequest, upstreamModel string) ([]byte, error
 		body["contents"] = claudeToGeminiContents(req.Messages)
 		if tools := claudeToolsToGemini(req.Tools); tools != nil {
 			body["tools"] = tools
+			if ti, ok := parseClaudeToolChoice(req.ToolChoice); ok {
+				if tc := ti.toGeminiToolConfig(); tc != nil {
+					body["toolConfig"] = tc
+				}
+			}
 		}
 	}
 
@@ -68,6 +79,10 @@ func buildGeminiBody(nr *NormalizedRequest, upstreamModel string) ([]byte, error
 func openAIToGeminiContents(msgs []OpenAIMessage) (string, []map[string]interface{}) {
 	var system strings.Builder
 	var contents []map[string]interface{}
+	// Gemini's functionResponse.name must be the FUNCTION name, but an OpenAI
+	// tool-role message only carries the tool_call_id. Map id -> name from the
+	// preceding assistant tool_calls so the response resolves to the right name.
+	idToName := map[string]string{}
 	for _, m := range msgs {
 		switch m.Role {
 		case "system":
@@ -83,8 +98,14 @@ func openAIToGeminiContents(msgs []OpenAIMessage) (string, []map[string]interfac
 				parts = append(parts, map[string]interface{}{"text": txt})
 			}
 			for _, tc := range m.ToolCalls {
+				if tc.ID != "" && tc.Function.Name != "" {
+					idToName[tc.ID] = tc.Function.Name
+				}
 				var args map[string]interface{}
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+				if args == nil {
+					args = map[string]interface{}{}
+				}
 				parts = append(parts, map[string]interface{}{
 					"functionCall": map[string]interface{}{"name": tc.Function.Name, "args": args},
 				})
@@ -94,12 +115,16 @@ func openAIToGeminiContents(msgs []OpenAIMessage) (string, []map[string]interfac
 			}
 			contents = append(contents, map[string]interface{}{"role": "model", "parts": parts})
 		case "tool":
+			name := idToName[m.ToolCallID]
+			if name == "" {
+				name = m.ToolCallID // fallback: better than empty
+			}
 			contents = append(contents, map[string]interface{}{
 				"role": "user",
 				"parts": []map[string]interface{}{{
 					"functionResponse": map[string]interface{}{
-						"name":     m.ToolCallID,
-						"response": map[string]interface{}{"content": extractOpenAIMessageText(m.Content)},
+						"name":     name,
+						"response": geminiFunctionResponsePayload(extractOpenAIMessageText(m.Content)),
 					},
 				}},
 			})
@@ -113,33 +138,100 @@ func openAIToGeminiContents(msgs []OpenAIMessage) (string, []map[string]interfac
 	return system.String(), contents
 }
 
+// claudeToGeminiContents converts Claude messages into Gemini contents,
+// preserving the full tool-calling protocol: assistant tool_use blocks become
+// functionCall parts and user tool_result blocks become functionResponse parts.
+// (The earlier version dropped both, so any multi-turn tool conversation routed
+// to a Gemini provider lost its entire tool history and the model re-asked or
+// hallucinated.) Gemini's functionResponse.name must be the FUNCTION name, so we
+// map tool_use_id -> name from the assistant tool_use blocks as we walk forward.
 func claudeToGeminiContents(msgs []ClaudeMessage) []map[string]interface{} {
 	var contents []map[string]interface{}
+	idToName := map[string]string{}
+
 	for _, m := range msgs {
 		role := "user"
 		if m.Role == "assistant" {
 			role = "model"
 		}
-		text := ""
+
+		// Plain string content: a single text part.
 		if s, ok := m.Content.(string); ok {
-			text = s
-		} else if blocks, ok := m.Content.([]interface{}); ok {
-			var sb strings.Builder
-			for _, b := range blocks {
-				if blk, ok := b.(map[string]interface{}); ok {
-					if t, ok := blk["text"].(string); ok {
-						sb.WriteString(t)
-					}
-				}
-			}
-			text = sb.String()
+			contents = append(contents, map[string]interface{}{
+				"role":  role,
+				"parts": []map[string]interface{}{{"text": s}},
+			})
+			continue
 		}
-		contents = append(contents, map[string]interface{}{
-			"role":  role,
-			"parts": []map[string]interface{}{{"text": text}},
-		})
+
+		blocks, ok := m.Content.([]interface{})
+		if !ok {
+			contents = append(contents, map[string]interface{}{
+				"role":  role,
+				"parts": []map[string]interface{}{{"text": ""}},
+			})
+			continue
+		}
+
+		var parts []map[string]interface{}
+		for _, b := range blocks {
+			blk, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch blk["type"] {
+			case "text":
+				if t, ok := blk["text"].(string); ok && t != "" {
+					parts = append(parts, map[string]interface{}{"text": t})
+				}
+			case "tool_use":
+				id, _ := blk["id"].(string)
+				name, _ := blk["name"].(string)
+				if id != "" && name != "" {
+					idToName[id] = name
+				}
+				args, _ := blk["input"].(map[string]interface{})
+				if args == nil {
+					args = map[string]interface{}{}
+				}
+				parts = append(parts, map[string]interface{}{
+					"functionCall": map[string]interface{}{"name": name, "args": args},
+				})
+			case "tool_result":
+				useID, _ := blk["tool_use_id"].(string)
+				name := idToName[useID]
+				if name == "" {
+					name = useID // fallback
+				}
+				parts = append(parts, map[string]interface{}{
+					"functionResponse": map[string]interface{}{
+						"name":     name,
+						"response": geminiFunctionResponsePayload(extractToolResultText(blk["content"])),
+					},
+				})
+			}
+		}
+		if len(parts) == 0 {
+			parts = append(parts, map[string]interface{}{"text": ""})
+		}
+		contents = append(contents, map[string]interface{}{"role": role, "parts": parts})
 	}
 	return contents
+}
+
+// geminiFunctionResponsePayload wraps a tool-result string in the object Gemini's
+// functionResponse.response field expects. Gemini requires a JSON object here; if
+// the result text is itself a JSON object we forward it as-is, otherwise we wrap
+// it under a "content" key so a bare string/array is still valid.
+func geminiFunctionResponsePayload(text string) map[string]interface{} {
+	trimmed := strings.TrimSpace(text)
+	if strings.HasPrefix(trimmed, "{") {
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(trimmed), &obj); err == nil && obj != nil {
+			return obj
+		}
+	}
+	return map[string]interface{}{"content": text}
 }
 
 func openAIToolsToGemini(tools []OpenAITool) []map[string]interface{} {
@@ -151,7 +243,9 @@ func openAIToolsToGemini(tools []OpenAITool) []map[string]interface{} {
 		decls = append(decls, map[string]interface{}{
 			"name":        t.Function.Name,
 			"description": t.Function.Description,
-			"parameters":  t.Function.Parameters,
+			// Gemini rejects unsupported JSON-Schema keywords; sanitize so the whole
+			// request doesn't 400 on a stock OpenAI/Claude-Code tool schema.
+			"parameters": geminiParametersOrEmpty(t.Function.Parameters),
 		})
 	}
 	return []map[string]interface{}{{"functionDeclarations": decls}}
@@ -169,7 +263,8 @@ func claudeToolsToGemini(tools []ClaudeTool) []map[string]interface{} {
 		decls = append(decls, map[string]interface{}{
 			"name":        t.Name,
 			"description": t.Description,
-			"parameters":  t.InputSchema,
+			// See openAIToolsToGemini: Gemini's schema validator is strict.
+			"parameters": geminiParametersOrEmpty(t.InputSchema),
 		})
 	}
 	if len(decls) == 0 {
@@ -231,8 +326,13 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 						input = map[string]interface{}{}
 					}
 					toolSeq++
+					// Gemini function calls carry no id, so we synthesize a UNIQUE one
+					// per call. Including the sequence number is essential: two parallel
+					// calls to the SAME function would otherwise collide on
+					// "call_<name>", and the client could not match each tool_result
+					// back to its tool_use.
 					cb.OnToolUse(KiroToolUse{
-						ToolUseID: "call_" + part.FunctionCall.Name,
+						ToolUseID: fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, toolSeq),
 						Name:      part.FunctionCall.Name,
 						Input:     input,
 					})

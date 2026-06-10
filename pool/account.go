@@ -214,6 +214,19 @@ type AccountPool struct {
 	cooldowns  map[string]*cooldownEntry  // accountID → cooldown state
 	modelLists map[string]map[string]bool // accountID → set of supported model IDs
 
+	// advisoryModelLists holds DISPLAY-ONLY model catalogs for providers that do
+	// not expose a working GET /models endpoint (e.g. Tencent CodeBuddy, iFlow,
+	// the Alibaba "alicode" coding hosts, GitLab Duo, Perplexity). These ids are a
+	// best-effort static catalog: they populate the dashboard model count and the
+	// /v1/models advert so the provider doesn't read as "0 models", but they are
+	// DELIBERATELY NOT consulted by accountHasModel — a hardcoded list can omit a
+	// model the provider later adds, and treating it as a strict routing filter
+	// would shed a valid request as "no available account". Routing therefore stays
+	// optimistic (the upstream validates the id at call time), exactly as it does
+	// for an account with no cached list. An account has EITHER a strict modelLists
+	// entry (from a live /models fetch) OR an advisory one, never both.
+	advisoryModelLists map[string]map[string]bool // accountID → display-only model IDs
+
 	// releaseCh wakes an admission waiter the instant an in-flight slot frees,
 	// so the failover dispatcher no longer has to poll for a free slot (a freed
 	// slot was previously unused until the next ~25ms poll tick). Buffered-1 with
@@ -353,6 +366,11 @@ func (p *AccountPool) Reload() {
 			delete(p.modelLists, id)
 		}
 	}
+	for id := range p.advisoryModelLists {
+		if !keep[id] {
+			delete(p.advisoryModelLists, id)
+		}
+	}
 }
 
 // computeEffectiveWeight derives the SWRR weight from account config. Returns
@@ -362,6 +380,16 @@ func (p *AccountPool) Reload() {
 // Weights are scaled up by 10× so overage accounts (which have weight 1..10)
 // can be expressed as fractions of a normal slot without losing precision.
 func computeEffectiveWeight(a config.Account) int {
+	// Operator-set per-account token cap (api-key providers). When exhausted the
+	// account is dropped from rotation entirely — there is no "overage" for a
+	// bring-your-own upstream key (unlike Kiro's AWS billing switch), so a spent
+	// key is simply skipped and the burst STACKS onto keys that still have budget.
+	// 0 = unlimited, so Kiro accounts and every account without a configured limit
+	// are unaffected.
+	if isTokenLimitExhausted(a) {
+		return 0
+	}
+
 	if isOverUsageLimit(a) {
 		if !a.AllowOverage && !config.GetAllowOverUsage() {
 			return 0
@@ -393,15 +421,43 @@ func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
 	}
 	p.mu.Lock()
 	p.modelLists[accountID] = set
+	// A live, authoritative list supersedes any advisory (static) one.
+	delete(p.advisoryModelLists, accountID)
 	p.mu.Unlock()
 }
 
-// GetModelList 返回该账号缓存的模型 ID 列表（供 admin API 使用）。
+// SetAdvisoryModelList records a DISPLAY-ONLY model catalog for an account whose
+// provider has no working GET /models endpoint (a hardcoded static list). Unlike
+// SetModelList it does NOT gate routing — accountHasModel ignores it — so an id
+// missing from this best-effort list is never shed; the upstream validates the id
+// at call time. It only feeds the dashboard count and the /v1/models advert (via
+// GetModelList). A real /models fetch later (SetModelList) supersedes it.
+func (p *AccountPool) SetAdvisoryModelList(accountID string, modelIDs []string) {
+	set := make(map[string]bool, len(modelIDs))
+	for _, id := range modelIDs {
+		if k := strings.ToLower(strings.TrimSpace(id)); k != "" {
+			set[k] = true
+		}
+	}
+	p.mu.Lock()
+	if p.advisoryModelLists == nil {
+		p.advisoryModelLists = make(map[string]map[string]bool)
+	}
+	p.advisoryModelLists[accountID] = set
+	p.mu.Unlock()
+}
+
+// GetModelList 返回该账号缓存的模型 ID 列表（供 admin API 使用）。It returns the
+// strict (live-fetched) list when present, else the advisory (static) one, so the
+// dashboard count and /v1/models advert reflect a no-/models provider's catalog.
 func (p *AccountPool) GetModelList(accountID string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	set, ok := p.modelLists[accountID]
 	if !ok || len(set) == 0 {
+		set = p.advisoryModelLists[accountID]
+	}
+	if len(set) == 0 {
 		return []string{}
 	}
 	ids := make([]string, 0, len(set))
@@ -427,6 +483,17 @@ func (p *AccountPool) accountHasModel(accountID, modelKey string) bool {
 		}
 	}
 	return false
+}
+
+// HasModelForTesting exposes the routing-gate model check (accountHasModel) to
+// tests in other packages, taking the lock and normalizing the key the same way
+// the picker does. It deliberately reflects ONLY the strict modelLists gate, not
+// the advisory (display-only) catalog — so a test can assert that an advisory list
+// never sheds an unlisted model. Not for production use.
+func (p *AccountPool) HasModelForTesting(accountID, model string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.accountHasModel(accountID, strings.ToLower(strings.TrimSpace(model)))
 }
 
 // strategyResolver returns the active pool selection strategy. Indirection
@@ -789,6 +856,16 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 			continue
 		}
 		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			continue
+		}
+		// Live per-account token-cap check. computeEffectiveWeight already drops an
+		// exhausted account at Reload, but TotalTokens keeps growing mid-session via
+		// UpdateStats (which mutates the in-memory p.accounts copy directly), so a key
+		// can cross its limit BETWEEN reloads. Skip it here too so the burst stacks
+		// onto keys that still have budget the instant one is spent — every strategy,
+		// including "fast". 0 = unlimited, so Kiro / unconfigured accounts are
+		// unaffected.
+		if isTokenLimitExhausted(*acc) {
 			continue
 		}
 		// Soft 429 cooldown is honored by every strategy EXCEPT "fast", which
@@ -1438,4 +1515,13 @@ func (p *AccountPool) CooldownRemaining(id string) time.Duration {
 
 func isOverUsageLimit(acc config.Account) bool {
 	return acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit
+}
+
+// isTokenLimitExhausted reports whether an operator-set per-account token cap has
+// been reached. 0 = unlimited (the default), so this is a no-op for Kiro accounts
+// and any account without a configured limit. The counter is the same cumulative
+// Account.TotalTokens the dashboard already tracks, incremented by pool.UpdateStats
+// after each successful request.
+func isTokenLimitExhausted(acc config.Account) bool {
+	return acc.TokenLimit > 0 && acc.TotalTokens >= acc.TokenLimit
 }

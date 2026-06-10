@@ -43,6 +43,9 @@ func buildAnthropicBody(nr *NormalizedRequest, upstreamModel string, stream bool
 		body["messages"] = req.Messages
 		if tools := claudeToolsPassthrough(req.Tools); len(tools) > 0 {
 			body["tools"] = tools
+			if ti, ok := parseClaudeToolChoice(req.ToolChoice); ok {
+				body["tool_choice"] = ti.toAnthropic()
+			}
 		}
 	case nr.OpenAI != nil:
 		req := nr.OpenAI
@@ -61,6 +64,9 @@ func buildAnthropicBody(nr *NormalizedRequest, upstreamModel string, stream bool
 		body["messages"] = msgs
 		if tools := openAIToolsToAnthropic(req.Tools); len(tools) > 0 {
 			body["tools"] = tools
+			if ti, ok := parseOpenAIToolChoice(req.ToolChoice); ok {
+				body["tool_choice"] = ti.toAnthropic()
+			}
 		}
 	}
 

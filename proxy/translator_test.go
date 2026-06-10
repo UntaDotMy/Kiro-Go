@@ -741,7 +741,7 @@ func TestCanonicalAnthropicModelID(t *testing.T) {
 		{"claude-opus-4.6", "claude-opus-4-6"},
 		{"claude-sonnet-4.6", "claude-sonnet-4-6"},
 		{"claude-haiku-4.5", "claude-haiku-4-5"},
-		{"claude-opus-4-7", "claude-opus-4-7"},          // already dashed — idempotent
+		{"claude-opus-4-7", "claude-opus-4-7"},                       // already dashed — idempotent
 		{"claude-sonnet-4-5-20251101", "claude-sonnet-4-5-20251101"}, // dated — preserved
 		{"", ""},
 	}
@@ -857,15 +857,15 @@ func TestCanonicalizeStopReason(t *testing.T) {
 // Claude 4-family models (sonnet-4*, opus-4*, haiku-4*) qualify.
 func TestModelSupportsAdaptiveThinking(t *testing.T) {
 	cases := map[string]bool{
-		"claude-opus-4.7":              true,
-		"claude-opus-4-7":              true,
-		"claude-sonnet-4.6":            true,
-		"claude-sonnet-4-5-20251101":   true,
-		"claude-haiku-4.5":             true,
-		"claude-3-opus":                false,
-		"claude-3-sonnet":              false,
-		"gpt-4o":                       false,
-		"":                             false,
+		"claude-opus-4.7":            true,
+		"claude-opus-4-7":            true,
+		"claude-sonnet-4.6":          true,
+		"claude-sonnet-4-5-20251101": true,
+		"claude-haiku-4.5":           true,
+		"claude-3-opus":              false,
+		"claude-3-sonnet":            false,
+		"gpt-4o":                     false,
+		"":                           false,
 	}
 	for in, want := range cases {
 		if got := modelSupportsAdaptiveThinking(in); got != want {
@@ -899,4 +899,3 @@ func TestExtractEventHeadersExceptionType(t *testing.T) {
 		t.Fatalf("expected empty event-type for an exception-only frame, got %q", got)
 	}
 }
-

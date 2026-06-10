@@ -45,7 +45,6 @@ func (e *ErrUpstreamStreamReset) Error() string {
 
 func (e *ErrUpstreamStreamReset) Unwrap() error { return e.Cause }
 
-
 // classifyStreamError returns a *ErrUpstreamStreamReset if err looks
 // like an HTTP/2 stream reset or connection-level GOAWAY; otherwise
 // returns err unchanged. Safe to call with nil.

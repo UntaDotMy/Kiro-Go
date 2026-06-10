@@ -993,6 +993,11 @@
                     </div>
                 </div>
                 <div style="padding:0 20px 12px;font-size:13px;color:#64748b" data-i18n="providers.hint"></div>
+                <div id="providerBatchBar" class="hidden" style="margin:0 20px 12px;padding:10px 14px;background:var(--accent-soft,#eef2ff);border:1px solid var(--accent,#6366f1);border-radius:8px;display:flex;align-items:center;gap:12px">
+                    <span id="providerBatchCount" style="font-size:13px;font-weight:600"></span>
+                    <button class="btn btn-sm btn-danger" onclick="batchDeleteProviders()" data-i18n="providers.deleteSelected"></button>
+                    <button class="btn btn-sm btn-secondary" onclick="clearProviderSelection()" data-i18n="providers.clearSelection"></button>
+                </div>
                 <div id="providersList" style="padding:0 4px 8px"></div>
             </div>
         </div>
@@ -1320,6 +1325,19 @@
                 'providers.title': '提供商',
                 'providers.add': '+ 添加提供商',
                 'providers.refresh': '刷新',
+                'providers.selectAll': '全选该提供商',
+                'providers.deleteSelected': '删除所选',
+                'providers.clearSelection': '清除',
+                'providers.nSelected': '已选 {0} 个',
+                'providers.confirmDeleteN': '删除选中的 {0} 个账号？此操作不可撤销。',
+                'providers.tokLimit': '上限',
+                'providers.tokRemaining': '剩余 token',
+                'providers.tokExhausted': '已达 token 上限',
+                'providers.tokExhaustedN': '{0} 个密钥已用尽',
+                'providers.tokLimitReachedHint': '该密钥已达 token 上限，已暂停轮换，直到你提高上限或删除它。',
+                'providers.fTokenLimit': 'Token 上限',
+                'providers.fTokenLimitHint': '0 = 不限制',
+                'providers.fTokenUsed': '已用 {0}',
                 'providers.hint': '非 Kiro 的上游提供商（Codex、Qoder、OpenAI、Groq、自定义 OpenAI 兼容端点……）。这里的每个账号通过 provider/model 前缀调用（例如 groq/llama-3.3-70b）。Kiro 账号在“账号”标签页下。',
                 'providers.empty': '还没有提供商账号。点击“添加提供商”来连接 Codex、API-Key 提供商，或你自己的 OpenAI 兼容端点。',
                 'providers.account': '账号',
@@ -1770,6 +1788,19 @@
                 'providers.title': 'Providers',
                 'providers.add': '+ Add Provider',
                 'providers.refresh': 'Refresh',
+                'providers.selectAll': 'Select all in this provider',
+                'providers.deleteSelected': 'Delete selected',
+                'providers.clearSelection': 'Clear',
+                'providers.nSelected': '{0} selected',
+                'providers.confirmDeleteN': 'Delete {0} selected account(s)? This cannot be undone.',
+                'providers.tokLimit': 'limit',
+                'providers.tokRemaining': 'tokens remaining',
+                'providers.tokExhausted': 'token limit reached',
+                'providers.tokExhaustedN': '{0} key(s) exhausted',
+                'providers.tokLimitReachedHint': 'This key hit its token limit and is paused from rotation until you raise the limit or it is deleted.',
+                'providers.fTokenLimit': 'Token limit',
+                'providers.fTokenLimitHint': '0 = unlimited',
+                'providers.fTokenUsed': '{0} used so far',
                 'providers.hint': 'Non-Kiro upstream providers (Codex, Qoder, OpenAI, Groq, custom OpenAI-compatible endpoints, ...). Each account here is reached with a provider/model prefix (e.g. groq/llama-3.3-70b). Kiro accounts live under the Accounts tab.',
                 'providers.empty': 'No provider accounts yet. Click "Add Provider" to connect Codex, an API-key provider, or your own OpenAI-compatible endpoint.',
                 'providers.account': 'Account',
@@ -3882,6 +3913,7 @@
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'cookie\')" onmouseover="this.style.borderColor=\'#7c3aed\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">' + t('modal.cookieTitle') + '</div><div style="font-size:13px;color:#64748b">' + t('modal.cookieDesc') + '</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'codex\')" onmouseover="this.style.borderColor=\'#3b82f6\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">OpenAI Codex (ChatGPT)</div><div style="font-size:13px;color:#64748b">Connect a ChatGPT/Codex account via OpenAI login, or paste an access token.</div></div>' +
                     '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'qoder\')" onmouseover="this.style.borderColor=\'#ec4899\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">Qoder</div><div style="font-size:13px;color:#64748b">Connect a Qoder account via device login (opens qoder.com in your browser).</div></div>' +
+                    '<div class="card" style="margin:0;cursor:pointer;border:2px solid transparent;transition:border-color 0.2s" onclick="showModal(\'qwen\')" onmouseover="this.style.borderColor=\'#9333ea\'" onmouseout="this.style.borderColor=\'transparent\'"><div style="font-weight:600;margin-bottom:6px">Qwen (Alibaba)</div><div style="font-size:13px;color:#64748b">Connect a Qwen account via device login (qwen-code OAuth) — shows a code to enter at chat.qwen.ai.</div></div>' +
                     '</div>' +
                     '<div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button></div>';
             } else if (type === 'builderid') {
@@ -3963,6 +3995,18 @@
                     '<p id="qoderStatus" style="color:#64748b;margin:16px 0;font-size:13px;text-align:center">Waiting for you to authorize in the browser…</p>' +
                     '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelQoderLogin()">' + t('common.cancel') + '</button></div>' +
                     '</div>';
+            } else if (type === 'qwen') {
+                title.textContent = 'Qwen (Alibaba)';
+                body.innerHTML =
+                    '<p style="font-size:13px;color:#64748b;margin-bottom:16px">Connect a Qwen account via the qwen-code OAuth device flow. Clicking "Login with Qwen" shows a code to enter at chat.qwen.ai; authorize there and this dialog completes automatically. Access tokens auto-refresh.</p>' +
+                    '<div id="qwenStep1"><div class="modal-footer"><button class="btn btn-secondary" onclick="showModal(\'add\')">' + t('common.back') + '</button><button class="btn btn-primary" onclick="startQwenLogin()">Login with Qwen</button></div></div>' +
+                    '<div id="qwenStep2" class="hidden">' +
+                    '<div class="message" style="background:#f3e8ff;color:#9333ea;text-align:center"><p style="font-size:12px;margin-bottom:6px">Enter this code at the verification page:</p><p style="font-size:22px;font-weight:700;letter-spacing:2px" id="qwenUserCode"></p></div>' +
+                    '<div class="form-group" style="margin-top:12px"><label>Verification URL</label><div class="endpoint" style="margin-bottom:0"><span id="qwenAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'qwenAuthUrl\').textContent,\'_blank\')">Open</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'qwenAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div>' +
+                    '<p id="qwenStatus" style="color:#64748b;margin:16px 0;font-size:13px;text-align:center">Waiting for you to authorize in the browser…</p>' +
+                    '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelQwenLogin()">' + t('common.cancel') + '</button></div>' +
+                    '</div>';
             }
             modal.classList.add('active');
         }
@@ -3975,6 +4019,8 @@
             if (typeof codexSessionId !== 'undefined') { codexSessionId = ''; }
             if (typeof qoderPollTimer !== 'undefined' && qoderPollTimer) { clearTimeout(qoderPollTimer); qoderPollTimer = null; }
             if (typeof qoderSessionId !== 'undefined') { qoderSessionId = ''; }
+            if (typeof qwenPollTimer !== 'undefined' && qwenPollTimer) { clearTimeout(qwenPollTimer); qwenPollTimer = null; }
+            if (typeof qwenSessionId !== 'undefined') { qwenSessionId = ''; }
         }
         // Add a non-Kiro provider account. Two shapes:
         //   - a named built-in provider (Groq, OpenAI, DeepSeek, ...) — just an
@@ -4008,8 +4054,11 @@
                 '  <div class="form-group"><label>Route Prefix <span style="font-weight:normal;color:#64748b;font-size:12px">(optional; defaults to a slug of the name)</span></label><input type="text" id="provCustomAlias" placeholder="mygw"></div>' +
                 '  <div class="form-group"><label>Models <span style="font-weight:normal;color:#64748b;font-size:12px">(optional; comma-separated. Use this if the endpoint has no /models list)</span></label><input type="text" id="provCustomModels" placeholder="gpt-4o, llama-3.3-70b"></div>' +
                 '</div>' +
-                '<div class="form-group"><label>API Key</label><input type="password" id="provApiKey" placeholder="sk-..."></div>' +
+                '<div class="form-group" style="display:flex;align-items:center;gap:8px"><label class="switch" style="margin:0"><input type="checkbox" id="provBulk" onchange="onProvBulkChange()"><span class="slider"></span></label><span style="font-size:13px">Bulk add — paste many API keys (one per line)</span></div>' +
+                '<div class="form-group" id="provApiKeyRow"><label>API Key</label><input type="password" id="provApiKey" placeholder="sk-..."></div>' +
+                '<div class="form-group hidden" id="provApiKeysRow"><label>API Keys <span style="font-weight:normal;color:#64748b;font-size:12px">(one per line — each becomes its own account on this provider)</span></label><textarea id="provApiKeys" rows="8" oninput="updateProvBulkCount()" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical" placeholder="sk-key-one&#10;sk-key-two&#10;sk-key-three"></textarea><div id="provBulkCount" style="font-size:12px;color:#64748b;margin-top:4px"></div></div>' +
                 '<div class="form-group" id="provNameRow"><label>Name <span style="font-weight:normal;color:#64748b;font-size:12px">(optional)</span></label><input type="text" id="provName" placeholder="My Groq key"></div>' +
+                '<div class="form-group"><label>Token limit per key <span style="font-weight:normal;color:#64748b;font-size:12px">(optional; 0 = unlimited. Each key is dropped from rotation once it hits this many total tokens, so traffic stacks onto keys that still have budget)</span></label><input type="number" id="provTokenLimit" min="0" step="1000" placeholder="e.g. 1000000"></div>' +
                 '<div id="provAddStatus" style="font-size:13px;color:#64748b;margin:8px 0;min-height:18px"></div>' +
                 '<div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button><button class="btn btn-primary" id="provAddBtn" onclick="submitProviderAccount()">' + t('common.add') + '</button></div>';
             onProvBackendChange();
@@ -4025,12 +4074,55 @@
             // Display Name), so hide it there.
             if (nameRow) nameRow.classList.toggle('hidden', isCustom);
         }
+        // Bulk toggle: swap the single password input for a multi-line textarea so
+        // the operator can paste many keys (one per line) — each becomes its own
+        // account on the selected provider.
+        function onProvBulkChange() {
+            const bulk = document.getElementById('provBulk');
+            const on = !!(bulk && bulk.checked);
+            const single = document.getElementById('provApiKeyRow');
+            const many = document.getElementById('provApiKeysRow');
+            if (single) single.classList.toggle('hidden', on);
+            if (many) many.classList.toggle('hidden', !on);
+            if (on) updateProvBulkCount();
+        }
+        function updateProvBulkCount() {
+            const ta = document.getElementById('provApiKeys');
+            const out = document.getElementById('provBulkCount');
+            if (!ta || !out) return;
+            const seen = {};
+            let n = 0;
+            ta.value.split(/\r?\n/).forEach(line => {
+                const k = line.trim();
+                if (k && !seen[k]) { seen[k] = true; n++; }
+            });
+            out.textContent = n === 0 ? '' : (n + ' unique key' + (n === 1 ? '' : 's') + ' will be added');
+        }
         async function submitProviderAccount() {
             const backend = document.getElementById('provBackend').value;
-            const apiKey = document.getElementById('provApiKey').value.trim();
+            const bulkEl = document.getElementById('provBulk');
+            const bulk = !!(bulkEl && bulkEl.checked);
             if (!backend) { alert('Pick a provider'); return; }
-            if (!apiKey) { alert('API key is required'); return; }
-            const payload = { backend, apiKey };
+
+            // Collect either one key or the de-duped textarea lines.
+            let apiKey = '';
+            let apiKeys = [];
+            if (bulk) {
+                const seen = {};
+                document.getElementById('provApiKeys').value.split(/\r?\n/).forEach(line => {
+                    const k = line.trim();
+                    if (k && !seen[k]) { seen[k] = true; apiKeys.push(k); }
+                });
+                if (apiKeys.length === 0) { alert('Paste at least one API key (one per line)'); return; }
+            } else {
+                apiKey = document.getElementById('provApiKey').value.trim();
+                if (!apiKey) { alert('API key is required'); return; }
+            }
+
+            const payload = { backend };
+            if (bulk) { payload.apiKeys = apiKeys; } else { payload.apiKey = apiKey; }
+            const tokLim = parseInt(document.getElementById('provTokenLimit').value, 10);
+            if (!isNaN(tokLim) && tokLim > 0) payload.tokenLimit = tokLim;
             if (backend === 'custom') {
                 payload.name = document.getElementById('provCustomName').value.trim();
                 payload.baseURL = document.getElementById('provCustomBase').value.trim();
@@ -4047,17 +4139,22 @@
             const btn = document.getElementById('provAddBtn');
             const statusEl = document.getElementById('provAddStatus');
             if (btn) { btn.disabled = true; btn.textContent = 'Adding…'; }
-            if (statusEl) statusEl.textContent = 'Adding account and fetching models…';
+            const url = bulk ? '/admin/api/providers/account/bulk' : '/admin/api/providers/account';
+            if (statusEl) statusEl.textContent = bulk
+                ? ('Adding ' + apiKeys.length + ' accounts and fetching models…')
+                : 'Adding account and fetching models…';
             try {
-                const res = await fetch('/admin/api/providers/account', {
+                const res = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
                     body: JSON.stringify(payload)
                 });
                 const d = await res.json();
                 if (d.success) {
-                    if (statusEl) statusEl.textContent = 'Added — ' + (d.modelCount || 0) + ' models found.';
-                    setTimeout(() => { closeModal(); loadAccounts(); loadProviders(); }, 600);
+                    if (statusEl) statusEl.textContent = bulk
+                        ? ('Added ' + (d.added || 0) + ' accounts' + (d.skipped ? ' (' + d.skipped + ' duplicates skipped)' : '') + ' — ' + (d.modelCount || 0) + ' models found.')
+                        : ('Added — ' + (d.modelCount || 0) + ' models found.');
+                    setTimeout(() => { closeModal(); loadAccounts(); loadProviders(); }, 800);
                 } else {
                     if (btn) { btn.disabled = false; btn.textContent = t('common.add'); }
                     if (statusEl) statusEl.textContent = '';
@@ -4086,16 +4183,25 @@
             codex: 'OpenAI Codex (ChatGPT)', qoder: 'Qoder', openai: 'OpenAI', anthropic: 'Anthropic',
             gemini: 'Gemini', groq: 'Groq', cerebras: 'Cerebras', deepseek: 'DeepSeek', mistral: 'Mistral',
             openrouter: 'OpenRouter', xai: 'xAI', together: 'Together', fireworks: 'Fireworks',
-            cohere: 'Cohere', nebius: 'Nebius', siliconflow: 'SiliconFlow'
+            cohere: 'Cohere', nebius: 'Nebius', siliconflow: 'SiliconFlow',
+            qwen: 'Qwen (Alibaba)', alicode: 'Alibaba Code', 'alicode-intl': 'Alibaba Code (Intl)',
+            dashscope: 'Alibaba Model Studio (China)', 'dashscope-intl': 'Alibaba Model Studio (Intl)',
+            'dashscope-us': 'Alibaba Model Studio (US)'
         };
         function renderProviders() {
             const container = document.getElementById('providersList');
             if (!container) return;
             const provs = providerAccounts();
             if (provs.length === 0) {
+                providerSelection.clear();
+                updateProviderBatchBar();
                 container.innerHTML = '<div class="empty" style="padding:32px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2" width="8" height="8" rx="1"/><rect x="14" y="2" width="8" height="8" rx="1"/><rect x="2" y="14" width="8" height="8" rx="1"/><path d="M18 14v8M14 18h8"/></svg><div>' + t('providers.empty') + '</div></div>';
                 return;
             }
+            // Drop any selected ids that no longer exist (e.g. deleted elsewhere) so a
+            // stale selection can't survive across the 5s auto-refresh re-render.
+            const liveIds = new Set(provs.map(a => a.id));
+            providerSelection.forEach(id => { if (!liveIds.has(id)) providerSelection.delete(id); });
             // Group accounts by backend (the provider id).
             const groups = {};
             provs.forEach(a => { const b = (a.backend || '').toLowerCase(); (groups[b] = groups[b] || []).push(a); });
@@ -4103,7 +4209,27 @@
             const html = Object.keys(groups).sort().map(backend => {
                 const accts = groups[backend];
                 const label = PROVIDER_LABELS[backend] || backend;
-                const totalModels = accts.reduce((s, a) => s + (a.modelCount || 0), 0);
+                // Distinct-model count: 100 keys sharing the same 145 models should read
+                // as 145 (the provider's actual catalog), not 14,500. We union the per-key
+                // model ids; keys with no cached list contribute nothing (and fall back to
+                // "any model" in their row badge). When the server only returns a numeric
+                // modelCount (older payloads, no modelList), we fall back to the max
+                // per-key count rather than the sum — same provider serves the same list.
+                const distinctModels = new Set();
+                let hasAnyList = false;
+                let maxCount = 0;
+                accts.forEach(a => {
+                    const list = a.modelList || [];
+                    if (list.length) { hasAnyList = true; list.forEach(m => distinctModels.add(m)); }
+                    if ((a.modelCount || 0) > maxCount) maxCount = a.modelCount || 0;
+                });
+                const totalModels = hasAnyList ? distinctModels.size : maxCount;
+                // Aggregate token usage across every key in this provider card ("stacked"
+                // allowance): sum of used tokens, and sum of configured limits (0-limit
+                // keys count as unlimited and are excluded from the limit total).
+                const usedSum = accts.reduce((s, a) => s + (a.totalTokens || 0), 0);
+                const limitSum = accts.reduce((s, a) => s + (a.tokenLimit > 0 ? a.tokenLimit : 0), 0);
+                const exhausted = accts.filter(a => a.tokenLimitReached).length;
                 const rows = accts.map(a => {
                     const ok = a.hasToken || a.hasApiKey;
                     const statusBadge = ok
@@ -4116,43 +4242,154 @@
                         ? '<span class="badge badge-success" title="' + t('providers.modelsHint') + '">' + a.modelCount + ' ' + t('providers.models') + '</span>'
                         : '<span class="badge badge-info" title="' + t('providers.anyModelHint') + '">' + t('providers.anyModel') + '</span>';
                     const planBadge = a.codexPlanType ? '<span class="badge badge-pro">' + a.codexPlanType + '</span>' : '';
+                    // Token-limit badge: show used/limit and remaining when a per-key cap
+                    // is set; flag an exhausted key (dropped from rotation) in red.
+                    let limitBadge = '';
+                    if (a.tokenLimit > 0) {
+                        const used = a.totalTokens || 0;
+                        const remaining = Math.max(0, a.tokenLimit - used);
+                        if (a.tokenLimitReached) {
+                            limitBadge = '<span class="badge badge-error" title="' + t('providers.tokLimitReachedHint') + '">' + t('providers.tokExhausted') + '</span>';
+                        } else {
+                            limitBadge = '<span class="badge badge-warning" title="' + formatNum(remaining) + ' ' + t('providers.tokRemaining') + '">' + formatNum(used) + ' / ' + formatNum(a.tokenLimit) + '</span>';
+                        }
+                    }
                     const name = a.nickname || a.email || a.id.slice(0, 8);
                     const actions = '<div class="row-actions">' +
-                        '<button class="btn btn-sm btn-secondary" onclick="refreshAccountModels(\'' + a.id + '\')" title="' + t('providers.refreshModels') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
+                        '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccountModels(\'' + a.id + '\')" title="' + t('providers.refreshModels') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
                         '<button class="btn btn-sm btn-secondary" onclick="editProviderAccount(\'' + a.id + '\')">' + t('common.edit') + '</button>' +
                         '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>' +
                         '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent)">' + t('accounts.test') + '</button>' +
                         '<button class="btn btn-sm btn-danger" onclick="deleteProviderAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
                         '</div>';
                     return '<tr>' +
+                        '<td style="width:32px;text-align:center"><input type="checkbox" class="prov-row-cb" data-id="' + a.id + '" onclick="toggleProviderRow(\'' + a.id + '\',this.checked)"' + (providerSelection.has(a.id) ? ' checked' : '') + '></td>' +
                         '<td><div class="acct-email">' + escapeHtml(name) + '</div></td>' +
-                        '<td><div class="row-meta">' + statusBadge + enabledBadge + planBadge + modelsBadge + '</div></td>' +
+                        '<td><div class="row-meta">' + statusBadge + enabledBadge + planBadge + modelsBadge + limitBadge + '</div></td>' +
                         '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
                         '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
                         '<td>' + actions + '</td>' +
                         '</tr>';
                 }).join('');
+                const selectedInGroup = accts.filter(a => providerSelection.has(a.id)).length;
+                const allChecked = selectedInGroup === accts.length && accts.length > 0;
+                const groupIds = accts.map(a => a.id);
+                // Card subtitle: account count, model count, aggregate token usage, and an
+                // exhausted-key warning when any key in the card is spent.
+                let usageStr = formatNum(usedSum) + ' ' + t('accounts.tokens');
+                if (limitSum > 0) usageStr += ' / ' + formatNum(limitSum) + ' ' + t('providers.tokLimit');
+                let exhaustedStr = exhausted > 0
+                    ? ' · <span style="color:var(--danger,#dc2626)">' + t('providers.tokExhaustedN', exhausted) + '</span>'
+                    : '';
+                // Collapse the row table by default so a 100-key provider reads as
+                // ONE compact card (count + models + aggregate usage in the header),
+                // not 100 rows. Operator clicks the header to expand and manage keys.
+                // Use class="hidden" (not DOM removal) so the select-all checkbox and
+                // .prov-row-cb nodes survive for syncProviderGroupHeaders / selection.
+                const expanded = providerCardExpanded.has(backend);
+                const caret = expanded ? '▾' : '▸';
                 return '<div class="card" style="margin:8px 0">' +
-                    '<div class="card-header" style="padding:12px 16px">' +
-                    '<span class="card-title" style="font-size:15px">' + escapeHtml(label) +
-                    ' <span style="font-weight:normal;color:#94a3b8;font-size:13px">(' + backend + ' · ' + accts.length + ' ' + t('providers.accounts') + ' · ' + totalModels + ' ' + t('providers.models') + ')</span></span>' +
+                    '<div class="card-header" style="padding:12px 16px;cursor:pointer" onclick=\'toggleProviderCard(' + JSON.stringify(backend) + ')\'>' +
+                    '<span class="card-title" style="font-size:15px"><span style="display:inline-block;width:14px;color:#94a3b8">' + caret + '</span> ' + escapeHtml(label) +
+                    ' <span style="font-weight:normal;color:#94a3b8;font-size:13px">(' + backend + ' · ' + accts.length + ' ' + t('providers.accounts') + ' · ' + totalModels + ' ' + t('providers.models') + ' · ' + usageStr + exhaustedStr + ')</span></span>' +
                     '</div>' +
-                    '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+                    '<div class="table-wrap' + (expanded ? '' : ' hidden') + '"><table class="data-table"><thead><tr>' +
+                    '<th style="width:32px;text-align:center"><input type="checkbox" title="' + t('providers.selectAll') + '" onclick=\'toggleProviderGroup(' + JSON.stringify(groupIds) + ',this.checked)\'' + (allChecked ? ' checked' : '') + '></th>' +
                     '<th>' + t('providers.account') + '</th><th>' + t('providers.status') + '</th>' +
                     '<th class="cell-num">' + t('accounts.requests') + '</th><th class="cell-num">' + t('accounts.tokens') + '</th>' +
                     '<th style="text-align:right"> </th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
                     '</div>';
             }).join('');
             container.innerHTML = html;
+            updateProviderBatchBar();
         }
         // deleteProviderAccount deletes a non-Kiro provider account and re-renders
         // the Providers tab (deleteAccount re-renders the Accounts tab instead).
         async function deleteProviderAccount(id) {
             if (!confirm(t('accounts.confirmDelete'))) return;
             await fetch('/admin/api/accounts/' + id, { method: 'DELETE', headers: { 'X-Admin-Password': password } });
+            providerSelection.delete(id);
             await loadAccounts();
             renderProviders();
             loadStats();
+        }
+        // ---- Providers: multi-select + batch delete ----
+        // providerSelection holds the ids the operator ticked. It survives the 5s
+        // auto-refresh re-render (renderProviders re-applies it and prunes dead ids),
+        // so a long selection isn't lost mid-task.
+        const providerSelection = new Set();
+        // providerCardExpanded holds the backends whose key table is expanded. A
+        // provider card is COLLAPSED by default so 100 keys read as one compact row;
+        // clicking the header expands it. It survives the 5s auto-refresh re-render.
+        const providerCardExpanded = new Set();
+        function toggleProviderCard(backend) {
+            if (providerCardExpanded.has(backend)) providerCardExpanded.delete(backend);
+            else providerCardExpanded.add(backend);
+            renderProviders();
+        }
+        function toggleProviderRow(id, checked) {
+            if (checked) providerSelection.add(id); else providerSelection.delete(id);
+            syncProviderGroupHeaders();
+            updateProviderBatchBar();
+        }
+        function toggleProviderGroup(ids, checked) {
+            (ids || []).forEach(id => { if (checked) providerSelection.add(id); else providerSelection.delete(id); });
+            // Reflect on the visible row checkboxes without a full re-render.
+            (ids || []).forEach(id => {
+                const cb = document.querySelector('.prov-row-cb[data-id="' + id + '"]');
+                if (cb) cb.checked = checked;
+            });
+            updateProviderBatchBar();
+        }
+        // syncProviderGroupHeaders re-evaluates each card's header checkbox so it
+        // shows checked only when every row in that card is selected.
+        function syncProviderGroupHeaders() {
+            document.querySelectorAll('#providersList table').forEach(tbl => {
+                const rowCbs = tbl.querySelectorAll('.prov-row-cb');
+                const head = tbl.querySelector('thead input[type="checkbox"]');
+                if (!head || rowCbs.length === 0) return;
+                let all = true;
+                rowCbs.forEach(cb => { if (!cb.checked) all = false; });
+                head.checked = all;
+            });
+        }
+        function clearProviderSelection() {
+            providerSelection.clear();
+            document.querySelectorAll('#providersList input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+            updateProviderBatchBar();
+        }
+        function updateProviderBatchBar() {
+            const bar = document.getElementById('providerBatchBar');
+            const count = document.getElementById('providerBatchCount');
+            if (!bar) return;
+            const n = providerSelection.size;
+            bar.classList.toggle('hidden', n === 0);
+            if (count) count.textContent = t('providers.nSelected', n);
+        }
+        // batchDeleteProviders deletes every selected account in one request, then
+        // refreshes the tab. One confirm, one round-trip, one pool reload.
+        async function batchDeleteProviders() {
+            const ids = Array.from(providerSelection);
+            if (ids.length === 0) return;
+            if (!confirm(t('providers.confirmDeleteN', ids.length))) return;
+            try {
+                const res = await fetch('/admin/api/accounts/batch-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ ids })
+                });
+                const d = await res.json();
+                if (!res.ok || d.error) { alert(d.error || t('common.failed')); return; }
+                // Hide the bar immediately (clears the set, unchecks boxes, and
+                // re-applies the hidden class) so it can't linger if the subsequent
+                // reload/render throws.
+                clearProviderSelection();
+                await loadAccounts();
+                renderProviders();
+                loadStats();
+            } catch (e) {
+                alert(t('common.failed'));
+            }
         }
         // editProviderAccount opens a modal to edit a non-Kiro provider account:
         // name, weight, API key (rotate), base URL override, and pinned model
@@ -4177,6 +4414,7 @@
                     '<div class="form-group"><label>' + t('providers.fBaseURL') + (isCustom ? ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + esc(a.customDialect) + ')</span>' : '') + '</label><input type="text" id="edpBaseURL" value="' + esc(a.baseURLOverride || '') + '" placeholder="https://api.example.com/v1"></div>'
                     : '<input type="hidden" id="edpBaseURL" value="">') +
                 '<div class="form-group"><label>' + t('providers.fModels') + ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + t('providers.fModelsHint') + ')</span></label><input type="text" id="edpModels" value="' + esc(models.join(', ')) + '" placeholder="gpt-4o, llama-3.3-70b"></div>' +
+                '<div class="form-group"><label>' + t('providers.fTokenLimit') + ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + t('providers.fTokenLimitHint') + (a.tokenLimit > 0 ? '; ' + t('providers.fTokenUsed', formatNum(a.totalTokens || 0)) : '') + ')</span></label><input type="number" id="edpTokenLimit" min="0" step="1000" value="' + (a.tokenLimit || 0) + '"></div>' +
                 '<div id="edpStatus" style="font-size:13px;color:var(--muted);margin:8px 0;min-height:18px"></div>' +
                 '<div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button><button class="btn btn-primary" id="edpSaveBtn" onclick="submitEditProviderAccount(\'' + id + '\')">' + t('common.save') + '</button></div>';
             modal.classList.add('active');
@@ -4192,6 +4430,8 @@
             if (baseEl) payload.baseURL = baseEl.value.trim();
             const modelsRaw = (document.getElementById('edpModels').value || '').trim();
             payload.models = modelsRaw ? modelsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+            const tlEl = document.getElementById('edpTokenLimit');
+            if (tlEl) { const tl = parseInt(tlEl.value, 10); payload.tokenLimit = (!isNaN(tl) && tl > 0) ? tl : 0; }
             const btn = document.getElementById('edpSaveBtn');
             const statusEl = document.getElementById('edpStatus');
             if (btn) { btn.disabled = true; btn.textContent = t('import.running'); }
@@ -4276,6 +4516,35 @@
         function cancelQoderLogin() {
             if (qoderPollTimer) { clearTimeout(qoderPollTimer); qoderPollTimer = null; }
             qoderSessionId = '';
+        }
+        let qwenPollTimer = null;
+        let qwenSessionId = '';
+        async function startQwenLogin() {
+            const res = await fetch('/admin/api/auth/qwen/start', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: '{}' });
+            const d = await res.json();
+            if (!res.ok || d.error) { alert(d.error || 'Failed to start Qwen login'); return; }
+            qwenSessionId = d.sessionId;
+            document.getElementById('qwenStep1').classList.add('hidden');
+            document.getElementById('qwenStep2').classList.remove('hidden');
+            document.getElementById('qwenUserCode').textContent = d.userCode || '';
+            const url = d.verificationUriComplete || d.verificationUri || '';
+            document.getElementById('qwenAuthUrl').textContent = url;
+            if (url) window.open(url, '_blank');
+            pollQwenLogin();
+        }
+        async function pollQwenLogin() {
+            if (!qwenSessionId) return;
+            try {
+                const res = await fetch('/admin/api/auth/qwen/poll', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: JSON.stringify({ sessionId: qwenSessionId }) });
+                const d = await res.json();
+                if (d.status === 'completed') { cancelQwenLogin(); closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (d.status === 'error') { document.getElementById('qwenStatus').textContent = 'Error: ' + (d.error || 'login failed'); return; }
+            } catch (e) { /* keep polling */ }
+            qwenPollTimer = setTimeout(pollQwenLogin, 2500);
+        }
+        function cancelQwenLogin() {
+            if (qwenPollTimer) { clearTimeout(qwenPollTimer); qwenPollTimer = null; }
+            qwenSessionId = '';
         }
         function loadLocalFile(input, targetId) {
             const file = input.files[0];

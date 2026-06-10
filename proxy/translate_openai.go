@@ -33,6 +33,7 @@ type openAIChatBody struct {
 	TopP        float64                  `json:"top_p,omitempty"`
 	Stream      bool                     `json:"stream"`
 	Tools       []map[string]interface{} `json:"tools,omitempty"`
+	ToolChoice  interface{}              `json:"tool_choice,omitempty"`
 }
 
 // buildOpenAIChatBody converts a NormalizedRequest into an OpenAI chat
@@ -50,6 +51,13 @@ func buildOpenAIChatBody(nr *NormalizedRequest, upstreamModel string, stream boo
 		body.TopP = req.TopP
 		body.Messages = openAIMessagesToMaps(req.Messages)
 		body.Tools = openAIToolsToMaps(req.Tools)
+		// Carry the tool-selection intent through unchanged (it's already an
+		// OpenAI-shaped value); normalize only to drop unknown forms.
+		if len(body.Tools) > 0 {
+			if ti, ok := parseOpenAIToolChoice(req.ToolChoice); ok {
+				body.ToolChoice = ti.toOpenAI()
+			}
+		}
 	case nr.Claude != nil:
 		req := nr.Claude
 		body.MaxTokens = req.MaxTokens
@@ -57,6 +65,11 @@ func buildOpenAIChatBody(nr *NormalizedRequest, upstreamModel string, stream boo
 		body.TopP = req.TopP
 		body.Messages = claudeToOpenAIMessages(req)
 		body.Tools = claudeToolsToOpenAIMaps(req.Tools)
+		if len(body.Tools) > 0 {
+			if ti, ok := parseClaudeToolChoice(req.ToolChoice); ok {
+				body.ToolChoice = ti.toOpenAI()
+			}
+		}
 	}
 
 	return json.Marshal(body)

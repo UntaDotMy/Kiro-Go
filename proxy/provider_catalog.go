@@ -19,6 +19,21 @@ type builtinProvider struct {
 	BaseURL    string
 	AuthHeader string            // "bearer" | "x-api-key" | "x-goog-api-key"; "" -> default by dialect
 	Headers    map[string]string // static headers merged into every request
+	// Models is a STATIC fallback catalog for providers that do NOT expose a
+	// GET /models listing endpoint (e.g. Tencent CodeBuddy, iFlow, the Alibaba
+	// "alicode" coding hosts, GitLab Duo, Perplexity). When the live fetch 404s
+	// or errors, ListModels falls back to this list so the dashboard shows a real
+	// model count and the pool's per-account model filter has ids to match —
+	// instead of "0 models" / "fetch failed". 9router ships per-provider static
+	// catalogs for exactly these no-/models providers. Leave nil for providers
+	// whose /models works (the live fetch wins and stays current).
+	Models []string
+	// OAuth marks a backend that authenticates via an OAuth flow (a device login),
+	// NOT a pasted API key. The catalog surfaces it with authType "oauth" so the
+	// dashboard routes it to its connect flow, and the api-key add paths reject it
+	// with a redirect message. Inference is still the generic dialect above once a
+	// token exists. Currently: qwen (qwen-code device flow).
+	OAuth bool
 }
 
 // sharedClaudeHeaders mirrors 9router's CLAUDE_API_HEADERS — the version/beta
@@ -26,6 +41,18 @@ type builtinProvider struct {
 var sharedClaudeHeaders = map[string]string{
 	"Anthropic-Version": "2023-06-01",
 	"Anthropic-Beta":    "claude-code-20250219,interleaved-thinking-2025-05-14",
+}
+
+// aliCoderModels is the advisory (display-only) Qwen-Coder catalog for the Alibaba
+// "alicode" coding-assistant hosts, which (unlike the DashScope compatible-mode
+// bases) do NOT serve a GET /models list (404). Shared by alicode + alicode-intl,
+// which expose the same coder lineup. Source: Alibaba Cloud Model Studio
+// Qwen-Coder docs (alibabacloud.com/help/en/model-studio/qwen-coder). Advisory
+// only — a missing id is never shed; the upstream validates at call time.
+var aliCoderModels = []string{
+	"qwen3-coder-next", "qwen3-coder-plus", "qwen3-coder-flash",
+	"qwen2.5-coder-7b-instruct", "qwen2.5-coder-14b-instruct", "qwen2.5-coder-32b-instruct",
+	"qwen-coder-turbo", "qwen-coder-turbo-latest", "qwen-coder-turbo-0919",
 }
 
 // builtinProviders is the data-only catalog. The OpenAI-compatible rows are all
@@ -46,7 +73,10 @@ var builtinProviders = []builtinProvider{
 	{ID: "nebius", Alias: "nebius", Name: "Nebius AI", Dialect: DialectOpenAI, BaseURL: "https://api.studio.nebius.ai/v1/chat/completions"},
 	{ID: "siliconflow", Alias: "siliconflow", Name: "SiliconFlow", Dialect: DialectOpenAI, BaseURL: "https://api.siliconflow.cn/v1/chat/completions"},
 	{ID: "hyperbolic", Alias: "hyp", Name: "Hyperbolic", Dialect: DialectOpenAI, BaseURL: "https://api.hyperbolic.xyz/v1/chat/completions"},
-	{ID: "perplexity", Alias: "pplx", Name: "Perplexity", Dialect: DialectOpenAI, BaseURL: "https://api.perplexity.ai/chat/completions"},
+	{ID: "perplexity", Alias: "pplx", Name: "Perplexity", Dialect: DialectOpenAI, BaseURL: "https://api.perplexity.ai/chat/completions",
+		// Perplexity has no GET /models endpoint (404), so we ship its Sonar catalog
+		// as an advisory (display-only) list. Source: docs.perplexity.ai model cards.
+		Models: []string{"sonar", "sonar-pro", "sonar-reasoning-pro", "sonar-deep-research"}},
 	{ID: "xai", Alias: "xai", Name: "xAI (Grok)", Dialect: DialectOpenAI, BaseURL: "https://api.x.ai/v1/chat/completions"},
 	{ID: "nvidia", Alias: "nvidia", Name: "NVIDIA NIM", Dialect: DialectOpenAI, BaseURL: "https://integrate.api.nvidia.com/v1/chat/completions"},
 	{ID: "chutes", Alias: "ch", Name: "Chutes AI", Dialect: DialectOpenAI, BaseURL: "https://llm.chutes.ai/v1/chat/completions"},
@@ -56,14 +86,33 @@ var builtinProviders = []builtinProvider{
 
 	// ---- Coding-assistant OpenAI-compatible providers (ported from 9router) ----
 	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v1/chat/completions"},
-	{ID: "qwen", Alias: "qwen", Name: "Qwen (Alibaba)", Dialect: DialectOpenAI, BaseURL: "https://portal.qwen.ai/v1/chat/completions"},
-	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions"},
+	{ID: "qwen", Alias: "qwen", Name: "Qwen (Alibaba)", Dialect: DialectOpenAI, BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", OAuth: true},
+	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions",
+		// iFlow's /models endpoint 404s; advisory catalog. Source: iFlow model
+		// router (mastra.ai/models/providers/iflowcn) — bare ids (the iflowcn/ prefix
+		// is the router's, not iFlow's API id).
+		Models: []string{
+			"deepseek-r1", "deepseek-v3", "deepseek-v3.2", "glm-4.6",
+			"kimi-k2", "kimi-k2-0905", "qwen3-235b", "qwen3-235b-a22b-instruct",
+			"qwen3-235b-a22b-thinking-2507", "qwen3-32b", "qwen3-coder-plus",
+			"qwen3-max", "qwen3-max-preview", "qwen3-vl-plus",
+		}},
 	{ID: "glm-cn", Alias: "glmcn", Name: "GLM (bigmodel.cn)", Dialect: DialectOpenAI, BaseURL: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"},
 	{ID: "kilocode", Alias: "kilo", Name: "Kilo Code", Dialect: DialectOpenAI, BaseURL: "https://api.kilo.ai/api/openrouter/chat/completions"},
 	{ID: "cline", Alias: "cline", Name: "Cline", Dialect: DialectOpenAI, BaseURL: "https://api.cline.bot/api/v1/chat/completions"},
 	{ID: "longcat", Alias: "longcat", Name: "LongCat (Meituan)", Dialect: DialectOpenAI, BaseURL: "https://api.longcat.chat/openai/v1/chat/completions"},
-	{ID: "alicode", Alias: "alicode", Name: "Alibaba Code", Dialect: DialectOpenAI, BaseURL: "https://coding.dashscope.aliyuncs.com/v1/chat/completions"},
-	{ID: "alicode-intl", Alias: "alicodeintl", Name: "Alibaba Code (Intl)", Dialect: DialectOpenAI, BaseURL: "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions"},
+	{ID: "alicode", Alias: "alicode", Name: "Alibaba Code", Dialect: DialectOpenAI, BaseURL: "https://coding.dashscope.aliyuncs.com/v1/chat/completions", Models: aliCoderModels},
+	{ID: "alicode-intl", Alias: "alicodeintl", Name: "Alibaba Code (Intl)", Dialect: DialectOpenAI, BaseURL: "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions", Models: aliCoderModels},
+	// Alibaba DashScope / Model Studio — the GENERAL-PURPOSE OpenAI-compatible
+	// endpoints (distinct from the coding-assistant "alicode" hosts above). Unlike
+	// the coding hosts, the compatible-mode base serves a working GET /models list
+	// (OpenAI convention) and the standard chat/completions, so "fetch models on
+	// add" and the dashboard model count work here. Auth is Bearer $DASHSCOPE_API_KEY.
+	// Three regional bases (China / International-Singapore / US); pick the one your
+	// key was issued in. Source: Alibaba Cloud Model Studio OpenAI-compat docs.
+	{ID: "dashscope", Alias: "dashscope", Name: "Alibaba Model Studio (China)", Dialect: DialectOpenAI, BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"},
+	{ID: "dashscope-intl", Alias: "dashscopeintl", Name: "Alibaba Model Studio (Intl)", Dialect: DialectOpenAI, BaseURL: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"},
+	{ID: "dashscope-us", Alias: "dashscopeus", Name: "Alibaba Model Studio (US)", Dialect: DialectOpenAI, BaseURL: "https://dashscope-us.aliyuncs.com/compatible-mode/v1/chat/completions"},
 	{ID: "gitlab", Alias: "gitlab", Name: "GitLab Duo", Dialect: DialectOpenAI, BaseURL: "https://gitlab.com/api/v4/chat/completions"},
 
 	// ---- Additional OpenAI-compatible inference providers (ported from 9router) ----
