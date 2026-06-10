@@ -66,6 +66,14 @@ func resolveProviderSettings(acct *config.Account) (providerSettings, bool) {
 		ps.authHeader = pc.AuthHeader
 		ps.headers = pc.Headers
 		ps.models = pc.Models
+	} else if acct != nil && strings.TrimSpace(acct.CustomDialect) != "" && strings.TrimSpace(acct.BaseURLOverride) != "" {
+		// Self-contained custom account: dialect + base URL + pinned models live
+		// on the account itself, with no shared Config.Providers[] entry. This is
+		// the "bring-your-own endpoint" path that does NOT register a reusable
+		// provider — the account's Backend id is its own routing prefix.
+		ps.dialect = Dialect(strings.ToLower(strings.TrimSpace(acct.CustomDialect)))
+		ps.baseURL = strings.TrimSpace(acct.BaseURLOverride)
+		ps.models = acct.CustomModels
 	} else {
 		return providerSettings{}, false
 	}
@@ -73,6 +81,11 @@ func resolveProviderSettings(acct *config.Account) (providerSettings, bool) {
 	if ps.authHeader == "" {
 		ps.authHeader = defaultAuthHeaderForDialect(ps.dialect)
 	}
+	// Per-account base URL override. For a NAMED provider (built-in / ProviderConfig)
+	// this repoints it at a custom gateway. For a self-contained custom account the
+	// inline branch above already set baseURL from this same field, so this is a
+	// harmless no-op rewrite (same value) — kept unconditional so the named path
+	// stays correct.
 	if acct != nil && strings.TrimSpace(acct.BaseURLOverride) != "" {
 		ps.baseURL = strings.TrimSpace(acct.BaseURLOverride)
 	}

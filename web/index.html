@@ -1333,6 +1333,16 @@
                 'providers.noModelsHint': '尚未缓存模型——请刷新模型或发起一次请求',
                 'providers.anyModel': '任意模型',
                 'providers.anyModelHint': '未固定模型列表——该账号可路由任意模型，上游在请求时校验模型 id。可点“刷新模型”尝试拉取列表。',
+                'providers.editTitle': '编辑提供商账号',
+                'providers.editHint': '后端：{0}。可修改名称、权重、API 密钥、Base URL 与模型列表。',
+                'providers.fName': '名称',
+                'providers.fWeight': '权重（负载均衡）',
+                'providers.fApiKey': 'API 密钥',
+                'providers.fApiKeyHint': '留空则保持不变',
+                'providers.fKeptIfBlank': '留空保持不变',
+                'providers.fBaseURL': 'Base URL',
+                'providers.fModels': '模型列表',
+                'providers.fModelsHint': '逗号分隔；留空表示可路由任意模型',
                 'providers.refreshModels': '刷新模型',
                 'tabs.analytics': '分析',
                 'apikeys.title': 'API 密钥',
@@ -1773,6 +1783,16 @@
                 'providers.noModelsHint': 'No models cached yet — refresh models or send a request',
                 'providers.anyModel': 'any model',
                 'providers.anyModelHint': 'No model list pinned — this account routes any model; the upstream validates the id at request time. Click "Refresh models" to try fetching a list.',
+                'providers.editTitle': 'Edit Provider Account',
+                'providers.editHint': 'Backend: {0}. Edit name, weight, API key, base URL, and model list.',
+                'providers.fName': 'Name',
+                'providers.fWeight': 'Weight (load balancing)',
+                'providers.fApiKey': 'API Key',
+                'providers.fApiKeyHint': 'leave blank to keep current',
+                'providers.fKeptIfBlank': 'kept if blank',
+                'providers.fBaseURL': 'Base URL',
+                'providers.fModels': 'Models',
+                'providers.fModelsHint': 'comma-separated; blank = routes any model',
                 'providers.refreshModels': 'Refresh models',
                 'tabs.analytics': 'Analytics',
                 'apikeys.title': 'API Keys',
@@ -2535,6 +2555,10 @@
                 });
                 const d = await res.json();
                 if (d.success) {
+                    // Re-pull accounts so modelCount updates, then re-render whichever
+                    // tab is showing this account (providers or accounts).
+                    await loadAccounts();
+                    if (activeDashboardTab() === 'providers') renderProviders();
                     alert(t('detail.refreshModelCache') + ' OK (' + (d.count || 0) + ' models)');
                 } else {
                     alert(t('common.failed') + ': ' + (d.error || ''));
@@ -2860,22 +2884,22 @@
             let inputHtml;
             if (models.length > 0) {
                 models.sort();
-                inputHtml = '<select id="testModelChoice" style="width:100%;padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;background:#fff">' +
+                inputHtml = '<select id="testModelChoice" style="width:100%;padding:6px 8px;border:1px solid var(--border-strong);border-radius:6px;font-size:13px;background:var(--surface);color:var(--text)">' +
                     models.map(function(m) { return '<option value="' + m + '">' + m + '</option>'; }).join('') +
                     '</select>';
             } else {
-                inputHtml = '<input type="text" id="testModelChoice" placeholder="claude-sonnet-4" value="claude-sonnet-4" style="width:100%;padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;box-sizing:border-box;">';
+                inputHtml = '<input type="text" id="testModelChoice" placeholder="claude-sonnet-4" value="claude-sonnet-4" style="width:100%;padding:6px 8px;border:1px solid var(--border-strong);border-radius:6px;font-size:13px;box-sizing:border-box;background:var(--surface);color:var(--text)">';
             }
             const popover = document.createElement('div');
             popover.id = 'testModelPopover';
             popover.style.cssText = 'position:fixed;inset:0;z-index:9998;';
             popover.innerHTML =
-                '<div onclick="event.stopPropagation()" style="position:fixed;top:' + top + 'px;left:' + left + 'px;background:#fff;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.2);padding:16px;width:264px;">' +
-                '<div style="font-weight:600;font-size:13px;margin-bottom:10px;">' + t('accounts.selectModel') + '</div>' +
+                '<div onclick="event.stopPropagation()" style="position:fixed;top:' + top + 'px;left:' + left + 'px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg);padding:16px;width:264px;">' +
+                '<div style="font-weight:600;font-size:13px;margin-bottom:10px;color:var(--text)">' + t('accounts.selectModel') + '</div>' +
                 inputHtml +
                 '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">' +
-                '<button onclick="closeTestModelPopover()" style="padding:5px 14px;border:1px solid #e2e8f0;border-radius:5px;background:#fff;cursor:pointer;font-size:12px;">' + t('common.cancel') + '</button>' +
-                '<button onclick="confirmTestAccount(\'' + id + '\')" style="padding:5px 14px;border:none;border-radius:5px;background:#2563eb;color:#fff;cursor:pointer;font-size:12px;">' + t('accounts.test') + '</button>' +
+                '<button onclick="closeTestModelPopover()" style="padding:5px 14px;border:1px solid var(--border-strong);border-radius:5px;background:var(--surface);color:var(--text);cursor:pointer;font-size:12px;">' + t('common.cancel') + '</button>' +
+                '<button onclick="confirmTestAccount(\'' + id + '\')" style="padding:5px 14px;border:none;border-radius:5px;background:var(--accent);color:var(--on-accent);cursor:pointer;font-size:12px;">' + t('accounts.test') + '</button>' +
                 '</div></div>';
             popover.addEventListener('click', function(e) { if (e.target === popover) closeTestModelPopover(); });
             document.body.appendChild(popover);
@@ -4095,8 +4119,9 @@
                     const name = a.nickname || a.email || a.id.slice(0, 8);
                     const actions = '<div class="row-actions">' +
                         '<button class="btn btn-sm btn-secondary" onclick="refreshAccountModels(\'' + a.id + '\')" title="' + t('providers.refreshModels') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
+                        '<button class="btn btn-sm btn-secondary" onclick="editProviderAccount(\'' + a.id + '\')">' + t('common.edit') + '</button>' +
                         '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>' +
-                        '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff;border-color:#2563eb">' + t('accounts.test') + '</button>' +
+                        '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent)">' + t('accounts.test') + '</button>' +
                         '<button class="btn btn-sm btn-danger" onclick="deleteProviderAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
                         '</div>';
                     return '<tr>' +
@@ -4128,6 +4153,67 @@
             await loadAccounts();
             renderProviders();
             loadStats();
+        }
+        // editProviderAccount opens a modal to edit a non-Kiro provider account:
+        // name, weight, API key (rotate), base URL override, and pinned model
+        // list. Custom (bring-your-own) accounts also show their dialect read-only.
+        function editProviderAccount(id) {
+            const a = (accountsData || []).find(x => x.id === id);
+            if (!a) { alert(t('common.failed')); return; }
+            const modal = document.getElementById('addModal');
+            const title = document.getElementById('modalTitle');
+            const body = document.getElementById('modalBody');
+            const isCustom = (a.customDialect || '').trim() !== '';
+            const backend = a.backend || '';
+            const models = (a.customModels && a.customModels.length ? a.customModels : (a.modelList || []));
+            title.textContent = t('providers.editTitle');
+            const esc = s => escapeHtml(s == null ? '' : String(s));
+            body.innerHTML =
+                '<p style="font-size:13px;color:var(--muted);margin-bottom:14px">' + t('providers.editHint', esc(backend)) + '</p>' +
+                '<div class="form-group"><label>' + t('providers.fName') + '</label><input type="text" id="edpName" value="' + esc(a.nickname || a.email || '') + '"></div>' +
+                '<div class="form-group"><label>' + t('providers.fWeight') + '</label><input type="number" id="edpWeight" min="0" value="' + (a.weight || 0) + '"></div>' +
+                '<div class="form-group"><label>' + t('providers.fApiKey') + ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + t('providers.fApiKeyHint') + ')</span></label><input type="password" id="edpApiKey" placeholder="' + (a.hasApiKey ? '•••••• ' + t('providers.fKeptIfBlank') : 'sk-...') + '"></div>' +
+                (isCustom || a.baseURLOverride ?
+                    '<div class="form-group"><label>' + t('providers.fBaseURL') + (isCustom ? ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + esc(a.customDialect) + ')</span>' : '') + '</label><input type="text" id="edpBaseURL" value="' + esc(a.baseURLOverride || '') + '" placeholder="https://api.example.com/v1"></div>'
+                    : '<input type="hidden" id="edpBaseURL" value="">') +
+                '<div class="form-group"><label>' + t('providers.fModels') + ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + t('providers.fModelsHint') + ')</span></label><input type="text" id="edpModels" value="' + esc(models.join(', ')) + '" placeholder="gpt-4o, llama-3.3-70b"></div>' +
+                '<div id="edpStatus" style="font-size:13px;color:var(--muted);margin:8px 0;min-height:18px"></div>' +
+                '<div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button><button class="btn btn-primary" id="edpSaveBtn" onclick="submitEditProviderAccount(\'' + id + '\')">' + t('common.save') + '</button></div>';
+            modal.classList.add('active');
+        }
+        async function submitEditProviderAccount(id) {
+            const payload = {};
+            const nm = document.getElementById('edpName').value.trim();
+            payload.nickname = nm;
+            payload.weight = parseInt(document.getElementById('edpWeight').value, 10) || 0;
+            const key = document.getElementById('edpApiKey').value.trim();
+            if (key) payload.apiKey = key; // blank = keep existing
+            const baseEl = document.getElementById('edpBaseURL');
+            if (baseEl) payload.baseURL = baseEl.value.trim();
+            const modelsRaw = (document.getElementById('edpModels').value || '').trim();
+            payload.models = modelsRaw ? modelsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+            const btn = document.getElementById('edpSaveBtn');
+            const statusEl = document.getElementById('edpStatus');
+            if (btn) { btn.disabled = true; btn.textContent = t('import.running'); }
+            try {
+                const res = await fetch('/admin/api/accounts/' + id, {
+                    method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify(payload)
+                });
+                const d = await res.json();
+                if (!res.ok || d.error) {
+                    if (btn) { btn.disabled = false; btn.textContent = t('common.save'); }
+                    if (statusEl) statusEl.textContent = d.error || t('common.failed');
+                    return;
+                }
+                closeModal();
+                await loadAccounts();
+                if (activeDashboardTab() === 'providers') renderProviders();
+                loadStats();
+            } catch (e) {
+                if (btn) { btn.disabled = false; btn.textContent = t('common.save'); }
+                if (statusEl) statusEl.textContent = t('common.failed');
+            }
         }
         let codexPollTimer = null;
         let codexSessionId = '';
@@ -4521,6 +4607,7 @@
             if (tab === 'apikeys') loadApiKeys();
             else if (tab === 'analytics') loadAnalytics();
             else if (tab === 'overview') loadOverview();
+            else if (tab === 'providers') loadProviders();
         }, 5000);
 
         // ==================== 版本检查 ====================

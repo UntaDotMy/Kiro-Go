@@ -152,6 +152,17 @@ type Account struct {
 	// ProviderConfig. Empty = use the provider's default base URL.
 	BaseURLOverride string `json:"baseURLOverride,omitempty"`
 
+	// ---- Self-contained custom provider (no shared ProviderConfig) ----
+	// When an operator adds a "bring-your-own" OpenAI/Anthropic/Gemini endpoint,
+	// the account carries everything the generic provider needs INLINE instead of
+	// registering a reusable Config.Providers[] entry. Backend then holds the
+	// account's own routing id (the prefix a client uses, e.g. "mygw/<model>").
+	// CustomDialect selects the wire format; BaseURLOverride above holds the base
+	// URL; CustomModels is the (optional) pinned model id list shown in /v1/models
+	// and used by the pool filter when the endpoint has no /models route.
+	CustomDialect string   `json:"customDialect,omitempty"` // "openai" | "anthropic" | "gemini"
+	CustomModels  []string `json:"customModels,omitempty"`  // pinned model ids (optional)
+
 	// Codex/ChatGPT (Backend == "codex"). The OAuth tokens live in
 	// AccessToken/RefreshToken/ExpiresAt; these add the upstream identity decoded
 	// from the id_token JWT and the quota signal polled from the usage endpoint.
@@ -530,7 +541,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.0.10-A27"
+const Version = "1.0.10-A28"
 
 var (
 	cfg     *Config
@@ -862,6 +873,33 @@ func GetAccountBackend(a *Account) string {
 		return "kiro"
 	}
 	return strings.ToLower(strings.TrimSpace(a.Backend))
+}
+
+// GetCustomAccountByBackend returns a copy of the first self-contained custom
+// account whose Backend id matches (case-insensitive) and which carries an
+// inline CustomDialect. Used by the routing/dialect resolvers to recognise a
+// "bring-your-own endpoint" account that has no shared Config.Providers[] entry.
+// Returns ok=false when no such account exists.
+func GetCustomAccountByBackend(backend string) (Account, bool) {
+	key := strings.ToLower(strings.TrimSpace(backend))
+	if key == "" || key == "kiro" {
+		return Account{}, false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return Account{}, false
+	}
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		if strings.TrimSpace(a.CustomDialect) == "" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(a.Backend)) == key {
+			return *a, true
+		}
+	}
+	return Account{}, false
 }
 
 func GetEnabledAccounts() []Account {
