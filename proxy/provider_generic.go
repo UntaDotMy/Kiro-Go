@@ -196,7 +196,12 @@ func (g *genericProvider) ListModels(acct *config.Account) ([]ModelInfo, error) 
 	}
 
 	if live, err := g.fetchModels(context.Background(), ps, acct); err == nil && len(live) > 0 {
-		return live, nil
+		// A live /models listing can be INCOMPLETE: it may omit aliases or
+		// models the endpoint serves but doesn't advertise. Union the operator's
+		// explicitly-pinned ids so a deliberately-bound model is never shed by the
+		// strict routing filter (the cause of a "503 No available accounts" for a
+		// model that the upstream would actually serve).
+		return unionModelInfos(live, ps.models), nil
 	} else if err != nil {
 		logger.Warnf("[%s] live model fetch failed for %s (%s); using static/empty catalog: %v", ps.id, acct.ID, ps.modelsURL(), err)
 	}
@@ -207,6 +212,30 @@ func (g *genericProvider) ListModels(acct *config.Account) ([]ModelInfo, error) 
 		out = append(out, ModelInfo{ModelId: id})
 	}
 	return out, nil
+}
+
+// unionModelInfos appends any pinned ids not already present in live (case-
+// insensitive) so an operator's explicit binding always stays routable, even
+// when the upstream /models listing omits it. live ordering is preserved; pinned
+// extras are appended in their configured order.
+func unionModelInfos(live []ModelInfo, pinned []string) []ModelInfo {
+	if len(pinned) == 0 {
+		return live
+	}
+	seen := make(map[string]bool, len(live)+len(pinned))
+	for _, m := range live {
+		seen[strings.ToLower(strings.TrimSpace(m.ModelId))] = true
+	}
+	out := live
+	for _, id := range pinned {
+		key := strings.ToLower(strings.TrimSpace(id))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ModelInfo{ModelId: strings.TrimSpace(id)})
+	}
+	return out
 }
 
 // FetchModelsForAccount fetches the live model list for a provider account,
@@ -229,6 +258,10 @@ func (g *genericProvider) FetchModelsForAccount(ctx context.Context, acct *confi
 	}
 	models, ferr := g.fetchModels(ctx, ps, acct)
 	if ferr == nil && len(models) > 0 {
+		// Union pinned ids into the live list (see ListModels): a live /models
+		// listing can omit a model the operator explicitly bound, and shedding it
+		// would surface as a 503 for a model the upstream actually serves.
+		models = unionModelInfos(models, ps.models)
 		out := make([]string, 0, len(models))
 		for _, m := range models {
 			out = append(out, m.ModelId)
