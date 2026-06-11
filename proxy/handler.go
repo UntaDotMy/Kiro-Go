@@ -1917,23 +1917,23 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Resolve the request's provider backend from the model string up front. The
 	// tool-search loop below runs the conversation against Kiro's NATIVE /mcp
-	// endpoint via CallKiroAPI, so it only makes sense for a Kiro-routed model;
-	// the web-search loop is now backend-aware (it runs generation against the
-	// request's OWN backend and executes the search via a Kiro account's MCP
-	// side-call), so it works for non-Kiro providers too.
+	// endpoint via CallKiroAPI, so it only makes sense for a Kiro-routed model.
+	// The web-search emulation loop is Kiro-only too (see below): a request routed
+	// to a non-Kiro provider stays entirely on that provider.
 	reqBackend, upstreamModel := ParseModelBackend(req.Model)
 	isKiroBackend := reqBackend == "kiro"
 
-	// Web-search resolution: PROVIDER-NATIVE FIRST, Kiro only as fallback.
+	// Web-search resolution: PROVIDER-NATIVE FIRST, Kiro emulation only for a
+	// Kiro-routed request. PROVIDER ISOLATION — a request explicitly routed to a
+	// provider never borrows another provider's account.
 	//   - Native provider (DashScope enable_search, Gemini google_search,
 	//     Anthropic hosted web_search): fall through to the normal path, where the
-	//     generic provider injects the native switch into the outbound body. No
-	//     Kiro account needed.
-	//   - No native capability but a usable Kiro account exists: run the agentic
-	//     emulation loop (generate on the request's own backend, search via Kiro
-	//     MCP). This is the only path that needs Kiro.
-	//   - No native capability and no Kiro account: fall through; the hosted tool
-	//     is dropped downstream and the model answers from training. NEVER a 404.
+	//     generic provider injects the native switch into its own outbound body.
+	//   - Kiro request with a usable Kiro account: run the agentic emulation loop
+	//     (generate + search both on Kiro). Self-contained — no other provider.
+	//   - Any other non-Kiro provider (no native search): fall through; the hosted
+	//     web_search tool is dropped downstream and the model answers without it.
+	//     We do NOT re-route its search through a Kiro account. NEVER a 404.
 	if config.GetWebSearchEnabled() {
 		if _, ok := findClaudeWebSearchTool(req.Tools); ok && h.shouldEmulateWebSearch(reqBackend) {
 			h.handleClaudeWebSearch(w, &req, req.Model, upstreamModel, reqBackend, matchedKeyID, thinking)
