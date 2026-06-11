@@ -187,25 +187,36 @@ func appendToolEntry(existing interface{}, entry map[string]interface{}) []inter
 }
 
 // shouldEmulateWebSearch reports whether the proxy should run the Kiro-backed
-// agentic web-search loop for a request on `backend`, rather than letting the
-// provider handle search natively (or dropping the tool). Emulation is used when
-// the backend has NO native search AND a usable Kiro account exists to run the
-// MCP search side-call. A Kiro-backed request always emulates (Kiro has no native
-// hosted tool). Returns false when the provider is native (it injects its own
-// search) or when no Kiro account is available (the tool is dropped instead).
+// agentic web-search loop for a request on `backend`.
+//
+// PROVIDER ISOLATION: a request explicitly routed to a provider (e.g.
+// "fable/claude-fable-5") must stay entirely on that provider — it must never
+// borrow another provider's account. So Kiro-backed web-search emulation is
+// engaged ONLY for a Kiro request. A non-Kiro backend either does search
+// NATIVELY (the generic provider injects the switch into its own outbound body)
+// or the web_search tool is dropped and the model answers without it. A non-Kiro
+// request is never silently re-routed through a Kiro account for the MCP search
+// side-call — that cross-provider mixing is what this gate exists to prevent.
+//
+// Returns false when the provider is native (it injects its own search), for any
+// non-Kiro backend (stay isolated), or when no usable Kiro account exists for a
+// Kiro request (the tool is dropped instead).
 func (h *Handler) shouldEmulateWebSearch(backend string) bool {
 	if nativeWebSearchKindForBackend(backend) != "" {
 		return false // provider does it natively
 	}
 	b := strings.ToLower(strings.TrimSpace(backend))
 	if b == "" || b == "kiro" {
-		// Kiro path: emulate via its own MCP (original behavior). Still require a
-		// usable Kiro account so a tokenless pool degrades to "drop tool".
+		// Kiro path: emulate via its own MCP (the inference account IS a Kiro
+		// account, so this is self-contained). Still require a usable Kiro account
+		// so a tokenless pool degrades to "drop tool".
 		return h.firstUsableKiroAccount() != nil
 	}
-	// Non-Kiro, non-native (e.g. Groq/OpenAI): emulate only if a Kiro account can
-	// run the search side-call; otherwise drop the tool (model answers).
-	return h.firstUsableKiroAccount() != nil
+	// Non-Kiro, non-native (e.g. a custom anthropic/openai-compatible provider):
+	// do NOT borrow a Kiro account. The request is routed to THIS provider and
+	// must stay on it; the web_search tool is dropped downstream and the model
+	// answers from its own knowledge. Native-search providers are handled above.
+	return false
 }
 
 // firstUsableKiroAccount returns a Kiro account with a valid token for the MCP
