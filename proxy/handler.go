@@ -1436,6 +1436,7 @@ func (h *Handler) refreshModelsCache() {
 		models   []ModelInfo
 		modelIDs []string
 		account  *config.Account
+		advisory bool
 		err      error
 	}
 	results := make([]accountResult, len(accounts))
@@ -1465,6 +1466,25 @@ func (h *Handler) refreshModelsCache() {
 				results[i] = accountResult{account: account, err: perr}
 				return
 			}
+			// For a generic (data-driven) provider, use FetchModelsForAccount so we
+			// learn whether the ids are LIVE/authoritative (strict routing filter) or
+			// a STATIC fallback (advisory, display-only — never shed). Using the
+			// always-strict ListModels here would overwrite an advisory list seeded by
+			// the per-account path with a strict one on every tick, re-introducing the
+			// "503 for a served-but-unlisted model" shed. Kiro keeps ListModels.
+			if gp, ok := prov.(*genericProvider); ok {
+				ids, advisory, ferr := gp.FetchModelsForAccount(context.Background(), account)
+				if ferr != nil {
+					results[i] = accountResult{account: account, err: ferr}
+					return
+				}
+				models := make([]ModelInfo, 0, len(ids))
+				for _, id := range ids {
+					models = append(models, ModelInfo{ModelId: id})
+				}
+				results[i] = accountResult{models: models, modelIDs: ids, account: account, advisory: advisory}
+				return
+			}
 			models, err := prov.ListModels(account)
 			if err != nil {
 				results[i] = accountResult{account: account, err: err}
@@ -1489,8 +1509,14 @@ func (h *Handler) refreshModelsCache() {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", r.account.Email, r.err)
 			continue
 		}
-		// 缓存每账号可用模型，用于路由时过滤
-		h.pool.SetModelList(r.account.ID, r.modelIDs)
+		// 缓存每账号可用模型，用于路由时过滤. An advisory list (static fallback for a
+		// no-/models provider) is display-only and must NOT gate routing, so seed it
+		// via SetAdvisoryModelList; a live/authoritative list seeds the strict filter.
+		if r.advisory {
+			h.pool.SetAdvisoryModelList(r.account.ID, r.modelIDs)
+		} else {
+			h.pool.SetModelList(r.account.ID, r.modelIDs)
+		}
 		// Aggregate into the SHARED /v1/models catalog ONLY for Kiro accounts.
 		// A non-Kiro provider's bare ids route via the "provider/model" prefix
 		// only, so listing them unprefixed in the global catalog would mis-route
