@@ -130,7 +130,7 @@ func requestIsHTTPS(r *http.Request) bool {
 // excluded: they get only the cheap nosniff/referrer headers.
 func isHTMLSurfacePath(path string) bool {
 	switch {
-	case path == "/" :
+	case path == "/":
 		return true
 	case path == "/admin" || path == "/admin/":
 		return true

@@ -422,8 +422,8 @@ func TestApiImportAccountsSkipDuplicatesAndReturnPerRowResults(t *testing.T) {
 	// is exercised by TestApiImportAccountsRejectsOversizedBody and the
 	// decode tests; this test focuses on the per-row counter behaviour.
 	rows := []importCredential{
-		{RefreshToken: "rt-existing"},                                                   // skip
-		{RefreshToken: ""},                                                              // invalid
+		{RefreshToken: "rt-existing"}, // skip
+		{RefreshToken: ""},            // invalid
 		{RefreshToken: "rt-broken", ClientID: "c", ClientSecret: "s", AuthMethod: "idc"}, // failed
 	}
 	failingRefresh := stubFailingRefresh("simulated network failure")

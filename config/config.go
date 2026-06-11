@@ -131,6 +131,20 @@ type Account struct {
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 
+	// TokenLimit is an OPERATOR-SET per-account lifetime token cap, primarily for
+	// api-key providers (OpenAI/Groq/DashScope/...) where each key carries its own
+	// allowance (e.g. a 1,000,000-token DashScope key). 0 = unlimited (default), so
+	// every pre-existing account and every Kiro account is unaffected. When > 0 and
+	// TotalTokens >= TokenLimit the account is "exhausted": the pool drops it from
+	// rotation (computeEffectiveWeight returns 0) exactly like a Kiro quota
+	// exhaustion, so a burst of 100 keys naturally STACKS — traffic keeps flowing
+	// to keys with remaining allowance and an exhausted key is skipped rather than
+	// erroring. It is independent of the Kiro UsageCurrent/UsageLimit pair (which is
+	// synced from AWS) and of the inbound per-API-key LifetimeTokLimit (which caps
+	// CLIENTS, not upstream keys). TotalTokens is the same cumulative counter the
+	// dashboard already shows, so "used" needs no new accounting.
+	TokenLimit int `json:"tokenLimit,omitempty"`
+
 	// ---- Non-Kiro provider credentials (Backend != "kiro") ----
 	// These are inert for Kiro accounts (Backend empty/"kiro"). They carry the
 	// credentials a non-Kiro provider needs; AccessToken/RefreshToken/ExpiresAt
@@ -921,6 +935,24 @@ func AddAccount(account Account) error {
 	return Save()
 }
 
+// AddAccounts appends multiple accounts in a single locked Save, so a bulk
+// import of N accounts does ONE marshal+fsync+rename instead of N. Returns the
+// number actually appended. A nil/empty slice is a no-op (no disk write). The
+// caller is responsible for any dedupe before calling — this performs none, to
+// keep it a pure batch primitive (the provider bulk-add path dedupes upstream).
+func AddAccounts(accounts []Account) (int, error) {
+	if len(accounts) == 0 {
+		return 0, nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Accounts = append(cfg.Accounts, accounts...)
+	if err := Save(); err != nil {
+		return 0, err
+	}
+	return len(accounts), nil
+}
+
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -987,6 +1019,28 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	return nil
 }
 
+// UpdateAccountBaseURLOverride persists a per-account base URL override. Used by
+// the Qwen OAuth path, where the token response's resource_url selects the
+// account's OpenAI-compatible host and can change on refresh. Empty is ignored so
+// a refresh that omits resource_url doesn't wipe a known-good base.
+func UpdateAccountBaseURLOverride(id, baseURL string) error {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			if cfg.Accounts[i].BaseURLOverride == baseURL {
+				return nil // no change, skip the disk write
+			}
+			cfg.Accounts[i].BaseURLOverride = baseURL
+			return Save()
+		}
+	}
+	return nil
+}
+
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -997,6 +1051,44 @@ func DeleteAccount(id string) error {
 		}
 	}
 	return nil
+}
+
+// DeleteAccounts removes multiple accounts by id in a single locked Save, so a
+// batch delete of N accounts does ONE marshal+fsync+rename instead of N. Returns
+// the number actually removed. Unknown ids are ignored. A nil/empty id set is a
+// no-op (no disk write).
+func DeleteAccounts(ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	idSet := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			idSet[id] = true
+		}
+	}
+	if len(idSet) == 0 {
+		return 0, nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	kept := cfg.Accounts[:0]
+	removed := 0
+	for _, a := range cfg.Accounts {
+		if idSet[a.ID] {
+			removed++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	cfg.Accounts = kept
+	if err := Save(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {

@@ -33,6 +33,7 @@ type openAIChatBody struct {
 	TopP        float64                  `json:"top_p,omitempty"`
 	Stream      bool                     `json:"stream"`
 	Tools       []map[string]interface{} `json:"tools,omitempty"`
+	ToolChoice  interface{}              `json:"tool_choice,omitempty"`
 }
 
 // buildOpenAIChatBody converts a NormalizedRequest into an OpenAI chat
@@ -50,6 +51,13 @@ func buildOpenAIChatBody(nr *NormalizedRequest, upstreamModel string, stream boo
 		body.TopP = req.TopP
 		body.Messages = openAIMessagesToMaps(req.Messages)
 		body.Tools = openAIToolsToMaps(req.Tools)
+		// Carry the tool-selection intent through unchanged (it's already an
+		// OpenAI-shaped value); normalize only to drop unknown forms.
+		if len(body.Tools) > 0 {
+			if ti, ok := parseOpenAIToolChoice(req.ToolChoice); ok {
+				body.ToolChoice = ti.toOpenAI()
+			}
+		}
 	case nr.Claude != nil:
 		req := nr.Claude
 		body.MaxTokens = req.MaxTokens
@@ -57,6 +65,11 @@ func buildOpenAIChatBody(nr *NormalizedRequest, upstreamModel string, stream boo
 		body.TopP = req.TopP
 		body.Messages = claudeToOpenAIMessages(req)
 		body.Tools = claudeToolsToOpenAIMaps(req.Tools)
+		if len(body.Tools) > 0 {
+			if ti, ok := parseClaudeToolChoice(req.ToolChoice); ok {
+				body.ToolChoice = ti.toOpenAI()
+			}
+		}
 	}
 
 	return json.Marshal(body)
@@ -292,6 +305,14 @@ type openAIStreamChunk struct {
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		// Real upstream prompt-cache hit count. OpenAI / DashScope-compatible
+		// report it under prompt_tokens_details.cached_tokens; DeepSeek uses the
+		// flat prompt_cache_hit_tokens. Either is the genuine cached prefix — we
+		// pass it through verbatim (never a local estimate) via OnCacheUsage.
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 	} `json:"usage"`
 }
 
@@ -376,6 +397,21 @@ func parseOpenAISSE(r io.Reader, cb *KiroStreamCallback) error {
 		}
 		if chunk.Usage != nil && cb.OnComplete != nil {
 			cb.OnComplete(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+		}
+		if chunk.Usage != nil && cb.OnCacheUsage != nil {
+			// Pass through the REAL upstream cached-prefix count (never estimated).
+			// prompt_tokens_details.cached_tokens is the OpenAI/DashScope-compatible
+			// field; prompt_cache_hit_tokens is DeepSeek's flat equivalent.
+			cached := 0
+			if d := chunk.Usage.PromptTokensDetails; d != nil {
+				cached = d.CachedTokens
+			}
+			if cached == 0 && chunk.Usage.PromptCacheHitTokens > 0 {
+				cached = chunk.Usage.PromptCacheHitTokens
+			}
+			if cached > 0 {
+				cb.OnCacheUsage(cached, 0) // read-only providers report no cache-creation
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {

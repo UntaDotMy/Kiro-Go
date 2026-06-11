@@ -32,10 +32,10 @@ func TestDetectToolSearchMode(t *testing.T) {
 
 func TestPartitionToolSearchTools(t *testing.T) {
 	tools := []ClaudeTool{
-		{Name: "read_file"},                                  // eager
-		{Name: "get_weather", DeferLoading: true},            // deferred
-		{Name: "create_issue", DeferLoading: true},           // deferred
-		{Type: "tool_search_tool_regex_20251119", Name: "x"}, // search tool (dropped)
+		{Name: "read_file"},                                                   // eager
+		{Name: "get_weather", DeferLoading: true},                             // deferred
+		{Name: "create_issue", DeferLoading: true},                            // deferred
+		{Type: "tool_search_tool_regex_20251119", Name: "x"},                  // search tool (dropped)
 		{Type: "web_search_20250305", Name: "web_search", DeferLoading: true}, // server tool: defer ignored → eager bucket
 	}
 	eager, deferred, mode := partitionToolSearchTools(tools)

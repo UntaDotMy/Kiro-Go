@@ -1555,6 +1555,28 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err != nil {
 		return err
 	}
+
+	// For a generic (data-driven) provider, use FetchModelsForAccount so we learn
+	// whether the ids came from a LIVE /models fetch (authoritative — seed a strict
+	// per-account routing filter) or from a STATIC fallback catalog (advisory —
+	// display-only, so a model missing from the hardcoded guess is never shed as
+	// "no available account"). The no-/models providers (CodeBuddy, iFlow, the
+	// Alibaba "alicode" coding hosts, GitLab Duo, Perplexity) take the advisory
+	// path; everything with a working /models endpoint takes the strict path.
+	if gp, ok := prov.(*genericProvider); ok {
+		ids, advisory, ferr := gp.FetchModelsForAccount(context.Background(), account)
+		if ferr != nil {
+			return ferr
+		}
+		if advisory {
+			h.pool.SetAdvisoryModelList(account.ID, ids)
+		} else {
+			h.pool.SetModelList(account.ID, ids)
+		}
+		logger.Infof("[ModelsCache] Refreshed %d models for account %s (advisory=%v)", len(ids), account.Email, advisory)
+		return nil
+	}
+
 	models, err := prov.ListModels(account)
 	if err != nil {
 		return err
@@ -1893,24 +1915,43 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		matchedKeyID = k.ID
 	}
 
-	// Web-search agentic loop: only when the feature is enabled AND the request
-	// actually carries a web_search tool. This path runs the search via Kiro's
-	// native MCP endpoint and answers with native citation blocks. Every other
-	// request falls through to the original, unchanged handler path below.
+	// Resolve the request's provider backend from the model string up front. The
+	// tool-search loop below runs the conversation against Kiro's NATIVE /mcp
+	// endpoint via CallKiroAPI, so it only makes sense for a Kiro-routed model;
+	// the web-search loop is now backend-aware (it runs generation against the
+	// request's OWN backend and executes the search via a Kiro account's MCP
+	// side-call), so it works for non-Kiro providers too.
+	reqBackend, upstreamModel := ParseModelBackend(req.Model)
+	isKiroBackend := reqBackend == "kiro"
+
+	// Web-search resolution: PROVIDER-NATIVE FIRST, Kiro only as fallback.
+	//   - Native provider (DashScope enable_search, Gemini google_search,
+	//     Anthropic hosted web_search): fall through to the normal path, where the
+	//     generic provider injects the native switch into the outbound body. No
+	//     Kiro account needed.
+	//   - No native capability but a usable Kiro account exists: run the agentic
+	//     emulation loop (generate on the request's own backend, search via Kiro
+	//     MCP). This is the only path that needs Kiro.
+	//   - No native capability and no Kiro account: fall through; the hosted tool
+	//     is dropped downstream and the model answers from training. NEVER a 404.
 	if config.GetWebSearchEnabled() {
-		if _, ok := findClaudeWebSearchTool(req.Tools); ok {
-			h.handleClaudeWebSearch(w, &req, req.Model, matchedKeyID, thinking)
+		if _, ok := findClaudeWebSearchTool(req.Tools); ok && h.shouldEmulateWebSearch(reqBackend) {
+			h.handleClaudeWebSearch(w, &req, req.Model, upstreamModel, reqBackend, matchedKeyID, thinking)
 			return
 		}
 	}
 
-	// Tool-search agentic loop: only when the feature is enabled AND the request
+	// Tool-search agentic loop: only when the feature is enabled, the request
 	// carries a tool_search server tool together with at least one deferred
-	// (defer_loading) tool. This withholds the deferred tool schemas from the
-	// upstream model, runs the regex/BM25 match proxy-side, and answers with
-	// native tool_search_tool_result blocks. A tool_search tool with no deferred
-	// tools is inert and falls through to the normal path below.
-	if config.GetToolSearchEnabled() {
+	// (defer_loading) tool, AND the request routes to Kiro. This withholds the
+	// deferred tool schemas from the upstream model, runs the regex/BM25 match
+	// proxy-side, and answers with native tool_search_tool_result blocks. A
+	// tool_search tool with no deferred tools is inert and falls through to the
+	// normal path below. For a NON-Kiro backend the deferred tools are simply
+	// forwarded to the upstream model as ordinary function tools (the generic
+	// converters ignore defer_loading), so tool calling still works there — only
+	// the token-saving withhold/search optimization is Kiro-specific.
+	if isKiroBackend && config.GetToolSearchEnabled() {
 		if requestHasToolSearch(req.Tools) {
 			h.handleClaudeToolSearch(w, &req, req.Model, matchedKeyID, thinking)
 			return
@@ -1938,10 +1979,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// matchedKeyID was resolved above (before the web-search branch) and is
 	// reused here for the per-key success debit on the normal path.
 
-	// Resolve the request's provider backend from the model string
-	// ("groq/llama-3.3", "or/...", or an unprefixed Kiro model). For Kiro the
-	// backend is "kiro" and routing/translation are byte-identical to before.
-	reqBackend, upstreamModel := ParseModelBackend(req.Model)
+	// reqBackend / upstreamModel were resolved up front (before the agentic-loop
+	// gate) from the model string ("groq/llama-3.3", "or/...", or an unprefixed
+	// Kiro model). For Kiro the backend is "kiro" and routing/translation are
+	// byte-identical to before.
 
 	// poolModel is the id the pool's per-account model filter matches against.
 	// For Kiro it's the MAPPED upstream id (actualModel) the model cache stores;
@@ -2035,6 +2076,18 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	activeBlockType := ""
 	startInputTokens := estimatedInputTokens
 
+	// Cross-backend cache rule: the local promptCache estimator is authoritative
+	// ONLY for Kiro (whose upstream reports no cache split). For any non-Kiro
+	// backend we must NOT emit the estimate — we pass through the provider's REAL
+	// reported cache (captured below via OnCacheUsage) or emit nothing.
+	isKiro := config.GetAccountBackend(account) == "kiro"
+	var realCacheRead, realCacheCreation int
+	// Provider-native web-search citations (e.g. Gemini grounding). Captured here
+	// and spliced as server_tool_use + web_search_tool_result blocks after the
+	// text answer, so a Claude client renders citation chips for the native path.
+	var nativeSearchResults []WebSearchResult
+	var nativeSearchQuery string
+
 	// committed flips to true the moment we write the first byte to the
 	// client (message_start). Before that, the dispatcher may fail over.
 	committed := false
@@ -2072,7 +2125,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				"model":         canonicalAnthropicModelID(model),
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
+				// Kiro: preliminary estimate. Non-Kiro: no cache yet (real upstream
+				// cache, if any, is known only at stream end → final message_delta).
+				"usage": buildClaudeUsageMap(startInputTokens, 0, cacheUsage, isKiro && cacheProfile != nil),
 			},
 		})
 		committed = true
@@ -2300,6 +2355,14 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
+		OnCacheUsage: func(read, creation int) {
+			realCacheRead = read
+			realCacheCreation = creation
+		},
+		OnWebSearchResults: func(query string, results []WebSearchResult) {
+			nativeSearchQuery = query
+			nativeSearchResults = results
+		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
@@ -2378,15 +2441,44 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	}
 	h.promptCache.Update(account.ID, cacheProfile)
 
+	// Splice provider-native web-search citations (e.g. Gemini grounding) as
+	// server_tool_use + web_search_tool_result content blocks after the text
+	// answer, so a Claude client renders citation chips. Only the native path
+	// (no Kiro emulation loop) populates nativeSearchResults.
+	if len(nativeSearchResults) > 0 {
+		toolUseID := "srvtoolu_" + uuid.New().String()
+		if len(nativeSearchResults) > maxWebSearchResults {
+			nativeSearchResults = nativeSearchResults[:maxWebSearchResults]
+		}
+		for _, blk := range buildWebSearchResultBlocks(toolUseID, nativeSearchQuery, nativeSearchResults) {
+			idx := nextContentIndex
+			nextContentIndex++
+			emit("content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": blk,
+			})
+			emit("content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
+	}
+
 	// 发送 message_delta
 	stopReason := resolveAnthropicStopReason(upstreamStopReason, len(toolUses) > 0)
+
+	// Backend-aware cache: Kiro uses the local estimate; non-Kiro passes through
+	// the provider's REAL reported cache (or emits none). Never a Kiro estimate
+	// on a non-Kiro response.
+	respCacheUsage, includeRespCache := resolveResponseCache(isKiro, cacheUsage, cacheProfile != nil, realCacheRead, realCacheCreation)
 
 	emit("message_delta", map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
 			"stop_reason": stopReason,
 		},
-		"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+		"usage": buildClaudeUsageMap(inputTokens, outputTokens, respCacheUsage, includeRespCache),
 	})
 
 	emit("message_stop", map[string]interface{}{
@@ -2603,6 +2695,15 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	var realInputTokens int
 	var upstreamStopReason string
 
+	// Backend-aware cache (see handleClaudeStream): estimate only for Kiro; for
+	// non-Kiro, pass through the provider's REAL reported cache or none.
+	isKiro := config.GetAccountBackend(account) == "kiro"
+	var realCacheRead, realCacheCreation int
+	// Provider-native web-search citations (e.g. Gemini grounding), spliced into
+	// the response content so a Claude client renders citation chips.
+	var nativeSearchResults []WebSearchResult
+	var nativeSearchQuery string
+
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
 			if isThinking {
@@ -2623,6 +2724,14 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		},
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+		},
+		OnCacheUsage: func(read, creation int) {
+			realCacheRead = read
+			realCacheCreation = creation
+		},
+		OnWebSearchResults: func(query string, results []WebSearchResult) {
+			nativeSearchQuery = query
+			nativeSearchResults = results
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
@@ -2688,16 +2797,27 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	}
 
 	resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
-	if cacheProfile != nil {
-		cacheUsage = reconcileCacheUsage(inputTokens, cacheUsage)
+	// Splice provider-native web-search citations (e.g. Gemini grounding) as
+	// server_tool_use + web_search_tool_result blocks so a Claude client renders
+	// citation chips. Only the native path populates nativeSearchResults.
+	if len(nativeSearchResults) > 0 {
+		toolUseID := "srvtoolu_" + uuid.New().String()
+		resp.Content = spliceNativeCitationBlocks(resp.Content, toolUseID, nativeSearchQuery, nativeSearchResults)
 	}
-	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
-	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
-	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-	if cacheProfile != nil {
+	// Backend-aware cache: Kiro uses the local estimate (reconciled to the real
+	// input total); non-Kiro passes through the provider's REAL reported cache or
+	// emits none. Never a Kiro estimate on a non-Kiro response.
+	respCacheUsage, includeRespCache := resolveResponseCache(isKiro, cacheUsage, cacheProfile != nil, realCacheRead, realCacheCreation)
+	if includeRespCache {
+		respCacheUsage = reconcileCacheUsage(inputTokens, respCacheUsage)
+	}
+	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, respCacheUsage)
+	resp.Usage.CacheCreationInputTokens = respCacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = respCacheUsage.CacheReadInputTokens
+	if includeRespCache && (respCacheUsage.CacheCreation5mInputTokens > 0 || respCacheUsage.CacheCreation1hInputTokens > 0) {
 		resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
-			Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
-			Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+			Ephemeral5mInputTokens: respCacheUsage.CacheCreation5mInputTokens,
+			Ephemeral1hInputTokens: respCacheUsage.CacheCreation1hInputTokens,
 		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -3372,6 +3492,12 @@ func applyTokenExtras(account *config.Account, extra map[string]string) {
 	if v, ok := extra["planType"]; ok && v != "" {
 		account.CodexPlanType = v
 	}
+	// Qwen OAuth refresh may return an updated resource_url -> base URL. Apply it in
+	// memory AND persist so the next request (and a restart) targets the right host.
+	if v, ok := extra["baseURLOverride"]; ok && v != "" && v != account.BaseURLOverride {
+		account.BaseURLOverride = v
+		_ = config.UpdateAccountBaseURLOverride(account.ID, v)
+	}
 }
 
 // ==================== 管理 API ====================
@@ -3421,6 +3547,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
+	case path == "/accounts/batch-delete" && r.Method == "POST":
+		// Delete many accounts in one request (select-all + delete on the
+		// Providers/Accounts tab). One save, one pool reload for the whole set.
+		h.apiDeleteAccountsBatch(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
 		h.apiRefreshAllAccountsModels(w, r)
@@ -3473,6 +3603,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		// Add a non-Kiro provider account (api-key backends: groq, openai,
 		// anthropic, gemini, deepseek, ...). Kiro accounts keep using /accounts.
 		h.apiAddProviderAccount(w, r)
+	case path == "/providers/account/bulk" && r.Method == "POST":
+		// Bulk-add many api keys for one provider in a single request (the "Bulk"
+		// toggle in the Add Provider modal). One save, one pool reload, one model
+		// fetch for the whole batch.
+		h.apiAddProviderAccountsBulk(w, r)
 	case path == "/providers" && r.Method == "GET":
 		h.apiListCustomProviders(w, r)
 	case path == "/providers" && r.Method == "POST":
@@ -3489,6 +3624,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartQoderLogin(w, r)
 	case path == "/auth/qoder/poll" && r.Method == "POST":
 		h.apiPollQoderLogin(w, r)
+	case path == "/auth/qwen/start" && r.Method == "POST":
+		h.apiStartQwenLogin(w, r)
+	case path == "/auth/qwen/poll" && r.Method == "POST":
+		h.apiPollQwenLogin(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -3628,6 +3767,8 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"errorCount":        stats.ErrorCount,
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
+			"tokenLimit":        a.TokenLimit,
+			"tokenLimitReached": a.TokenLimit > 0 && stats.TotalTokens >= a.TokenLimit,
 			"lastUsed":          stats.LastUsed,
 			"inflight":          inflight,
 			"concurrencyLimit":  concurrencyLimit,
@@ -3688,6 +3829,36 @@ func (h *Handler) apiDeleteAccount(w http.ResponseWriter, r *http.Request, id st
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+// apiDeleteAccountsBatch POST /admin/api/accounts/batch-delete — delete many
+// accounts by id in one request (the Providers/Accounts tab "select all + delete"
+// action). One config save, one pool reload for the whole set. Body: {"ids":[...]}.
+func (h *Handler) apiDeleteAccountsBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no account ids provided"})
+		return
+	}
+	removed, err := config.DeleteAccounts(req.IDs)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if removed > 0 {
+		h.pool.Reload()
+	}
+	logger.Infof("[Accounts] Batch-deleted %d of %d requested accounts", removed, len(req.IDs))
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "deleted": removed})
+}
+
 func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id string) {
 	var updates map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
@@ -3736,6 +3907,14 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["overageWeight"].(float64); ok {
 		existing.OverageWeight = clampInt(int(v), 1, 10)
+	}
+	if v, ok := updates["tokenLimit"].(float64); ok {
+		// Operator-set per-account lifetime token cap. Negative is treated as 0
+		// (unlimited); fractional input is floored. 0 clears the cap.
+		if v < 0 {
+			v = 0
+		}
+		existing.TokenLimit = int(v)
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		if v != "" {

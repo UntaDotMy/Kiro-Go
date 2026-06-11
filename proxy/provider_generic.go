@@ -60,6 +60,7 @@ func resolveProviderSettings(acct *config.Account) (providerSettings, bool) {
 		ps.baseURL = bp.BaseURL
 		ps.authHeader = bp.AuthHeader
 		ps.headers = bp.Headers
+		ps.models = bp.Models
 	} else if pc, ok := config.GetProviderConfig(backend); ok {
 		ps.dialect = Dialect(strings.ToLower(strings.TrimSpace(pc.Dialect)))
 		ps.baseURL = pc.BaseURL
@@ -176,21 +177,44 @@ func (g *genericProvider) ListModels(acct *config.Account) ([]ModelInfo, error) 
 
 // FetchModelsForAccount fetches the live model list for a provider account,
 // returning just the ids. Exposed for the admin add/validate flow so the
-// dashboard can show what models an endpoint offers immediately on add.
-func (g *genericProvider) FetchModelsForAccount(ctx context.Context, acct *config.Account) ([]string, error) {
+// dashboard can show what models an endpoint offers immediately on add. When the
+// live fetch fails or returns nothing AND the provider ships a static catalog
+// (providers with no GET /models endpoint — see builtinProvider.Models), it falls
+// back to that static list so the add flow shows a real count instead of 0.
+//
+// The returned `advisory` flag reports the SOURCE: false when the ids came from a
+// live /models fetch (authoritative — the caller should seed a STRICT routing
+// filter via SetModelList), true when they came from the static fallback (a
+// best-effort hardcoded list — the caller should seed a DISPLAY-ONLY advisory list
+// via SetAdvisoryModelList so a model missing from the static guess is never shed).
+// Only returns an error when the live fetch failed AND there is no static fallback.
+func (g *genericProvider) FetchModelsForAccount(ctx context.Context, acct *config.Account) (ids []string, advisory bool, err error) {
 	ps, ok := resolveProviderSettings(acct)
 	if !ok {
-		return nil, fmt.Errorf("unknown provider for account %s", acct.ID)
+		return nil, false, fmt.Errorf("unknown provider for account %s", acct.ID)
 	}
-	models, err := g.fetchModels(ctx, ps, acct)
-	if err != nil {
-		return nil, err
+	models, ferr := g.fetchModels(ctx, ps, acct)
+	if ferr == nil && len(models) > 0 {
+		out := make([]string, 0, len(models))
+		for _, m := range models {
+			out = append(out, m.ModelId)
+		}
+		return out, false, nil
 	}
-	ids := make([]string, 0, len(models))
-	for _, m := range models {
-		ids = append(ids, m.ModelId)
+	// Live fetch failed or was empty: fall back to the provider's static catalog
+	// (no-/models providers ship one). This is advisory only.
+	if len(ps.models) > 0 {
+		if ferr != nil {
+			logger.Infof("[%s] /models fetch failed (%v); using static catalog of %d models (advisory)", ps.id, ferr, len(ps.models))
+		}
+		out := make([]string, len(ps.models))
+		copy(out, ps.models)
+		return out, true, nil
 	}
-	return ids, nil
+	if ferr != nil {
+		return nil, false, ferr
+	}
+	return nil, false, nil
 }
 
 // fetchModels does the GET {modelsURL} call and parses the response. It accepts
@@ -326,20 +350,38 @@ func (g *genericProvider) Call(ctx context.Context, acct *config.Account, nr *No
 }
 
 // buildRequest produces the upstream URL and JSON body for the provider's
-// dialect.
+// dialect. When the request carries a web_search tool AND this provider has a
+// native web-search capability (DashScope enable_search, Gemini google_search,
+// Anthropic hosted web_search), the native switch is injected into the body so
+// the provider runs the search server-side — no Kiro account, no agentic loop.
+// A provider with no native capability ignores web_search here; the handler
+// routes those requests to the Kiro-backed emulation loop (or drops the tool).
 func (g *genericProvider) buildRequest(ps providerSettings, nr *NormalizedRequest, upstreamModel string) (string, []byte, error) {
+	nativeKind := ""
+	if config.GetWebSearchEnabled() && nrHasWebSearch(nr) {
+		nativeKind = nativeWebSearchKindForSettings(ps)
+	}
 	switch ps.dialect {
 	case DialectOpenAI:
 		body, err := buildOpenAIChatBody(nr, upstreamModel, true)
+		if err == nil {
+			body = injectNativeWebSearch(nativeKind, body)
+		}
 		return ps.chatURL(), body, err
 	case DialectAnthropic:
 		body, err := buildAnthropicBody(nr, upstreamModel, true)
+		if err == nil {
+			body = injectNativeWebSearch(nativeKind, body)
+		}
 		return ps.chatURL(), body, err
 	case DialectGemini:
 		// Gemini encodes the model + streaming mode in the URL path, off the
 		// models-listing base.
 		url := strings.TrimRight(ps.apiBase(), "/") + "/" + upstreamModel + ":streamGenerateContent?alt=sse"
 		body, err := buildGeminiBody(nr, upstreamModel)
+		if err == nil {
+			body = injectNativeWebSearch(nativeKind, body)
+		}
 		return url, body, err
 	default:
 		return "", nil, fmt.Errorf("unsupported dialect %q", ps.dialect)

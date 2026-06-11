@@ -444,6 +444,26 @@ type KiroStreamCallback struct {
 	OnComplete     func(inputTokens, outputTokens int)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnCacheUsage surfaces REAL upstream prompt-cache token counts when the
+	// inference provider reports them in its own usage payload — NOT a local
+	// estimate. Only the non-Kiro generic providers populate it, reading:
+	//   - OpenAI-compatible: usage.prompt_tokens_details.cached_tokens
+	//                        (DeepSeek fallback: usage.prompt_cache_hit_tokens)
+	//   - Gemini:            usageMetadata.cachedContentTokenCount
+	//   - Anthropic:         usage.cache_read_input_tokens / cache_creation_input_tokens
+	// cacheRead is the cached/cache-hit prefix; cacheCreation is the cache-write
+	// count (Anthropic only — the others report read-only, so cacheCreation=0).
+	// Last value wins (mirrors OnComplete). Optional; the Kiro path never sets it
+	// (Kiro cache is handled by the local promptCache estimator instead).
+	OnCacheUsage func(cacheRead, cacheCreation int)
+	// OnWebSearchResults surfaces PROVIDER-NATIVE web-search citations parsed from
+	// the upstream response (e.g. Gemini groundingMetadata.groundingChunks). The
+	// handler splices these into Anthropic server_tool_use + web_search_tool_result
+	// blocks so a Claude client renders real citation chips even though the
+	// provider ran the search server-side (no emulation loop). query is the
+	// provider's own search query (Gemini webSearchQueries joined), "" if none.
+	// Optional; only the generic providers that can parse native grounding set it.
+	OnWebSearchResults func(query string, results []WebSearchResult)
 	// OnStopReason surfaces a canonical stop reason ("end_turn", "max_tokens",
 	// "stop_sequence", "tool_use", "pause_turn", "refusal") detected from the
 	// upstream event stream — either from explicit messageStopEvent /
@@ -1159,6 +1179,15 @@ const defaultContextWindow = 200_000
 func getContextWindowSize(model string) int {
 	if isLargeContextModel(model) {
 		return 1_000_000
+	}
+	// Non-Claude provider models (gemini/qwen/glm/...) don't match the Claude
+	// version parse above. Consult the per-family documented-window table so a
+	// gemini-2.5 (1M) or qwen-turbo (1M) model isn't capped to the flat Claude
+	// default — that under-count makes a client's usage gauge overshoot. A live
+	// tokenLimits value still wins upstream (contextWindowForModel); this is the
+	// fallback when the provider's /models reports no per-model window.
+	if w := familyContextWindowFor(model); w > 0 {
+		return w
 	}
 	return defaultContextWindow
 }

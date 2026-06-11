@@ -112,6 +112,19 @@ func ProviderForBackend(backend string) Provider {
 	if p, ok := providerRegistry[backend]; ok {
 		return p
 	}
+	// A built-in catalog provider (groq, qwen, alicode, alicode-intl, anthropic,
+	// gemini, ...) is served by the shared generic provider for its dialect. These
+	// are NOT keyed in providerRegistry by their own id (only "generic:<dialect>"
+	// is), and they are not config.ProviderConfig entries, so without this branch
+	// every built-in api-key account resolved to nil — surfacing as "no provider
+	// registered for backend" on live calls AND silently skipping the on-add /
+	// refresh model fetch (the *genericProvider type assertion failed). This is the
+	// branch that makes the built-in api-key providers actually work end to end.
+	if bp, ok := resolveBuiltinProvider(backend); ok {
+		if p, ok := providerRegistry["generic:"+string(bp.Dialect)]; ok {
+			return p
+		}
+	}
 	// A user-defined ProviderConfig id resolves to the generic provider for its
 	// dialect, if that provider has been registered (Phase 3).
 	if pc, ok := config.GetProviderConfig(backend); ok {

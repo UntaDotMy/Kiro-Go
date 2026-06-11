@@ -63,18 +63,18 @@ type ResponsesTool struct {
 
 // ResponsesResponse is the non-streaming /v1/responses response body.
 type ResponsesResponse struct {
-	ID                string                       `json:"id"`
-	Object            string                       `json:"object"`
-	CreatedAt         int64                        `json:"created_at"`
-	Status            string                       `json:"status"`
-	Model             string                       `json:"model"`
-	Output            []ResponsesOutput            `json:"output"`
-	Usage             ResponsesUsage               `json:"usage"`
-	Metadata          map[string]string            `json:"metadata,omitempty"`
-	Reasoning         *ResponsesReason             `json:"reasoning,omitempty"`
-	ParallelTC        bool                         `json:"parallel_tool_calls"`
-	Tools             []ResponsesTool              `json:"tools,omitempty"`
-	IncompleteDetails *ResponsesIncompleteDetails  `json:"incomplete_details,omitempty"`
+	ID                string                      `json:"id"`
+	Object            string                      `json:"object"`
+	CreatedAt         int64                       `json:"created_at"`
+	Status            string                      `json:"status"`
+	Model             string                      `json:"model"`
+	Output            []ResponsesOutput           `json:"output"`
+	Usage             ResponsesUsage              `json:"usage"`
+	Metadata          map[string]string           `json:"metadata,omitempty"`
+	Reasoning         *ResponsesReason            `json:"reasoning,omitempty"`
+	ParallelTC        bool                        `json:"parallel_tool_calls"`
+	Tools             []ResponsesTool             `json:"tools,omitempty"`
+	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
 }
 
 // ResponsesIncompleteDetails carries the reason a response did not run to

@@ -10,17 +10,19 @@ import "strings"
 // 15-rune tail-hold that interacted badly with the upstream delta handling).
 //
 // Lifecycle:
-//   p := newThinkingProcessor(thinking, emit)
-//   for each upstream text or thinking chunk:
-//     p.Process(text, isThinking)
-//   when the upstream stream ends:
-//     p.Finalize()
+//
+//	p := newThinkingProcessor(thinking, emit)
+//	for each upstream text or thinking chunk:
+//	  p.Process(text, isThinking)
+//	when the upstream stream ends:
+//	  p.Finalize()
 //
 // The emitter receives (text, thinkingState):
-//   thinkingState == 0 → ordinary assistant content
-//   thinkingState == 1 → first chunk of a thinking block (caller opens block)
-//   thinkingState == 2 → middle chunk of a thinking block
-//   thinkingState == 3 → last chunk of a thinking block (caller closes block)
+//
+//	thinkingState == 0 → ordinary assistant content
+//	thinkingState == 1 → first chunk of a thinking block (caller opens block)
+//	thinkingState == 2 → middle chunk of a thinking block
+//	thinkingState == 3 → last chunk of a thinking block (caller closes block)
 //
 // The 15-rune tail-hold preserves enough buffered text across chunk
 // boundaries that a partial "<thinking>" or "</thinking>" tag straddling
@@ -28,10 +30,10 @@ import "strings"
 // verbatim. Finalize() is the only path that flushes the held tail, so
 // every error path on the caller's side MUST call Finalize().
 type thinkingTextProcessor struct {
-	thinking       bool                                       // whether thinking output is enabled at all
-	emit           func(text string, thinkingState int)       // downstream emitter
-	allowReasoning func(*thinkingStreamSource) bool           // gate for reasoningContentEvent path
-	allowTag       func(*thinkingStreamSource) bool           // gate for inline <thinking> path
+	thinking       bool                                 // whether thinking output is enabled at all
+	emit           func(text string, thinkingState int) // downstream emitter
+	allowReasoning func(*thinkingStreamSource) bool     // gate for reasoningContentEvent path
+	allowTag       func(*thinkingStreamSource) bool     // gate for inline <thinking> path
 
 	textBuffer        string
 	inThinkingBlock   bool

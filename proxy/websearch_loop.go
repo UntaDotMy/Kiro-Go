@@ -56,16 +56,17 @@ type kiroRoundResult struct {
 
 // runKiroCollect runs a single Kiro round against the pool with full failover,
 // collecting the assistant output instead of writing it to the client. Returns
-// the collected result, or an error if every account attempt failed.
+// the collected result, or an error if every account attempt failed. This is the
+// Kiro-only variant used by the tool-search loop; the web-search loop uses the
+// backend-aware runProviderCollect below.
 //
-// ACCOUNTING NOTE: this runs per ROUND of the web-search agentic loop (up to
-// maxWebSearchRounds times for one client request). It records ONLY the
-// per-account pool stats (RecordSuccess/UpdateStats), which are legitimately
-// per-upstream-call. It deliberately does NOT call recordSuccess (global
-// request/token/credit counters + SQLite) or ConsumeAPIKey (per-key quota
-// debit) — those would over-count a single client request by up to N×. The
-// caller (handleClaudeWebSearch) aggregates across rounds and debits exactly
-// once. See the loop in handleClaudeWebSearch.
+// ACCOUNTING NOTE: this runs per ROUND of the agentic loop (up to maxRounds
+// times for one client request). It records ONLY the per-account pool stats
+// (RecordSuccess/UpdateStats), which are legitimately per-upstream-call. It
+// deliberately does NOT call recordSuccess (global request/token/credit counters
+// + SQLite) or ConsumeAPIKey (per-key quota debit) — those would over-count a
+// single client request by up to N×. The caller aggregates across rounds and
+// debits exactly once.
 func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (*kiroRoundResult, error) {
 	out := &kiroRoundResult{}
 	var realInputTokens int
@@ -124,10 +125,107 @@ func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (
 	return out, nil
 }
 
-// handleClaudeWebSearch orchestrates the web-search agentic loop and writes the
-// final response. Precondition: req carries a web_search tool and the feature
-// is enabled (verified by the caller).
-func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeRequest, model, apiKeyID string, thinking bool) {
+// runProviderCollect runs ONE agentic round against the request's OWN backend
+// (Kiro or any generic/non-Kiro provider) with full backend-scoped failover,
+// collecting the assistant output instead of writing it to the client. This is
+// what makes the web-search loop work for non-Kiro providers: a dashscope/qwen
+// account generates the turn, while the search side-call still goes through a
+// Kiro account's MCP endpoint (handled by the caller).
+//
+// backend is the resolved provider id ("kiro" or e.g. "qwen"/"dashscope"); the
+// pool selection is scoped to accounts on that backend. poolModel is the id the
+// pool's per-account filter matches against (the de-prefixed upstream id for a
+// non-Kiro backend, the request model for Kiro). roundReq is the Claude request
+// for THIS round (already grown with prior search results). payload is the
+// prebuilt Kiro payload — used verbatim by the Kiro provider and ignored by a
+// generic provider, which translates roundReq itself.
+//
+// Accounting matches runKiroCollect: per-account pool stats only; the caller
+// owns the once-per-request global + per-key accounting.
+func (h *Handler) runProviderCollect(backend, poolModel, model, upstreamModel, apiKeyID string, roundReq *ClaudeRequest, payload *KiroPayload, thinking bool, effort string) (*kiroRoundResult, error) {
+	out := &kiroRoundResult{}
+	var realInputTokens int
+
+	baseNR := &NormalizedRequest{
+		Model:         upstreamModel,
+		ClientDialect: DialectClaude,
+		Claude:        roundReq,
+		Thinking:      thinking,
+		Stream:        false,
+		Effort:        effort,
+	}
+
+	worker := func(account *config.Account) (bool, error) {
+		*out = kiroRoundResult{}
+		realInputTokens = 0
+		if payload != nil {
+			payload.ProfileArn = ""
+		}
+
+		callback := &KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				if isThinking {
+					out.thinking += text
+				} else {
+					out.content += text
+				}
+			},
+			OnToolUse:  func(tu KiroToolUse) { out.toolUses = append(out.toolUses, tu) },
+			OnComplete: func(inTok, outTok int) { out.inputTokens = inTok; out.outputTokens = outTok },
+			OnCredits:  func(c float64) { out.credits = c },
+			OnContextUsage: func(pct float64) {
+				realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+			},
+			OnStopReason: func(r string) { out.stopReason = r },
+		}
+
+		// Stash the per-round NormalizedRequest so callProviderForKiro hands the
+		// generic provider a real request to translate. A fresh copy per attempt
+		// keeps concurrent failover attempts from racing on nr.Kiro.
+		nr := *baseNR
+		ctx := withNormalizedRequest(context.Background(), &nr)
+		if err := h.callProviderForKiro(ctx, account, payload, model, thinking, callback); err != nil {
+			h.recordAttemptError(err, account.ID)
+			return false, err
+		}
+
+		out.inputTokens = resolveInputTokens(out.inputTokens, realInputTokens, 0)
+		h.pool.RecordSuccess(account.ID)
+		h.pool.UpdateStats(account.ID, out.inputTokens+out.outputTokens, out.credits)
+		h.triggerAccountRefresh(account.ID)
+		return false, nil
+	}
+
+	_, _, err := h.runWithFailoverCountedBackend(backend, poolModel, apiKeyID, effort, worker, false)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// handleClaudeWebSearch orchestrates the web-search agentic EMULATION loop and
+// writes the final response. Precondition (verified by the caller): the feature
+// is enabled, req carries a web_search tool, the request's backend has NO native
+// web search, and a usable Kiro account exists for the MCP search side-call.
+//
+// Generation runs against the request's OWN backend (Kiro or any generic/non-Kiro
+// provider) via runProviderCollect, so e.g. a Groq/OpenAI model that lacks native
+// search still gets grounded answers. The actual search always executes through a
+// Kiro account's MCP endpoint (firstUsableKiroAccount), which is the only search
+// source this emulation has.
+//
+//	model         — public model id as requested (echoed back to the client)
+//	upstreamModel — de-prefixed id sent upstream (== model for a Kiro request)
+//	backend       — resolved provider id ("kiro" or e.g. "groq")
+func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeRequest, model, upstreamModel, backend, apiKeyID string, thinking bool) {
+	// poolModel is the id the pool's per-account filter matches against: the
+	// de-prefixed upstream id for a non-Kiro backend, the request model for Kiro.
+	poolModel := model
+	if backend != "" && backend != "kiro" {
+		poolModel = upstreamModel
+	}
+	effort := claudeRequestEffort(req)
+
 	// Working copy of the conversation we grow across search rounds.
 	messages := make([]ClaudeMessage, len(req.Messages))
 	copy(messages, req.Messages)
@@ -158,19 +256,18 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 
 		roundReq := *req
 		roundReq.Messages = messages
+		// Prebuild the Kiro payload so a Kiro-backed request is byte-identical to
+		// the original path; a generic provider ignores it and translates roundReq.
 		payload := ClaudeToKiro(&roundReq, thinking)
-		// Forward native reasoning effort (output_config.effort) per round, the
-		// same as the non-web-search Claude path, so an effort level set by the
-		// client isn't silently dropped on web-search requests.
-		h.applyReasoningEffort(payload, claudeRequestEffort(req))
+		h.applyReasoningEffort(payload, effort)
 
-		res, err := h.runKiroCollect(model, apiKeyID, payload)
+		res, err := h.runProviderCollect(backend, poolModel, model, upstreamModel, apiKeyID, &roundReq, payload, thinking, effort)
 		if err != nil {
 			// If at least one round already succeeded, surface what we have
 			// rather than discarding it; the partial usage is still debited
 			// below. Only a round-0 failure (nothing produced) is a hard error.
 			if roundsRun == 0 {
-				// runKiroCollect suppresses the global failure count (this loop
+				// runProviderCollect suppresses the global failure count (this loop
 				// owns once-per-request accounting), so record the single failure
 				// here for a total round-0 failure.
 				h.recordFailure(model, apiKeyID, payload.ResolvedEffort)
@@ -210,10 +307,15 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 		assistantBlocks := buildAssistantToolUseBlocks(res.content, searchCalls)
 		messages = append(messages, ClaudeMessage{Role: "assistant", Content: assistantBlocks})
 
+		// The MCP search side-call ALWAYS runs on a Kiro account, regardless of the
+		// inference backend (the search endpoint is Kiro-specific). Resolve it once
+		// per round.
+		searchAccount := h.firstUsableKiroAccount()
+
 		var resultBlocks []interface{}
 		for _, call := range searchCalls {
 			query := extractWebSearchQuery(call.Input)
-			results, searchErr := performKiroWebSearch(context.Background(), h.firstUsableAccount(), query)
+			results, searchErr := performKiroWebSearch(context.Background(), searchAccount, query)
 			logWebSearch(query, len(results), searchErr)
 
 			feedback := formatWebSearchForModel(query, results)
@@ -234,7 +336,7 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 	}
 
 	// Account for the WHOLE request exactly ONCE, with the summed totals across
-	// every round. runKiroCollect deliberately skips global counters + per-key
+	// every round. runProviderCollect deliberately skips global counters + per-key
 	// debit (see its accounting note) so we don't inflate them N× for a single
 	// client request. Only record if at least one round actually ran.
 	if roundsRun > 0 {
@@ -268,31 +370,6 @@ func buildAssistantToolUseBlocks(content string, toolUses []KiroToolUse) []inter
 		})
 	}
 	return blocks
-}
-
-// firstUsableAccount returns an account with a token for executing the MCP
-// search side-call. It prefers the pool's strategy-aware pick (so it honors
-// weights and skips accounts currently in cooldown), and only falls back to a
-// linear scan of enabled accounts if the pool has nothing eligible. The main
-// generation rounds still go through full pool failover via runKiroCollect.
-func (h *Handler) firstUsableAccount() *config.Account {
-	// Pool-first: respects cooldown/backoff and weighting. Empty model = "any
-	// eligible account", which is correct for a model-agnostic MCP side-call.
-	if acc, _, ok := h.pool.GetNextForModel(""); ok && acc != nil && acc.AccessToken != "" {
-		a := *acc
-		_ = h.ensureValidToken(&a)
-		return &a
-	}
-	// Fallback: a cooled-down pool shouldn't make web search impossible, so
-	// scan for any enabled account with a token.
-	for _, a := range config.GetAccounts() {
-		if a.Enabled && a.AccessToken != "" {
-			acc := a
-			_ = h.ensureValidToken(&acc)
-			return &acc
-		}
-	}
-	return nil
 }
 
 // writeClaudeWebSearchResponse emits the final assistant message, splicing the

@@ -550,6 +550,30 @@ func reconcileCacheUsage(inputTokens int, usage promptCacheUsage) promptCacheUsa
 	}
 }
 
+// resolveResponseCache enforces the hard cross-backend cache rule, returning the
+// cache usage to emit and whether to emit cache fields at all:
+//
+//   - KIRO backend: the LOCAL prompt-cache estimator is authoritative (Kiro's
+//     upstream doesn't report a real cache split), so we use the estimated usage
+//     and emit it whenever an estimator profile was built — unchanged behavior.
+//   - ANY NON-KIRO backend: NEVER emit a Kiro-estimated split. Pass through ONLY
+//     the provider's REAL reported cache (realRead/realCreation from the upstream
+//     usage via OnCacheUsage). When the provider reported none (the common case),
+//     emit NO cache fields rather than a fabricated/zero stub. Keeps a client's
+//     running context tally honest for DashScope/Gemini/OpenAI-compatible backends.
+func resolveResponseCache(isKiro bool, estimated promptCacheUsage, estimatedProfilePresent bool, realRead, realCreation int) (promptCacheUsage, bool) {
+	if isKiro {
+		return estimated, estimatedProfilePresent
+	}
+	if realRead > 0 || realCreation > 0 {
+		return promptCacheUsage{
+			CacheReadInputTokens:     realRead,
+			CacheCreationInputTokens: realCreation,
+		}, true
+	}
+	return promptCacheUsage{}, false
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	if includeCache {
 		usage = reconcileCacheUsage(inputTokens, usage)

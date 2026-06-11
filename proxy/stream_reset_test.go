@@ -91,7 +91,6 @@ func TestClassifyStreamError_ClientConnectionLost(t *testing.T) {
 	}
 }
 
-
 func TestClassifyStreamError_UnrelatedPassesThrough(t *testing.T) {
 	notAReset := errors.New("connection refused")
 	if got := classifyStreamError(notAReset); got != notAReset {

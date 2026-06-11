@@ -485,14 +485,20 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 
 // applySystemPromptFilters runs the full filter chain on a system prompt:
 //
-//  1. Detect Claude Code CLI system prompt -> drop it entirely (gated by
-//     FilterClaudeCode toggle). The proxy used to replace it with a static
-//     "Help the user..." line, but the standalone replacement was itself
-//     recognizable as fake injection — so when detected we just return an
-//     empty system prompt. Tool definitions still travel via the structured
-//     tools field; the model uses its training defaults for response styling.
+//  1. Detect Claude Code CLI system prompt -> drop the HARNESS boilerplate
+//     (gated by FilterClaudeCode toggle) WHILE preserving genuine user/project
+//     memory (CLAUDE.md / AGENTS.md) that Claude Code embeds inside
+//     <system-reminder> blocks. The proxy used to replace the prompt with a
+//     static "Help the user..." line, but the standalone replacement was itself
+//     recognizable as fake injection — so it then dropped the system prompt
+//     ENTIRELY. That over-corrected: when CLAUDE.md rode inside the system
+//     prompt it was thrown away too, which is why the model stopped honoring it.
+//     We now keep the user-memory reminders (real user instructions, not
+//     fingerprintable harness text) and drop only the Anthropic harness
+//     boilerplate. Tool definitions still travel via the structured tools field.
 //  2. Strip "--- SYSTEM PROMPT ---" boundary markers (gated by FilterStripBoundaries).
-//  3. Strip environment-noise lines and <system-reminder> blocks (gated by FilterEnvNoise).
+//  3. Strip environment-noise lines and noisy <system-reminder> blocks (gated by
+//     FilterEnvNoise) — memory reminders are preserved even here.
 //  4. Apply user-defined regex / line-filter rules.
 //
 // Use this only on the system prompt. For user-message text use
@@ -505,12 +511,113 @@ func applySystemPromptFilters(prompt string) string {
 
 	cfg := config.GetPromptFilterConfig()
 
-	// 1. Detect Claude Code CLI system prompt → drop entirely.
+	// 1. Detect Claude Code CLI system prompt → strip harness boilerplate but
+	//    keep any embedded user/project memory (CLAUDE.md / AGENTS.md). Dropping
+	//    the whole prompt lost that memory; preserving the memory reminders keeps
+	//    the user's instructions flowing to the model without re-introducing a
+	//    fingerprintable fake-injection line.
 	if cfg.FilterClaudeCode && isClaudeCodeSystemPrompt(prompt) {
-		return ""
+		memory := extractUserMemoryReminders(prompt)
+		if memory == "" {
+			return ""
+		}
+		// Run the shared noise filters over the preserved memory so a stray
+		// billing-header line riding alongside it can't trip upstream moderation.
+		return applySharedFiltersWithConfig(memory, cfg)
 	}
 
 	return applySharedFiltersWithConfig(prompt, cfg)
+}
+
+// reminderCarriesUserMemory reports whether a <system-reminder> block (or any
+// text fragment) carries genuine user/project memory — the CLAUDE.md / AGENTS.md
+// content Claude Code wraps in a reminder — as opposed to pure harness/env noise
+// (deferred-tool catalog, environment, git status, malicious-code warnings).
+// These memory blocks are real user instructions and must survive filtering so
+// the model keeps honoring CLAUDE.md.
+func reminderCarriesUserMemory(block string) bool {
+	lower := strings.ToLower(block)
+	// Strong, unambiguous markers Claude Code / other harnesses use when embedding
+	// memory files. Kept broad on purpose: a false POSITIVE only preserves a bit
+	// of extra system text, while a false NEGATIVE silently drops the user's
+	// CLAUDE.md — so when in doubt we keep the block.
+	strong := []string{
+		"# claudemd",
+		"# agentsmd",
+		"codebase and user instructions are shown below",
+		"these instructions override any default behavior",
+		"user's private global instructions",
+		"user's global instructions",
+		"user memory",
+		"project memory",
+		"project instructions",
+		"# project instructions",
+		"# user instructions",
+		"global claude code instructions",
+		"memory file",
+		// Localized framings of the Claude Code memory header that we have seen
+		// in the wild (zh / es / fr / de / ja / pt). These mirror the English
+		// "Codebase and user instructions are shown below" / "user instructions".
+		"用户指令",       // zh: user instructions
+		"用户记忆",       // zh: user memory
+		"项目指令",       // zh: project instructions
+		"instrucciones del usuario", // es
+		"instructions de l'utilisateur", // fr
+		"benutzeranweisungen",       // de
+		"ユーザーの指示",  // ja: user instructions
+		"instruções do usuário",     // pt
+	}
+	for _, m := range strong {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	// "Contents of <path>/CLAUDE.md" / "Contents of <path>/AGENTS.md" — the
+	// file-embed header Claude Code prepends to each memory file. Also match a
+	// bare mention of a memory filename next to "contents"/"内容"/"contenu" so a
+	// localized embed header still preserves the block.
+	memoryFiles := []string{"claude.md", "agents.md", "claude.local.md", ".clauderc", "gemini.md", "qwen.md", "copilot-instructions.md"}
+	hasMemoryFile := false
+	for _, f := range memoryFiles {
+		if strings.Contains(lower, f) {
+			hasMemoryFile = true
+			break
+		}
+	}
+	if hasMemoryFile {
+		for _, head := range []string{"contents of", "contents", "内容", "contenu", "contenido", "inhalt"} {
+			if strings.Contains(lower, head) {
+				return true
+			}
+		}
+		// A reminder that names a memory file AND frames it as instructions/memory
+		// is memory even without the "contents of" header (heading-based embeds).
+		for _, kw := range []string{"instruction", "memory", "memories", "guidance", "指令", "记忆"} {
+			if strings.Contains(lower, kw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractUserMemoryReminders returns the concatenation of every
+// <system-reminder> block in prompt that carries genuine user/project memory,
+// preserving the reminder tags so the model sees the memory exactly as Claude
+// Code framed it. Returns "" when no memory reminders are present (in which case
+// the caller drops the harness prompt entirely, as before).
+func extractUserMemoryReminders(prompt string) string {
+	matches := systemReminderBlockRe.FindAllString(prompt, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	kept := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if reminderCarriesUserMemory(m) {
+			kept = append(kept, strings.TrimSpace(m))
+		}
+	}
+	return strings.Join(kept, "\n\n")
 }
 
 // applyUserMessageFilters runs only the noise-stripping subset of the filter
@@ -697,8 +804,18 @@ func isAnyHeading(trimmed string) bool {
 //   - gitStatus, Recent commits, knowledge cutoff, fast_mode_info, etc.
 //   - Various inline "Claude Code" identity markers
 func stripEnvNoiseLines(prompt string) string {
-	// 1. Block-level: drop whole <system-reminder>...</system-reminder> blocks.
-	prompt = systemReminderBlockRe.ReplaceAllString(prompt, "")
+	// 1. Block-level: drop <system-reminder>...</system-reminder> blocks, BUT
+	//    keep any that carry genuine user/project memory (CLAUDE.md / AGENTS.md).
+	//    Claude Code delivers project memory inside these blocks, so a blanket
+	//    drop here silently discards the user's instructions — the exact reason
+	//    CLAUDE.md "wasn't being followed". We strip only the noise reminders
+	//    (deferred-tool catalog, environment, skills index) and preserve memory.
+	prompt = systemReminderBlockRe.ReplaceAllStringFunc(prompt, func(block string) string {
+		if reminderCarriesUserMemory(block) {
+			return block
+		}
+		return ""
+	})
 
 	// 2. Line-level: drop the Bedrock reserved keyword wherever it appears,
 	//    even if Claude Code emits it indented or wrapped.
@@ -1413,6 +1530,13 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	// ToolChoice is the OpenAI tool-selection knob: "auto" | "none" | "required"
+	// | {"type":"function","function":{"name":"..."}}. The Kiro path ignores it
+	// (CodeWhisperer has no equivalent), but the generic-provider translation
+	// layer maps it across dialects so a forced/affirmative tool choice survives
+	// to OpenAI-, Anthropic-, and Gemini-compatible upstreams. See
+	// translate_tool_choice.go.
+	ToolChoice interface{} `json:"tool_choice,omitempty"`
 	// ReasoningEffort is the OpenAI Chat Completions reasoning knob
 	// ("minimal"|"low"|"medium"|"high"). We fold it into the thinking decision
 	// (see reasoning_effort.go) rather than forwarding it upstream, since the
