@@ -1436,6 +1436,7 @@ func (h *Handler) refreshModelsCache() {
 		models   []ModelInfo
 		modelIDs []string
 		account  *config.Account
+		advisory bool
 		err      error
 	}
 	results := make([]accountResult, len(accounts))
@@ -1465,6 +1466,25 @@ func (h *Handler) refreshModelsCache() {
 				results[i] = accountResult{account: account, err: perr}
 				return
 			}
+			// For a generic (data-driven) provider, use FetchModelsForAccount so we
+			// learn whether the ids are LIVE/authoritative (strict routing filter) or
+			// a STATIC fallback (advisory, display-only — never shed). Using the
+			// always-strict ListModels here would overwrite an advisory list seeded by
+			// the per-account path with a strict one on every tick, re-introducing the
+			// "503 for a served-but-unlisted model" shed. Kiro keeps ListModels.
+			if gp, ok := prov.(*genericProvider); ok {
+				ids, advisory, ferr := gp.FetchModelsForAccount(context.Background(), account)
+				if ferr != nil {
+					results[i] = accountResult{account: account, err: ferr}
+					return
+				}
+				models := make([]ModelInfo, 0, len(ids))
+				for _, id := range ids {
+					models = append(models, ModelInfo{ModelId: id})
+				}
+				results[i] = accountResult{models: models, modelIDs: ids, account: account, advisory: advisory}
+				return
+			}
 			models, err := prov.ListModels(account)
 			if err != nil {
 				results[i] = accountResult{account: account, err: err}
@@ -1489,8 +1509,14 @@ func (h *Handler) refreshModelsCache() {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", r.account.Email, r.err)
 			continue
 		}
-		// 缓存每账号可用模型，用于路由时过滤
-		h.pool.SetModelList(r.account.ID, r.modelIDs)
+		// 缓存每账号可用模型，用于路由时过滤. An advisory list (static fallback for a
+		// no-/models provider) is display-only and must NOT gate routing, so seed it
+		// via SetAdvisoryModelList; a live/authoritative list seeds the strict filter.
+		if r.advisory {
+			h.pool.SetAdvisoryModelList(r.account.ID, r.modelIDs)
+		} else {
+			h.pool.SetModelList(r.account.ID, r.modelIDs)
+		}
 		// Aggregate into the SHARED /v1/models catalog ONLY for Kiro accounts.
 		// A non-Kiro provider's bare ids route via the "provider/model" prefix
 		// only, so listing them unprefixed in the global catalog would mis-route
@@ -1917,23 +1943,23 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Resolve the request's provider backend from the model string up front. The
 	// tool-search loop below runs the conversation against Kiro's NATIVE /mcp
-	// endpoint via CallKiroAPI, so it only makes sense for a Kiro-routed model;
-	// the web-search loop is now backend-aware (it runs generation against the
-	// request's OWN backend and executes the search via a Kiro account's MCP
-	// side-call), so it works for non-Kiro providers too.
+	// endpoint via CallKiroAPI, so it only makes sense for a Kiro-routed model.
+	// The web-search emulation loop is Kiro-only too (see below): a request routed
+	// to a non-Kiro provider stays entirely on that provider.
 	reqBackend, upstreamModel := ParseModelBackend(req.Model)
 	isKiroBackend := reqBackend == "kiro"
 
-	// Web-search resolution: PROVIDER-NATIVE FIRST, Kiro only as fallback.
+	// Web-search resolution: PROVIDER-NATIVE FIRST, Kiro emulation only for a
+	// Kiro-routed request. PROVIDER ISOLATION — a request explicitly routed to a
+	// provider never borrows another provider's account.
 	//   - Native provider (DashScope enable_search, Gemini google_search,
 	//     Anthropic hosted web_search): fall through to the normal path, where the
-	//     generic provider injects the native switch into the outbound body. No
-	//     Kiro account needed.
-	//   - No native capability but a usable Kiro account exists: run the agentic
-	//     emulation loop (generate on the request's own backend, search via Kiro
-	//     MCP). This is the only path that needs Kiro.
-	//   - No native capability and no Kiro account: fall through; the hosted tool
-	//     is dropped downstream and the model answers from training. NEVER a 404.
+	//     generic provider injects the native switch into its own outbound body.
+	//   - Kiro request with a usable Kiro account: run the agentic emulation loop
+	//     (generate + search both on Kiro). Self-contained — no other provider.
+	//   - Any other non-Kiro provider (no native search): fall through; the hosted
+	//     web_search tool is dropped downstream and the model answers without it.
+	//     We do NOT re-route its search through a Kiro account. NEVER a 404.
 	if config.GetWebSearchEnabled() {
 		if _, ok := findClaudeWebSearchTool(req.Tools); ok && h.shouldEmulateWebSearch(reqBackend) {
 			h.handleClaudeWebSearch(w, &req, req.Model, upstreamModel, reqBackend, matchedKeyID, thinking)
