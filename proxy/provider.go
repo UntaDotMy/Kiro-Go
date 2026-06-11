@@ -17,6 +17,8 @@ const (
 	DialectOpenAI    Dialect = "openai"    // OpenAI /v1/chat/completions (SSE)
 	DialectAnthropic Dialect = "anthropic" // Anthropic /v1/messages (SSE)
 	DialectGemini    Dialect = "gemini"    // Google generateContent (SSE)
+	DialectOllama    Dialect = "ollama"    // Ollama /api/chat (NDJSON stream)
+	DialectGeminiCLI Dialect = "gemini-cli" // Google Cloud Code Assist (wraps generateContent)
 
 	// Client-side dialects (what the inbound request spoke). These tag
 	// NormalizedRequest.ClientDialect so a provider can tell whether to expect

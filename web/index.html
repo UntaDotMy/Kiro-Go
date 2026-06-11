@@ -1073,6 +1073,36 @@
                 <button class="btn btn-primary" onclick="saveOverUsageConfig()" data-i18n="common.save"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title">Web Search</span></div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:10px">
+                        <label class="switch"><input type="checkbox" id="webSearchEnabled"><span class="slider"></span></label>
+                        <span>Enable web search emulation</span>
+                    </label>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Services an inbound web_search tool (Claude hosted web_search / Claude Code WebSearch). Default on. With Kiro selected below, search runs on Kiro's native MCP endpoint (no key, billed to the Kiro account). Pick an external provider to search via a standalone API instead — useful for a pure DashScope/Gemini/OpenAI deployment with no Kiro account.</small>
+                </div>
+                <div class="form-group">
+                    <label>Search provider</label>
+                    <select id="webSearchProvider" onchange="onWebSearchProviderChange()">
+                        <option value="kiro">Kiro (native MCP — no API key)</option>
+                        <option value="tavily">Tavily</option>
+                        <option value="brave">Brave Search</option>
+                        <option value="serper">Serper</option>
+                        <option value="exa">Exa</option>
+                        <option value="linkup">Linkup</option>
+                        <option value="searchapi">SearchAPI</option>
+                        <option value="youcom">You.com</option>
+                        <option value="google-pse">Google Programmable Search</option>
+                    </select>
+                </div>
+                <div class="form-group hidden" id="webSearchKeyRow">
+                    <label>Search API key <span id="webSearchKeyHint" style="font-weight:normal;color:#64748b;font-size:12px"></span></label>
+                    <input type="password" id="webSearchApiKey" placeholder="leave blank to keep the saved key">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block" id="webSearchKeyState"></small>
+                </div>
+                <button class="btn btn-primary" onclick="saveWebSearchConfig()">Save Web Search</button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.thinkingSuffix"></label>
@@ -3491,10 +3521,48 @@
             document.getElementById('requireApiKey').checked = d.requireApiKey;
             document.getElementById('apiKeyInput').value = d.apiKey || '';
             document.getElementById('allowOverUsage').checked = d.allowOverUsage || false;
+            const wsEnabled = document.getElementById('webSearchEnabled');
+            if (wsEnabled) {
+                wsEnabled.checked = d.webSearchEnabled || false;
+                const wsProvider = document.getElementById('webSearchProvider');
+                if (wsProvider) wsProvider.value = d.webSearchProvider || 'kiro';
+                window._webSearchKeySet = !!d.webSearchApiKeySet;
+                const wsKey = document.getElementById('webSearchApiKey');
+                if (wsKey) wsKey.value = '';
+                onWebSearchProviderChange();
+            }
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
             loadPromptFilter();
+        }
+        function onWebSearchProviderChange() {
+            const provider = document.getElementById('webSearchProvider').value;
+            const keyRow = document.getElementById('webSearchKeyRow');
+            const needsKey = provider !== 'kiro';
+            if (keyRow) keyRow.classList.toggle('hidden', !needsKey);
+            const hint = document.getElementById('webSearchKeyHint');
+            if (hint) hint.textContent = needsKey ? '(' + provider + ')' : '';
+            const state = document.getElementById('webSearchKeyState');
+            if (state) state.textContent = window._webSearchKeySet ? 'A key is saved. Leave blank to keep it.' : 'No key saved yet.';
+        }
+        async function saveWebSearchConfig() {
+            const payload = {
+                webSearchEnabled: document.getElementById('webSearchEnabled').checked,
+                webSearchProvider: document.getElementById('webSearchProvider').value,
+            };
+            const key = document.getElementById('webSearchApiKey').value;
+            if (key) payload.webSearchApiKey = key;
+            const res = await fetch('/admin/api/settings', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+                alert('Web search settings saved');
+                loadSettings();
+            } else {
+                alert('Failed to save web search settings');
+            }
         }
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
@@ -4021,6 +4089,9 @@
             if (typeof qoderSessionId !== 'undefined') { qoderSessionId = ''; }
             if (typeof qwenPollTimer !== 'undefined' && qwenPollTimer) { clearTimeout(qwenPollTimer); qwenPollTimer = null; }
             if (typeof qwenSessionId !== 'undefined') { qwenSessionId = ''; }
+            if (typeof oauthFlowTimer !== 'undefined' && oauthFlowTimer) { clearTimeout(oauthFlowTimer); oauthFlowTimer = null; }
+            if (typeof oauthFlowSession !== 'undefined') { oauthFlowSession = ''; }
+            if (typeof oauthFlowId !== 'undefined') { oauthFlowId = ''; }
         }
         // Add a non-Kiro provider account. Two shapes:
         //   - a named built-in provider (Groq, OpenAI, DeepSeek, ...) — just an
@@ -4037,15 +4108,40 @@
             body.innerHTML = '<p style="font-size:13px;color:#64748b;margin-bottom:12px">Loading providers…</p>';
             modal.classList.add('active');
             let cat = [];
+            let oauthCat = [];
             try {
                 const res = await fetch('/admin/api/providers/catalog', { headers: { 'X-Admin-Password': password } });
                 const d = await res.json();
-                cat = (d.providers || []).filter(p => p.authType === 'apikey');
+                const all = d.providers || [];
+                cat = all.filter(p => p.authType === 'apikey');
+                // Any catalog provider with a wired connect flow gets a login/import
+                // button — including dual-mode providers (e.g. xai) that also accept a
+                // pasted API key and so still appear in the dropdown above.
+                oauthCat = all.filter(p => OAUTH_FLOWS[p.id]);
             } catch (e) { /* fall through to empty */ }
             const builtinOpts = cat.map(p => '<option value="' + p.id + '" data-dialect="' + p.dialect + '">' + (p.name || p.id) + ' (' + p.dialect + ')</option>').join('');
             const opts = builtinOpts + '<option value="custom">➕ Custom (OpenAI / Anthropic / Gemini compatible)</option>';
+            // Browser/OAuth/import providers get a button grid — each opens its own connect flow.
+            let oauthSection = '';
+            if (oauthCat.length) {
+                const btns = oauthCat.map(p => {
+                    const f = OAUTH_FLOWS[p.id];
+                    return '<button class="btn btn-secondary" style="justify-content:flex-start;text-align:left" onclick="openOAuthProvider(\'' + p.id + '\')">' +
+                        '<span style="font-weight:600">' + (p.name || p.id) + '</span>' +
+                        '<span style="font-size:11px;color:var(--muted);margin-left:6px">' + (f.kindLabel || '') + '</span>' +
+                        '</button>';
+                }).join('');
+                oauthSection =
+                    '<div style="margin-bottom:18px">' +
+                    '<div style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">Browser login / token import</div>' +
+                    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' + btns + '</div>' +
+                    '<div style="font-size:12px;color:var(--muted);margin-top:8px">These providers authenticate via a browser login, device code, or imported token instead of an API key.</div>' +
+                    '</div>' +
+                    '<div style="border-top:1px solid var(--border);margin-bottom:16px"></div>';
+            }
             body.innerHTML =
-                '<p style="font-size:13px;color:#64748b;margin-bottom:16px">Add any API-key provider. Models route with a <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px">provider/model</code> prefix (e.g. <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px">groq/llama-3.3-70b</code>). Pick <b>Custom</b> to bring your own OpenAI-compatible endpoint by base URL — its models are fetched automatically. OAuth providers (Codex, Qoder) use their own connect flow.</p>' +
+                oauthSection +
+                '<p style="font-size:13px;color:#64748b;margin-bottom:16px">Add any API-key provider. Models route with a <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px">provider/model</code> prefix (e.g. <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px">groq/llama-3.3-70b</code>). Pick <b>Custom</b> to bring your own OpenAI-compatible endpoint by base URL — its models are fetched automatically.</p>' +
                 '<div class="form-group"><label>Provider</label><select id="provBackend" onchange="onProvBackendChange()">' + opts + '</select></div>' +
                 '<div id="provCustomFields" class="hidden">' +
                 '  <div class="form-group"><label>Display Name</label><input type="text" id="provCustomName" placeholder="My LLM Gateway"></div>' +
@@ -4545,6 +4641,251 @@
         function cancelQwenLogin() {
             if (qwenPollTimer) { clearTimeout(qwenPollTimer); qwenPollTimer = null; }
             qwenSessionId = '';
+        }
+
+        // ===== Generic OAuth / browser-login / token-import connect flows =====
+        // Each catalog provider with authType "oauth" maps to one of these flow
+        // shapes. The dispatcher (openOAuthProvider) renders the right modal body
+        // and the *Generic* helpers drive start/poll/complete/import against the
+        // provider's /admin/api/auth/<id>/* endpoints. This replaces hand-writing a
+        // bespoke modal + JS per provider.
+        //
+        // kind:
+        //   'device'   — start returns {sessionId, userCode?, verificationUri}; poll until completed
+        //   'loopback' — start returns {sessionId, authUrl}; browser callback completes server-side; poll until completed
+        //   'paste'    — start returns {sessionId, authUrl}; user pastes the redirect code; complete exchanges it
+        //   'gitlab'   — like 'paste' but start needs {baseUrl, clientId, clientSecret}
+        //   'token'    — no start; import a pasted token (+ optional fields)
+        //   'cookie'   — no start; import a session cookie
+        //   'vertex'   — no start; import a service-account JSON
+        const OAUTH_FLOWS = {
+            codebuddy:      { kind: 'device',   kindLabel: 'browser login' },
+            'codebuddy-ai': { kind: 'device',   kindLabel: 'browser login' },
+            'kimi-coding':  { kind: 'device',   kindLabel: 'device code' },
+            kilocode:       { kind: 'device',   kindLabel: 'browser login' },
+            github:         { kind: 'device',   kindLabel: 'device code' },
+            qwen:           { kind: 'device',   kindLabel: 'device code' },
+            xai:            { kind: 'loopback', kindLabel: 'browser login' },
+            iflow:          { kind: 'loopback', kindLabel: 'browser login' },
+            'gemini-cli':   { kind: 'loopback', kindLabel: 'Google login' },
+            antigravity:    { kind: 'loopback', kindLabel: 'Google login' },
+            'claude-code':  { kind: 'paste',    kindLabel: 'paste code' },
+            cline:          { kind: 'paste',    kindLabel: 'paste code' },
+            gitlab:         { kind: 'gitlab',   kindLabel: 'OAuth app' },
+            cursor:         { kind: 'token',    kindLabel: 'import token',
+                fields: [
+                    { id: 'accessToken', label: 'Access Token', type: 'password', placeholder: 'cursorAuth/accessToken from the Cursor IDE', required: true },
+                    { id: 'machineId',   label: 'Machine ID',  type: 'text',     placeholder: 'storage.serviceMachineId from the Cursor IDE', required: true },
+                    { id: 'name',        label: 'Name (optional)', type: 'text',  placeholder: 'Cursor IDE' }
+                ],
+                importPath: '/auth/cursor/import',
+                help: 'Import from the Cursor IDE state DB: cursorAuth/accessToken + storage.serviceMachineId.' },
+            vertex:         { kind: 'vertex',   kindLabel: 'service account',
+                importPath: '/auth/vertex/import',
+                help: 'Paste a Google Cloud service-account JSON key with Vertex AI access.' },
+            'grok-web':       { kind: 'cookie', kindLabel: 'session cookie',
+                importPath: '/auth/cookie/import',
+                help: 'Paste your grok.com session cookie (the sso cookie value).' },
+            'perplexity-web': { kind: 'cookie', kindLabel: 'session cookie',
+                importPath: '/auth/cookie/import',
+                help: 'Paste your perplexity.ai session cookie value.' }
+        };
+        let oauthFlowTimer = null;
+        let oauthFlowSession = '';
+        let oauthFlowId = '';
+        function cancelOAuthFlow() {
+            if (oauthFlowTimer) { clearTimeout(oauthFlowTimer); oauthFlowTimer = null; }
+            oauthFlowSession = '';
+            oauthFlowId = '';
+        }
+        function oauthHeaders() {
+            return { 'Content-Type': 'application/json', 'X-Admin-Password': password };
+        }
+        // Render the connect modal for a provider id.
+        async function openOAuthProvider(id) {
+            const flow = OAUTH_FLOWS[id];
+            if (!flow) { alert('No connect flow for ' + id); return; }
+            cancelOAuthFlow();
+            oauthFlowId = id;
+            const modal = document.getElementById('addModal');
+            const title = document.getElementById('modalTitle');
+            const body = document.getElementById('modalBody');
+            // Friendly display name from the loaded catalog if available.
+            let name = id;
+            try {
+                const r = await fetch('/admin/api/providers/catalog', { headers: { 'X-Admin-Password': password } });
+                const d = await r.json();
+                const p = (d.providers || []).find(x => x.id === id);
+                if (p && p.name) name = p.name;
+            } catch (e) {}
+            title.textContent = 'Connect ' + name;
+            const back = '<button class="btn btn-secondary" onclick="showAddProviderModal()">' + t('common.back') + '</button>';
+            const help = flow.help ? '<p style="font-size:12px;color:var(--muted);margin-bottom:14px">' + flow.help + '</p>' : '';
+
+            if (flow.kind === 'device' || flow.kind === 'loopback') {
+                body.innerHTML = help +
+                    '<div id="oauthStep1"><div class="modal-footer">' + back +
+                    '<button class="btn btn-primary" onclick="startOAuthFlow(\'' + id + '\')">Start login</button></div></div>' +
+                    '<div id="oauthStep2" class="hidden">' +
+                    '<div id="oauthCodeBox" class="message hidden" style="background:#eff6ff;color:#1d4ed8;text-align:center"><p style="font-size:12px;margin-bottom:6px">Enter this code on the verification page:</p><p style="font-size:22px;font-weight:700;letter-spacing:2px" id="oauthUserCode"></p></div>' +
+                    '<div class="form-group" style="margin-top:12px"><label>Verification URL</label><div class="endpoint" style="margin-bottom:0"><span id="oauthAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'oauthAuthUrl\').textContent,\'_blank\')">Open</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'oauthAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div>' +
+                    '<p id="oauthStatus" style="color:#64748b;margin:16px 0;font-size:13px;text-align:center">Waiting for you to authorize in the browser…</p>' +
+                    '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelOAuthFlow();showAddProviderModal()">' + t('common.cancel') + '</button></div>' +
+                    '</div>';
+            } else if (flow.kind === 'paste') {
+                body.innerHTML = help +
+                    '<div id="oauthStep1"><div class="modal-footer">' + back +
+                    '<button class="btn btn-primary" onclick="startOAuthFlow(\'' + id + '\')">Start login</button></div></div>' +
+                    '<div id="oauthStep2" class="hidden">' +
+                    '<div class="form-group"><label>Authorization URL</label><div class="endpoint" style="margin-bottom:0"><span id="oauthAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'oauthAuthUrl\').textContent,\'_blank\')">Open</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'oauthAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div>' +
+                    '<div class="form-group" style="margin-top:12px"><label>Paste the code from the redirect</label><input type="text" id="oauthCode" placeholder="Paste the authorization code here"></div>' +
+                    '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
+                    '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelOAuthFlow();showAddProviderModal()">' + t('common.cancel') + '</button>' +
+                    '<button class="btn btn-primary" onclick="completeOAuthFlow(\'' + id + '\')">Complete</button></div>' +
+                    '</div>';
+            } else if (flow.kind === 'gitlab') {
+                body.innerHTML = help +
+                    '<div id="oauthStep1">' +
+                    '<div class="form-group"><label>GitLab instance URL <span style="font-weight:normal;color:#64748b;font-size:12px">(blank = gitlab.com)</span></label><input type="text" id="glBaseUrl" placeholder="https://gitlab.com"></div>' +
+                    '<div class="form-group"><label>OAuth App Client ID</label><input type="text" id="glClientId" placeholder="Application ID from your GitLab OAuth app"></div>' +
+                    '<div class="form-group"><label>OAuth App Client Secret <span style="font-weight:normal;color:#64748b;font-size:12px">(optional for PKCE apps)</span></label><input type="password" id="glClientSecret" placeholder="Secret"></div>' +
+                    '<div class="modal-footer">' + back + '<button class="btn btn-primary" onclick="startOAuthFlow(\'gitlab\')">Start login</button></div></div>' +
+                    '<div id="oauthStep2" class="hidden">' +
+                    '<div class="form-group"><label>Authorization URL</label><div class="endpoint" style="margin-bottom:0"><span id="oauthAuthUrl" style="font-size:11px;word-break:break-all"></span></div>' +
+                    '<div style="display:flex;gap:8px;margin-top:8px"><button class="btn btn-sm btn-secondary" style="flex:1" onclick="window.open(document.getElementById(\'oauthAuthUrl\').textContent,\'_blank\')">Open</button><button class="btn btn-sm btn-secondary" style="flex:1" onclick="navigator.clipboard.writeText(document.getElementById(\'oauthAuthUrl\').textContent);alert(\'' + t('common.copied') + '\')">' + t('common.copy') + '</button></div></div>' +
+                    '<div class="form-group" style="margin-top:12px"><label>Paste the code from the redirect</label><input type="text" id="oauthCode" placeholder="Paste the authorization code here"></div>' +
+                    '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
+                    '<div class="modal-footer"><button class="btn btn-secondary" onclick="cancelOAuthFlow();showAddProviderModal()">' + t('common.cancel') + '</button>' +
+                    '<button class="btn btn-primary" onclick="completeOAuthFlow(\'gitlab\')">Complete</button></div>' +
+                    '</div>';
+            } else if (flow.kind === 'token') {
+                const rows = (flow.fields || []).map(f =>
+                    '<div class="form-group"><label>' + f.label + '</label><input type="' + (f.type || 'text') + '" id="oauthField_' + f.id + '" placeholder="' + (f.placeholder || '') + '"></div>').join('');
+                body.innerHTML = help + rows +
+                    '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
+                    '<div class="modal-footer">' + back +
+                    '<button class="btn btn-primary" onclick="importOAuthToken(\'' + id + '\')">' + t('common.add') + '</button></div>';
+            } else if (flow.kind === 'vertex') {
+                body.innerHTML = help +
+                    '<div class="form-group"><label>Service Account JSON</label><textarea id="oauthVertexJson" rows="8" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical" placeholder=\'{ "type": "service_account", ... }\'></textarea></div>' +
+                    '<div class="form-group"><label>Region <span style="font-weight:normal;color:#64748b;font-size:12px">(default us-central1)</span></label><input type="text" id="oauthVertexRegion" placeholder="us-central1"></div>' +
+                    '<div class="form-group"><label>Name (optional)</label><input type="text" id="oauthVertexName" placeholder="Vertex AI"></div>' +
+                    '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
+                    '<div class="modal-footer">' + back +
+                    '<button class="btn btn-primary" onclick="importVertexAccount()">' + t('common.add') + '</button></div>';
+            } else if (flow.kind === 'cookie') {
+                body.innerHTML = help +
+                    '<div class="form-group"><label>Session Cookie</label><textarea id="oauthCookie" rows="4" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical" placeholder="Paste the cookie value"></textarea></div>' +
+                    '<div class="form-group"><label>Name (optional)</label><input type="text" id="oauthCookieName" placeholder="' + name + '"></div>' +
+                    '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
+                    '<div class="modal-footer">' + back +
+                    '<button class="btn btn-primary" onclick="importCookieAccount(\'' + id + '\')">' + t('common.add') + '</button></div>';
+            }
+            modal.classList.add('active');
+        }
+        // device + loopback + paste + gitlab share this start.
+        async function startOAuthFlow(id) {
+            const flow = OAUTH_FLOWS[id];
+            let body = '{}';
+            if (flow.kind === 'gitlab') {
+                const clientId = document.getElementById('glClientId').value.trim();
+                if (!clientId) { alert('Client ID is required (register an OAuth app on your GitLab instance)'); return; }
+                body = JSON.stringify({
+                    baseUrl: document.getElementById('glBaseUrl').value.trim(),
+                    clientId: clientId,
+                    clientSecret: document.getElementById('glClientSecret').value.trim()
+                });
+            }
+            let res, d;
+            try {
+                res = await fetch('/admin/api/auth/' + id + '/start', { method: 'POST', headers: oauthHeaders(), body });
+                d = await res.json();
+            } catch (e) { alert('Failed to start login'); return; }
+            if (!res.ok || d.error) { alert(d.error || 'Failed to start login'); return; }
+            oauthFlowSession = d.sessionId || '';
+            document.getElementById('oauthStep1').classList.add('hidden');
+            document.getElementById('oauthStep2').classList.remove('hidden');
+            const url = d.verificationUriComplete || d.verificationUri || d.authUrl || '';
+            document.getElementById('oauthAuthUrl').textContent = url;
+            const codeBox = document.getElementById('oauthCodeBox');
+            if (d.userCode && codeBox) {
+                codeBox.classList.remove('hidden');
+                document.getElementById('oauthUserCode').textContent = d.userCode;
+            }
+            if (url) window.open(url, '_blank');
+            // device + loopback poll; paste/gitlab wait for the user to submit a code.
+            if (flow.kind === 'device' || flow.kind === 'loopback') pollOAuthFlow(id);
+        }
+        async function pollOAuthFlow(id) {
+            if (!oauthFlowSession || oauthFlowId !== id) return;
+            try {
+                const res = await fetch('/admin/api/auth/' + id + '/poll', { method: 'POST', headers: oauthHeaders(), body: JSON.stringify({ sessionId: oauthFlowSession }) });
+                const d = await res.json();
+                if (d.status === 'completed') { cancelOAuthFlow(); closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (d.status === 'error') { const s = document.getElementById('oauthStatus'); if (s) s.textContent = 'Error: ' + (d.error || 'login failed'); return; }
+            } catch (e) { /* keep polling */ }
+            oauthFlowTimer = setTimeout(() => pollOAuthFlow(id), 2500);
+        }
+        async function completeOAuthFlow(id) {
+            const code = document.getElementById('oauthCode').value.trim();
+            if (!code) { alert('Paste the authorization code first'); return; }
+            const statusEl = document.getElementById('oauthStatus');
+            if (statusEl) statusEl.textContent = t('import.running');
+            try {
+                const res = await fetch('/admin/api/auth/' + id + '/complete', { method: 'POST', headers: oauthHeaders(), body: JSON.stringify({ sessionId: oauthFlowSession, code }) });
+                const d = await res.json();
+                if (d.status === 'completed' || d.success) { cancelOAuthFlow(); closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (statusEl) statusEl.textContent = 'Error: ' + (d.error || 'login failed');
+            } catch (e) { if (statusEl) statusEl.textContent = 'Error: request failed'; }
+        }
+        async function importOAuthToken(id) {
+            const flow = OAUTH_FLOWS[id];
+            const payload = {};
+            for (const f of (flow.fields || [])) {
+                const v = document.getElementById('oauthField_' + f.id).value.trim();
+                if (f.required && !v) { alert(f.label + ' is required'); return; }
+                if (v) payload[f.id] = v;
+            }
+            const statusEl = document.getElementById('oauthStatus');
+            if (statusEl) statusEl.textContent = t('import.running');
+            try {
+                const res = await fetch('/admin/api' + flow.importPath, { method: 'POST', headers: oauthHeaders(), body: JSON.stringify(payload) });
+                const d = await res.json();
+                if (d.success || d.id) { closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (statusEl) statusEl.textContent = 'Error: ' + (d.error || 'import failed');
+            } catch (e) { if (statusEl) statusEl.textContent = 'Error: request failed'; }
+        }
+        async function importVertexAccount() {
+            const serviceAccountJson = document.getElementById('oauthVertexJson').value.trim();
+            if (!serviceAccountJson) { alert('Paste the service-account JSON'); return; }
+            const payload = {
+                serviceAccountJson,
+                region: document.getElementById('oauthVertexRegion').value.trim(),
+                name: document.getElementById('oauthVertexName').value.trim()
+            };
+            const statusEl = document.getElementById('oauthStatus');
+            if (statusEl) statusEl.textContent = t('import.running');
+            try {
+                const res = await fetch('/admin/api/auth/vertex/import', { method: 'POST', headers: oauthHeaders(), body: JSON.stringify(payload) });
+                const d = await res.json();
+                if (d.success || d.id) { closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (statusEl) statusEl.textContent = 'Error: ' + (d.error || 'import failed');
+            } catch (e) { if (statusEl) statusEl.textContent = 'Error: request failed'; }
+        }
+        async function importCookieAccount(id) {
+            const cookie = document.getElementById('oauthCookie').value.trim();
+            if (!cookie) { alert('Paste the session cookie'); return; }
+            const payload = { backend: id, cookie, name: document.getElementById('oauthCookieName').value.trim() };
+            const statusEl = document.getElementById('oauthStatus');
+            if (statusEl) statusEl.textContent = t('import.running');
+            try {
+                const res = await fetch('/admin/api/auth/cookie/import', { method: 'POST', headers: oauthHeaders(), body: JSON.stringify(payload) });
+                const d = await res.json();
+                if (d.success || d.id) { closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (statusEl) statusEl.textContent = 'Error: ' + (d.error || 'import failed');
+            } catch (e) { if (statusEl) statusEl.textContent = 'Error: request failed'; }
         }
         function loadLocalFile(input, targetId) {
             const file = input.files[0];

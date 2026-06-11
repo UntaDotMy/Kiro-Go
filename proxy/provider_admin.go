@@ -1065,3 +1065,1313 @@ func (h *Handler) apiPollQwenLogin(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
 }
+
+// ---- CodeBuddy browser-OAuth polling login (CN + international hosts) ----
+
+type codeBuddySession struct {
+	State     string
+	AuthURL   string
+	Backend   string // "codebuddy" (CN) or "codebuddy-ai" (international)
+	Host      string // auth host base for poll/refresh
+	ExpiresAt time.Time
+}
+
+var (
+	codeBuddySessions   = map[string]*codeBuddySession{}
+	codeBuddySessionsMu sync.Mutex
+)
+
+// codeBuddyBackendHost maps a CodeBuddy backend id to its auth host + display
+// nickname. Defaults to the China gateway for an unknown/empty id so older callers
+// keep working.
+func codeBuddyBackendHost(backend string) (host, nickname string) {
+	switch backend {
+	case "codebuddy-ai":
+		return auth.CodeBuddyHostIntl, "CodeBuddy (International)"
+	default:
+		return auth.CodeBuddyHostCN, "CodeBuddy"
+	}
+}
+
+// codeBuddyBackendFromPath derives the backend id from the auth route path. The
+// international route is /auth/codebuddy-ai/*, the CN route is /auth/codebuddy/*.
+func codeBuddyBackendFromPath(path string) string {
+	if strings.Contains(path, "/codebuddy-ai/") {
+		return "codebuddy-ai"
+	}
+	return "codebuddy"
+}
+
+// apiStartCodeBuddyLogin POST /admin/api/auth/codebuddy/start (CN) and
+// /admin/api/auth/codebuddy-ai/start (international) — begins a CodeBuddy browser
+// login and returns {sessionId, verificationUri}. The dashboard opens the URL for
+// the operator to approve, then polls until completion. The backend is taken from
+// the request path so the right host is used for the whole flow.
+func (h *Handler) apiStartCodeBuddyLogin(w http.ResponseWriter, r *http.Request) {
+	backend := codeBuddyBackendFromPath(r.URL.Path)
+	host, _ := codeBuddyBackendHost(backend)
+	ca, err := auth.StartCodeBuddyAuth(r.Context(), host)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	id := auth.GenerateAccountID()
+	sess := &codeBuddySession{
+		State:     ca.State,
+		AuthURL:   ca.AuthURL,
+		Backend:   backend,
+		Host:      host,
+		ExpiresAt: time.Now().Add(300 * time.Second), // login window ~5 min
+	}
+	codeBuddySessionsMu.Lock()
+	codeBuddySessions[id] = sess
+	for sid, s := range codeBuddySessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(codeBuddySessions, sid)
+		}
+	}
+	codeBuddySessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":               id,
+		"verificationUri":         ca.AuthURL,
+		"verificationUriComplete": ca.AuthURL,
+		"interval":                5,
+	})
+}
+
+// apiPollCodeBuddyLogin POST /admin/api/auth/codebuddy{,-ai}/poll {sessionId} —
+// one poll; on success it creates the CodeBuddy account with the OAuth tokens and
+// returns its id. The host + backend are read from the session captured at start.
+func (h *Handler) apiPollCodeBuddyLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	codeBuddySessionsMu.Lock()
+	sess := codeBuddySessions[req.SessionID]
+	codeBuddySessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	host := sess.Host
+	if host == "" {
+		host = auth.CodeBuddyHostCN
+	}
+	backend := sess.Backend
+	if backend == "" {
+		backend = "codebuddy"
+	}
+	_, nickname := codeBuddyBackendHost(backend)
+
+	status, tokens, err := auth.PollCodeBuddyToken(r.Context(), host, sess.State)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+		return
+	}
+	acct := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Backend:      backend,
+		Nickname:     nickname,
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		Enabled:      true,
+	}
+	if tokens.ExpiresIn > 0 {
+		acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	codeBuddySessionsMu.Lock()
+	delete(codeBuddySessions, req.SessionID)
+	codeBuddySessionsMu.Unlock()
+	logger.Infof("[CodeBuddy] Added account %s (%s)", acct.ID, backend)
+
+	if ids, advisory, ferr := codeBuddyInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- Kimi Coding (Moonshot) OAuth device login ----
+
+type kimiCodingSession struct {
+	DeviceCode string
+	UserCode   string
+	VerifyURL  string
+	ExpiresAt  time.Time
+}
+
+var (
+	kimiCodingSessions   = map[string]*kimiCodingSession{}
+	kimiCodingSessionsMu sync.Mutex
+)
+
+// apiStartKimiCodingLogin POST /admin/api/auth/kimi-coding/start — begins a Kimi
+// Coding device login and returns {sessionId, userCode, verificationUri, ...}.
+func (h *Handler) apiStartKimiCodingLogin(w http.ResponseWriter, r *http.Request) {
+	da, err := auth.StartKimiCodingDeviceAuth(r.Context())
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	id := auth.GenerateAccountID()
+	expiresIn := da.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 300
+	}
+	sess := &kimiCodingSession{
+		DeviceCode: da.DeviceCode,
+		UserCode:   da.UserCode,
+		VerifyURL:  firstNonEmpty(da.VerificationURIComplete, da.VerificationURI),
+		ExpiresAt:  time.Now().Add(time.Duration(expiresIn) * time.Second),
+	}
+	kimiCodingSessionsMu.Lock()
+	kimiCodingSessions[id] = sess
+	for sid, s := range kimiCodingSessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(kimiCodingSessions, sid)
+		}
+	}
+	kimiCodingSessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":               id,
+		"userCode":                da.UserCode,
+		"verificationUri":         da.VerificationURI,
+		"verificationUriComplete": da.VerificationURIComplete,
+		"interval":                da.Interval,
+	})
+}
+
+// apiPollKimiCodingLogin POST /admin/api/auth/kimi-coding/poll {sessionId} — one poll.
+func (h *Handler) apiPollKimiCodingLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	kimiCodingSessionsMu.Lock()
+	sess := kimiCodingSessions[req.SessionID]
+	kimiCodingSessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	status, tokens, err := auth.PollKimiCodingToken(r.Context(), sess.DeviceCode)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+		return
+	}
+	acct := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Backend:      "kimi-coding",
+		Nickname:     "Kimi Coding",
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		Enabled:      true,
+	}
+	if tokens.ExpiresIn > 0 {
+		acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	kimiCodingSessionsMu.Lock()
+	delete(kimiCodingSessions, req.SessionID)
+	kimiCodingSessionsMu.Unlock()
+	logger.Infof("[KimiCoding] Added account %s", acct.ID)
+
+	if ids, advisory, ferr := kimiCodingInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- Kilo Code custom device-auth login ----
+
+type kilocodeSession struct {
+	Code      string
+	VerifyURL string
+	ExpiresAt time.Time
+}
+
+var (
+	kilocodeSessions   = map[string]*kilocodeSession{}
+	kilocodeSessionsMu sync.Mutex
+)
+
+// apiStartKilocodeLogin POST /admin/api/auth/kilocode/start — begins a Kilo Code
+// device login and returns {sessionId, verificationUri}.
+func (h *Handler) apiStartKilocodeLogin(w http.ResponseWriter, r *http.Request) {
+	da, err := auth.StartKilocodeDeviceAuth(r.Context())
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	id := auth.GenerateAccountID()
+	sess := &kilocodeSession{
+		Code:      da.Code,
+		VerifyURL: da.VerificationURL,
+		ExpiresAt: time.Now().Add(time.Duration(da.ExpiresIn) * time.Second),
+	}
+	kilocodeSessionsMu.Lock()
+	kilocodeSessions[id] = sess
+	for sid, s := range kilocodeSessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(kilocodeSessions, sid)
+		}
+	}
+	kilocodeSessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":               id,
+		"verificationUri":         da.VerificationURL,
+		"verificationUriComplete": da.VerificationURL,
+		"interval":                da.Interval,
+	})
+}
+
+// apiPollKilocodeLogin POST /admin/api/auth/kilocode/poll {sessionId} — one poll.
+func (h *Handler) apiPollKilocodeLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	kilocodeSessionsMu.Lock()
+	sess := kilocodeSessions[req.SessionID]
+	kilocodeSessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	status, tokens, err := auth.PollKilocodeToken(r.Context(), sess.Code)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+		return
+	}
+	acct := config.Account{
+		ID:          auth.GenerateAccountID(),
+		Backend:     "kilocode",
+		Nickname:    "Kilo Code",
+		AccessToken: tokens.AccessToken,
+		Email:       tokens.UserEmail,
+		Enabled:     true,
+	}
+	if tokens.OrgID != "" {
+		acct.ExtraHeaders = map[string]string{"X-Kilocode-OrganizationID": tokens.OrgID}
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	kilocodeSessionsMu.Lock()
+	delete(kilocodeSessions, req.SessionID)
+	kilocodeSessionsMu.Unlock()
+	logger.Infof("[Kilocode] Added account %s (org=%s)", acct.ID, tokens.OrgID)
+
+	if ids, advisory, ferr := kilocodeInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- GitHub Copilot OAuth device login ----
+
+type githubSession struct {
+	DeviceCode string
+	UserCode   string
+	VerifyURL  string
+	ExpiresAt  time.Time
+}
+
+var (
+	githubSessions   = map[string]*githubSession{}
+	githubSessionsMu sync.Mutex
+)
+
+// apiStartGitHubLogin POST /admin/api/auth/github/start — begins a GitHub Copilot
+// device login and returns {sessionId, userCode, verificationUri}.
+func (h *Handler) apiStartGitHubLogin(w http.ResponseWriter, r *http.Request) {
+	da, err := auth.StartGitHubDeviceAuth(r.Context())
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	id := auth.GenerateAccountID()
+	expiresIn := da.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 900 // GitHub device codes are valid ~15 min
+	}
+	sess := &githubSession{
+		DeviceCode: da.DeviceCode,
+		UserCode:   da.UserCode,
+		VerifyURL:  da.VerificationURI,
+		ExpiresAt:  time.Now().Add(time.Duration(expiresIn) * time.Second),
+	}
+	githubSessionsMu.Lock()
+	githubSessions[id] = sess
+	for sid, s := range githubSessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(githubSessions, sid)
+		}
+	}
+	githubSessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":               id,
+		"userCode":                da.UserCode,
+		"verificationUri":         da.VerificationURI,
+		"verificationUriComplete": da.VerificationURI,
+		"interval":                da.Interval,
+	})
+}
+
+// apiPollGitHubLogin POST /admin/api/auth/github/poll {sessionId} — one poll; on
+// success it creates the GitHub Copilot account (GitHub token in RefreshToken, minted
+// Copilot token in AccessToken) and returns its id.
+func (h *Handler) apiPollGitHubLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	githubSessionsMu.Lock()
+	sess := githubSessions[req.SessionID]
+	githubSessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	status, tokens, err := auth.PollGitHubToken(r.Context(), sess.DeviceCode)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+		return
+	}
+	nick := "GitHub Copilot"
+	if tokens.GitHubLogin != "" {
+		nick = "GitHub Copilot (" + tokens.GitHubLogin + ")"
+	}
+	acct := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Backend:      "github",
+		Nickname:     nick,
+		AccessToken:  tokens.CopilotToken, // short-lived inference bearer
+		RefreshToken: tokens.GitHubToken,  // long-lived; re-mints copilot tokens
+		ExpiresAt:    tokens.CopilotExpiresAt,
+		Enabled:      true,
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	githubSessionsMu.Lock()
+	delete(githubSessions, req.SessionID)
+	githubSessionsMu.Unlock()
+	logger.Infof("[GitHubCopilot] Added account %s (login=%s)", acct.ID, tokens.GitHubLogin)
+
+	if ids, advisory, ferr := githubInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- Claude Code (Anthropic) OAuth manual-code login ----
+
+type claudeSession struct {
+	State        string
+	CodeVerifier string
+	ExpiresAt    time.Time
+}
+
+var (
+	claudeSessions   = map[string]*claudeSession{}
+	claudeSessionsMu sync.Mutex
+)
+
+// apiStartClaudeLogin POST /admin/api/auth/claude/start — returns {sessionId,
+// authUrl}. The operator opens authUrl, approves, copies the code#state string the
+// Anthropic console shows, and submits it to /auth/claude/complete.
+func (h *Handler) apiStartClaudeLogin(w http.ResponseWriter, r *http.Request) {
+	st, err := auth.StartClaudeLogin()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	id := auth.GenerateAccountID()
+	claudeSessionsMu.Lock()
+	claudeSessions[id] = &claudeSession{
+		State:        st.State,
+		CodeVerifier: st.CodeVerifier,
+		ExpiresAt:    time.Now().Add(10 * time.Minute),
+	}
+	for sid, s := range claudeSessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(claudeSessions, sid)
+		}
+	}
+	claudeSessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": id,
+		"authUrl":   st.AuthURL,
+	})
+}
+
+// apiCompleteClaudeLogin POST /admin/api/auth/claude/complete {sessionId, code} —
+// exchanges the pasted code for tokens and creates the Claude Code account.
+func (h *Handler) apiCompleteClaudeLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+		Code      string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "missing code"})
+		return
+	}
+	claudeSessionsMu.Lock()
+	sess := claudeSessions[req.SessionID]
+	claudeSessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	tokens, err := auth.ExchangeClaudeCode(r.Context(), req.Code, sess.CodeVerifier, sess.State)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	acct := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Backend:      "claude-code",
+		Nickname:     "Claude Code",
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		Enabled:      true,
+	}
+	if tokens.ExpiresIn > 0 {
+		acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	claudeSessionsMu.Lock()
+	delete(claudeSessions, req.SessionID)
+	claudeSessionsMu.Unlock()
+	logger.Infof("[ClaudeCode] Added account %s", acct.ID)
+
+	if ids, advisory, ferr := claudeInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- xAI (Grok) OAuth loopback login ----
+
+// apiStartXaiLogin POST /admin/api/auth/xai/start — begins the xAI browser OAuth
+// flow (loopback callback) and returns {sessionId, authUrl}.
+func (h *Handler) apiStartXaiLogin(w http.ResponseWriter, r *http.Request) {
+	sess, err := auth.StartXaiLogin()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": sess.ID,
+		"authUrl":   sess.AuthURL,
+	})
+}
+
+// apiPollXaiLogin POST /admin/api/auth/xai/poll {sessionId} — returns status; on
+// "completed" it creates the xAI account and returns its id.
+func (h *Handler) apiPollXaiLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	status, tokens, errMsg, found := auth.PollXaiLogin(req.SessionID)
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	switch status {
+	case "pending":
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+	case "error":
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": errMsg})
+	case "completed":
+		nick := firstNonEmpty(tokens.Email, "xAI (Grok)")
+		acct := config.Account{
+			ID:           auth.GenerateAccountID(),
+			Backend:      "xai",
+			Email:        tokens.Email,
+			Nickname:     nick,
+			AccessToken:  tokens.AccessToken,
+			RefreshToken: tokens.RefreshToken,
+			Enabled:      true,
+		}
+		if tokens.ExpiresIn > 0 {
+			acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+		}
+		if err := config.AddAccount(acct); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
+		logger.Infof("[xAI] Added account %s", acct.ID)
+		if ids, advisory, ferr := xaiInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+			if advisory {
+				h.pool.SetAdvisoryModelList(acct.ID, ids)
+			} else {
+				h.pool.SetModelList(acct.ID, ids)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+	default:
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	}
+}
+
+// ---- Cline OAuth manual-code login ----
+
+type clineSession struct {
+	ExpiresAt time.Time
+}
+
+var (
+	clineSessions   = map[string]*clineSession{}
+	clineSessionsMu sync.Mutex
+)
+
+// apiStartClineLogin POST /admin/api/auth/cline/start — returns {sessionId, authUrl}.
+// The operator opens authUrl, approves, copies the returned code, and submits it to
+// /auth/cline/complete. Cline carries no PKCE/state, so the session is just a TTL guard.
+func (h *Handler) apiStartClineLogin(w http.ResponseWriter, r *http.Request) {
+	id := auth.GenerateAccountID()
+	clineSessionsMu.Lock()
+	clineSessions[id] = &clineSession{ExpiresAt: time.Now().Add(10 * time.Minute)}
+	for sid, s := range clineSessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(clineSessions, sid)
+		}
+	}
+	clineSessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": id,
+		"authUrl":   auth.BuildClineAuthURL(),
+	})
+}
+
+// apiCompleteClineLogin POST /admin/api/auth/cline/complete {sessionId, code}.
+func (h *Handler) apiCompleteClineLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+		Code      string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "missing code"})
+		return
+	}
+	clineSessionsMu.Lock()
+	sess := clineSessions[req.SessionID]
+	clineSessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	tokens, err := auth.ExchangeClineCode(r.Context(), req.Code)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	acct := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Backend:      "cline",
+		Nickname:     firstNonEmpty(tokens.Email, "Cline"),
+		Email:        tokens.Email,
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		Enabled:      true,
+	}
+	if tokens.ExpiresIn > 0 {
+		acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	clineSessionsMu.Lock()
+	delete(clineSessions, req.SessionID)
+	clineSessionsMu.Unlock()
+	logger.Infof("[Cline] Added account %s", acct.ID)
+
+	if ids, advisory, ferr := clineInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- iFlow OAuth loopback login ----
+
+// apiStartIFlowLogin POST /admin/api/auth/iflow/start — begins the iFlow browser
+// OAuth flow (loopback callback) and returns {sessionId, authUrl}.
+func (h *Handler) apiStartIFlowLogin(w http.ResponseWriter, r *http.Request) {
+	sess, err := auth.StartIFlowLogin()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": sess.ID,
+		"authUrl":   sess.AuthURL,
+	})
+}
+
+// apiPollIFlowLogin POST /admin/api/auth/iflow/poll {sessionId} — returns status;
+// on "completed" it creates the iFlow account (apiKey as the inference credential).
+func (h *Handler) apiPollIFlowLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	status, tokens, errMsg, found := auth.PollIFlowLogin(req.SessionID)
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	switch status {
+	case "pending":
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+	case "error":
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": errMsg})
+	case "completed":
+		acct := config.Account{
+			ID:       auth.GenerateAccountID(),
+			Backend:  "iflow",
+			Nickname: firstNonEmpty(tokens.Email, "iFlow"),
+			Email:    tokens.Email,
+			// iFlow inference authenticates with the resolved apiKey (Bearer), so it
+			// lives in APIKey; the OAuth tokens are kept for a future re-auth.
+			APIKey:       tokens.APIKey,
+			AccessToken:  tokens.AccessToken,
+			RefreshToken: tokens.RefreshToken,
+			Enabled:      true,
+		}
+		if err := config.AddAccount(acct); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
+		logger.Infof("[iFlow] Added account %s", acct.ID)
+		if ids, advisory, ferr := genericOpenAIInference().FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+			if advisory {
+				h.pool.SetAdvisoryModelList(acct.ID, ids)
+			} else {
+				h.pool.SetModelList(acct.ID, ids)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+	default:
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	}
+}
+
+// ---- GitLab Duo OAuth manual-code login (self-hostable: operator supplies
+// baseUrl + clientId + optional clientSecret of the OAuth app on their instance) ----
+
+type gitlabSession struct {
+	BaseURL      string
+	ClientID     string
+	ClientSecret string
+	State        string
+	CodeVerifier string
+	ExpiresAt    time.Time
+}
+
+var (
+	gitlabSessions   = map[string]*gitlabSession{}
+	gitlabSessionsMu sync.Mutex
+)
+
+// apiStartGitLabLogin POST /admin/api/auth/gitlab/start {baseUrl?, clientId,
+// clientSecret?} — returns {sessionId, authUrl}.
+func (h *Handler) apiStartGitLabLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BaseURL      string `json:"baseUrl"`
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.ClientID) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "clientId is required (register an OAuth app on your GitLab instance)"})
+		return
+	}
+	st, err := auth.StartGitLabLogin(req.BaseURL, req.ClientID)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	id := auth.GenerateAccountID()
+	gitlabSessionsMu.Lock()
+	gitlabSessions[id] = &gitlabSession{
+		BaseURL:      req.BaseURL,
+		ClientID:     req.ClientID,
+		ClientSecret: req.ClientSecret,
+		State:        st.State,
+		CodeVerifier: st.CodeVerifier,
+		ExpiresAt:    time.Now().Add(10 * time.Minute),
+	}
+	for sid, s := range gitlabSessions {
+		if time.Now().After(s.ExpiresAt) {
+			delete(gitlabSessions, sid)
+		}
+	}
+	gitlabSessionsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": id,
+		"authUrl":   st.AuthURL,
+	})
+}
+
+// apiCompleteGitLabLogin POST /admin/api/auth/gitlab/complete {sessionId, code} —
+// exchanges the pasted code and creates the GitLab Duo account. The instance
+// inference URL + OAuth app creds are persisted so token refresh works later.
+func (h *Handler) apiCompleteGitLabLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+		Code      string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "missing code"})
+		return
+	}
+	gitlabSessionsMu.Lock()
+	sess := gitlabSessions[req.SessionID]
+	gitlabSessionsMu.Unlock()
+	if sess == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	if time.Now().After(sess.ExpiresAt) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "login expired"})
+		return
+	}
+
+	tokens, err := auth.ExchangeGitLabCode(r.Context(), sess.BaseURL, sess.ClientID, sess.ClientSecret, req.Code, sess.CodeVerifier)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	// Resolve the instance inference URL (default gitlab.com).
+	base := strings.TrimRight(strings.TrimSpace(sess.BaseURL), "/")
+	if base == "" {
+		base = "https://gitlab.com"
+	} else if !strings.HasPrefix(strings.ToLower(base), "http") {
+		base = "https://" + base
+	}
+	inferenceURL := base + "/api/v4/chat/completions"
+
+	acct := config.Account{
+		ID:              auth.GenerateAccountID(),
+		Backend:         "gitlab",
+		Nickname:        firstNonEmpty(tokens.Username, "GitLab Duo"),
+		AccessToken:     tokens.AccessToken,
+		RefreshToken:    tokens.RefreshToken,
+		ClientID:        sess.ClientID,
+		ClientSecret:    sess.ClientSecret,
+		BaseURLOverride: inferenceURL,
+		Enabled:         true,
+	}
+	if tokens.ExpiresIn > 0 {
+		acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	gitlabSessionsMu.Lock()
+	delete(gitlabSessions, req.SessionID)
+	gitlabSessionsMu.Unlock()
+	logger.Infof("[GitLab] Added account %s (user=%s)", acct.ID, tokens.Username)
+
+	if ids, advisory, ferr := gitlabInference.FetchModelsForAccount(r.Context(), &acct); ferr == nil && len(ids) > 0 {
+		if advisory {
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		} else {
+			h.pool.SetModelList(acct.ID, ids)
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+}
+
+// ---- Gemini CLI (Cloud Code Assist) OAuth loopback login ----
+
+// apiStartGeminiCLILogin POST /admin/api/auth/gemini-cli/start — begins the Google
+// OAuth flow (loopback callback) and returns {sessionId, authUrl}.
+func (h *Handler) apiStartGeminiCLILogin(w http.ResponseWriter, r *http.Request) {
+	sess, err := auth.StartGeminiCLILogin()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": sess.ID,
+		"authUrl":   sess.AuthURL,
+	})
+}
+
+// apiPollGeminiCLILogin POST /admin/api/auth/gemini-cli/poll {sessionId} — returns
+// status; on "completed" creates the account (project id stored in ExtraHeaders).
+func (h *Handler) apiPollGeminiCLILogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	status, tokens, errMsg, found := auth.PollGeminiCLILogin(req.SessionID)
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	switch status {
+	case "pending":
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+	case "error":
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": errMsg})
+	case "completed":
+		acct := config.Account{
+			ID:           auth.GenerateAccountID(),
+			Backend:      "gemini-cli",
+			Nickname:     firstNonEmpty(tokens.Email, "Gemini CLI"),
+			Email:        tokens.Email,
+			AccessToken:  tokens.AccessToken,
+			RefreshToken: tokens.RefreshToken,
+			Enabled:      true,
+		}
+		if tokens.ProjectID != "" {
+			acct.ExtraHeaders = map[string]string{"x-goog-project": tokens.ProjectID}
+		}
+		if tokens.ExpiresIn > 0 {
+			acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+		}
+		if err := config.AddAccount(acct); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
+		logger.Infof("[GeminiCLI] Added account %s (project=%s)", acct.ID, tokens.ProjectID)
+		if p := ProviderForBackend("gemini-cli"); p != nil {
+			if models, merr := p.ListModels(&acct); merr == nil && len(models) > 0 {
+				ids := make([]string, 0, len(models))
+				for _, m := range models {
+					ids = append(ids, m.ModelId)
+				}
+				h.pool.SetAdvisoryModelList(acct.ID, ids)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+	default:
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	}
+}
+
+// ---- Antigravity (Cloud Code Assist) OAuth loopback login ----
+
+// apiStartAntigravityLogin POST /admin/api/auth/antigravity/start.
+func (h *Handler) apiStartAntigravityLogin(w http.ResponseWriter, r *http.Request) {
+	sess, err := auth.StartAntigravityLogin()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": sess.ID,
+		"authUrl":   sess.AuthURL,
+	})
+}
+
+// apiPollAntigravityLogin POST /admin/api/auth/antigravity/poll {sessionId}.
+func (h *Handler) apiPollAntigravityLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	status, tokens, errMsg, found := auth.PollAntigravityLogin(req.SessionID)
+	if !found {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "session not found or expired"})
+		return
+	}
+	switch status {
+	case "pending":
+		json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+	case "error":
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": errMsg})
+	case "completed":
+		acct := config.Account{
+			ID:           auth.GenerateAccountID(),
+			Backend:      "antigravity",
+			Nickname:     firstNonEmpty(tokens.Email, "Antigravity"),
+			Email:        tokens.Email,
+			AccessToken:  tokens.AccessToken,
+			RefreshToken: tokens.RefreshToken,
+			Enabled:      true,
+		}
+		if tokens.ProjectID != "" {
+			acct.ExtraHeaders = map[string]string{"x-goog-project": tokens.ProjectID}
+		}
+		if tokens.ExpiresIn > 0 {
+			acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
+		}
+		if err := config.AddAccount(acct); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
+		logger.Infof("[Antigravity] Added account %s (project=%s)", acct.ID, tokens.ProjectID)
+		if p := ProviderForBackend("antigravity"); p != nil {
+			if models, merr := p.ListModels(&acct); merr == nil && len(models) > 0 {
+				ids := make([]string, 0, len(models))
+				for _, m := range models {
+					ids = append(ids, m.ModelId)
+				}
+				h.pool.SetAdvisoryModelList(acct.ID, ids)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "completed", "id": acct.ID})
+	default:
+		json.NewEncoder(w).Encode(map[string]string{"status": status})
+	}
+}
+
+// ---- Vertex AI Service-Account import (no browser flow) ----
+
+// apiImportVertexServiceAccount POST /admin/api/auth/vertex/import
+// {serviceAccountJson, region?, name?} — validates the SA JSON, mints a first
+// access token to confirm it works, and creates the Vertex account (SA JSON in
+// APIKey, region in Region).
+func (h *Handler) apiImportVertexServiceAccount(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ServiceAccountJSON string `json:"serviceAccountJson"`
+		Region             string `json:"region"`
+		Name               string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	sa, err := auth.ParseVertexServiceAccount(strings.TrimSpace(req.ServiceAccountJSON))
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	// Confirm the SA can actually mint a token before persisting.
+	tok, expiresAt, err := auth.VertexAccessToken(r.Context(), req.ServiceAccountJSON)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "service account validation failed: " + err.Error()})
+		return
+	}
+	region := strings.TrimSpace(req.Region)
+	if region == "" {
+		region = "us-central1"
+	}
+	acct := config.Account{
+		ID:          auth.GenerateAccountID(),
+		Backend:     "vertex",
+		Nickname:    firstNonEmpty(req.Name, "Vertex AI ("+sa.ProjectID+")"),
+		Email:       sa.ClientEmail,
+		APIKey:      strings.TrimSpace(req.ServiceAccountJSON), // durable SA credential
+		AccessToken: tok,
+		ExpiresAt:   expiresAt.Unix(),
+		Region:      region,
+		Enabled:     true,
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	logger.Infof("[Vertex] Added account %s (project=%s region=%s)", acct.ID, sa.ProjectID, region)
+	if p := ProviderForBackend("vertex"); p != nil {
+		if models, merr := p.ListModels(&acct); merr == nil && len(models) > 0 {
+			ids := make([]string, 0, len(models))
+			for _, m := range models {
+				ids = append(ids, m.ModelId)
+			}
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": acct.ID})
+}
+
+// ---- Cursor IDE token import (token + machine id pasted from the IDE) ----
+
+// apiImportCursorToken POST /admin/api/auth/cursor/import {accessToken, machineId, name?}
+// — adds a Cursor account from the token + machine id imported from the Cursor IDE's
+// state.vscdb (cursorAuth/accessToken + storage.serviceMachineId).
+func (h *Handler) apiImportCursorToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccessToken string `json:"accessToken"`
+		MachineID   string `json:"machineId"`
+		Name        string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.AccessToken) == "" || strings.TrimSpace(req.MachineID) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "accessToken and machineId are both required (import them from the Cursor IDE)"})
+		return
+	}
+	acct := config.Account{
+		ID:          auth.GenerateAccountID(),
+		Backend:     "cursor",
+		Nickname:    firstNonEmpty(req.Name, "Cursor IDE"),
+		AccessToken: strings.TrimSpace(req.AccessToken),
+		MachineId:   strings.TrimSpace(req.MachineID),
+		Enabled:     true,
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	logger.Infof("[Cursor] Added account %s", acct.ID)
+	if p := ProviderForBackend("cursor"); p != nil {
+		if models, merr := p.ListModels(&acct); merr == nil && len(models) > 0 {
+			ids := make([]string, 0, len(models))
+			for _, m := range models {
+				ids = append(ids, m.ModelId)
+			}
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": acct.ID})
+}
+
+// apiImportCookieProvider POST /admin/api/auth/cookie/import {backend, cookie, name?}
+// — adds a cookie-authenticated web-subscription account (grok-web or
+// perplexity-web). The cookie value is stored in APIKey; the bespoke provider sends
+// it as the appropriate Cookie header.
+func (h *Handler) apiImportCookieProvider(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Backend string `json:"backend"`
+		Cookie  string `json:"cookie"`
+		Name    string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	backend := strings.ToLower(strings.TrimSpace(req.Backend))
+	if backend != "grok-web" && backend != "perplexity-web" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "backend must be grok-web or perplexity-web"})
+		return
+	}
+	if strings.TrimSpace(req.Cookie) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "cookie value is required"})
+		return
+	}
+	bp, _ := resolveBuiltinProvider(backend)
+	acct := config.Account{
+		ID:       auth.GenerateAccountID(),
+		Backend:  backend,
+		Nickname: firstNonEmpty(req.Name, bp.Name),
+		APIKey:   strings.TrimSpace(req.Cookie),
+		Enabled:  true,
+	}
+	if err := config.AddAccount(acct); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	h.pool.Reload()
+	logger.Infof("[%s] Added cookie account %s", backend, acct.ID)
+	if p := ProviderForBackend(backend); p != nil {
+		if models, merr := p.ListModels(&acct); merr == nil && len(models) > 0 {
+			ids := make([]string, 0, len(models))
+			for _, m := range models {
+				ids = append(ids, m.ModelId)
+			}
+			h.pool.SetAdvisoryModelList(acct.ID, ids)
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": acct.ID})
+}
