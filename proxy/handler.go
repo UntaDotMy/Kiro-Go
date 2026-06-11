@@ -2076,6 +2076,18 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	activeBlockType := ""
 	startInputTokens := estimatedInputTokens
 
+	// Cross-backend cache rule: the local promptCache estimator is authoritative
+	// ONLY for Kiro (whose upstream reports no cache split). For any non-Kiro
+	// backend we must NOT emit the estimate — we pass through the provider's REAL
+	// reported cache (captured below via OnCacheUsage) or emit nothing.
+	isKiro := config.GetAccountBackend(account) == "kiro"
+	var realCacheRead, realCacheCreation int
+	// Provider-native web-search citations (e.g. Gemini grounding). Captured here
+	// and spliced as server_tool_use + web_search_tool_result blocks after the
+	// text answer, so a Claude client renders citation chips for the native path.
+	var nativeSearchResults []WebSearchResult
+	var nativeSearchQuery string
+
 	// committed flips to true the moment we write the first byte to the
 	// client (message_start). Before that, the dispatcher may fail over.
 	committed := false
@@ -2113,7 +2125,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				"model":         canonicalAnthropicModelID(model),
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
+				// Kiro: preliminary estimate. Non-Kiro: no cache yet (real upstream
+				// cache, if any, is known only at stream end → final message_delta).
+				"usage": buildClaudeUsageMap(startInputTokens, 0, cacheUsage, isKiro && cacheProfile != nil),
 			},
 		})
 		committed = true
@@ -2341,6 +2355,14 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
 		},
+		OnCacheUsage: func(read, creation int) {
+			realCacheRead = read
+			realCacheCreation = creation
+		},
+		OnWebSearchResults: func(query string, results []WebSearchResult) {
+			nativeSearchQuery = query
+			nativeSearchResults = results
+		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
 
@@ -2419,15 +2441,44 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	}
 	h.promptCache.Update(account.ID, cacheProfile)
 
+	// Splice provider-native web-search citations (e.g. Gemini grounding) as
+	// server_tool_use + web_search_tool_result content blocks after the text
+	// answer, so a Claude client renders citation chips. Only the native path
+	// (no Kiro emulation loop) populates nativeSearchResults.
+	if len(nativeSearchResults) > 0 {
+		toolUseID := "srvtoolu_" + uuid.New().String()
+		if len(nativeSearchResults) > maxWebSearchResults {
+			nativeSearchResults = nativeSearchResults[:maxWebSearchResults]
+		}
+		for _, blk := range buildWebSearchResultBlocks(toolUseID, nativeSearchQuery, nativeSearchResults) {
+			idx := nextContentIndex
+			nextContentIndex++
+			emit("content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": blk,
+			})
+			emit("content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
+	}
+
 	// 发送 message_delta
 	stopReason := resolveAnthropicStopReason(upstreamStopReason, len(toolUses) > 0)
+
+	// Backend-aware cache: Kiro uses the local estimate; non-Kiro passes through
+	// the provider's REAL reported cache (or emits none). Never a Kiro estimate
+	// on a non-Kiro response.
+	respCacheUsage, includeRespCache := resolveResponseCache(isKiro, cacheUsage, cacheProfile != nil, realCacheRead, realCacheCreation)
 
 	emit("message_delta", map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
 			"stop_reason": stopReason,
 		},
-		"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+		"usage": buildClaudeUsageMap(inputTokens, outputTokens, respCacheUsage, includeRespCache),
 	})
 
 	emit("message_stop", map[string]interface{}{
@@ -2644,6 +2695,15 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	var realInputTokens int
 	var upstreamStopReason string
 
+	// Backend-aware cache (see handleClaudeStream): estimate only for Kiro; for
+	// non-Kiro, pass through the provider's REAL reported cache or none.
+	isKiro := config.GetAccountBackend(account) == "kiro"
+	var realCacheRead, realCacheCreation int
+	// Provider-native web-search citations (e.g. Gemini grounding), spliced into
+	// the response content so a Claude client renders citation chips.
+	var nativeSearchResults []WebSearchResult
+	var nativeSearchQuery string
+
 	callback := &KiroStreamCallback{
 		OnText: func(text string, isThinking bool) {
 			if isThinking {
@@ -2664,6 +2724,14 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		},
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+		},
+		OnCacheUsage: func(read, creation int) {
+			realCacheRead = read
+			realCacheCreation = creation
+		},
+		OnWebSearchResults: func(query string, results []WebSearchResult) {
+			nativeSearchQuery = query
+			nativeSearchResults = results
 		},
 		OnStopReason: func(r string) { upstreamStopReason = r },
 	}
@@ -2729,16 +2797,27 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	}
 
 	resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
-	if cacheProfile != nil {
-		cacheUsage = reconcileCacheUsage(inputTokens, cacheUsage)
+	// Splice provider-native web-search citations (e.g. Gemini grounding) as
+	// server_tool_use + web_search_tool_result blocks so a Claude client renders
+	// citation chips. Only the native path populates nativeSearchResults.
+	if len(nativeSearchResults) > 0 {
+		toolUseID := "srvtoolu_" + uuid.New().String()
+		resp.Content = spliceNativeCitationBlocks(resp.Content, toolUseID, nativeSearchQuery, nativeSearchResults)
 	}
-	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
-	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
-	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-	if cacheProfile != nil {
+	// Backend-aware cache: Kiro uses the local estimate (reconciled to the real
+	// input total); non-Kiro passes through the provider's REAL reported cache or
+	// emits none. Never a Kiro estimate on a non-Kiro response.
+	respCacheUsage, includeRespCache := resolveResponseCache(isKiro, cacheUsage, cacheProfile != nil, realCacheRead, realCacheCreation)
+	if includeRespCache {
+		respCacheUsage = reconcileCacheUsage(inputTokens, respCacheUsage)
+	}
+	resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, respCacheUsage)
+	resp.Usage.CacheCreationInputTokens = respCacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = respCacheUsage.CacheReadInputTokens
+	if includeRespCache && (respCacheUsage.CacheCreation5mInputTokens > 0 || respCacheUsage.CacheCreation1hInputTokens > 0) {
 		resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
-			Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
-			Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+			Ephemeral5mInputTokens: respCacheUsage.CacheCreation5mInputTokens,
+			Ephemeral1hInputTokens: respCacheUsage.CacheCreation1hInputTokens,
 		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

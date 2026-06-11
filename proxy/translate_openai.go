@@ -305,6 +305,14 @@ type openAIStreamChunk struct {
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		// Real upstream prompt-cache hit count. OpenAI / DashScope-compatible
+		// report it under prompt_tokens_details.cached_tokens; DeepSeek uses the
+		// flat prompt_cache_hit_tokens. Either is the genuine cached prefix — we
+		// pass it through verbatim (never a local estimate) via OnCacheUsage.
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 	} `json:"usage"`
 }
 
@@ -389,6 +397,21 @@ func parseOpenAISSE(r io.Reader, cb *KiroStreamCallback) error {
 		}
 		if chunk.Usage != nil && cb.OnComplete != nil {
 			cb.OnComplete(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
+		}
+		if chunk.Usage != nil && cb.OnCacheUsage != nil {
+			// Pass through the REAL upstream cached-prefix count (never estimated).
+			// prompt_tokens_details.cached_tokens is the OpenAI/DashScope-compatible
+			// field; prompt_cache_hit_tokens is DeepSeek's flat equivalent.
+			cached := 0
+			if d := chunk.Usage.PromptTokensDetails; d != nil {
+				cached = d.CachedTokens
+			}
+			if cached == 0 && chunk.Usage.PromptCacheHitTokens > 0 {
+				cached = chunk.Usage.PromptCacheHitTokens
+			}
+			if cached > 0 {
+				cb.OnCacheUsage(cached, 0) // read-only providers report no cache-creation
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {

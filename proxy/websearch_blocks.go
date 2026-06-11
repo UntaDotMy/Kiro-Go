@@ -117,6 +117,65 @@ func buildWebSearchResultBlocks(toolUseID, query string, results []WebSearchResu
 	return []map[string]interface{}{serverToolUse, toolResult}
 }
 
+// buildClaudeWebSearchContentBlocks renders native web-search results as TYPED
+// ClaudeContentBlocks (the server_tool_use + web_search_tool_result pair), for
+// the non-streaming response path where the body is built from typed blocks
+// rather than raw maps. Mirrors buildWebSearchResultBlocks.
+func buildClaudeWebSearchContentBlocks(toolUseID, query string, results []WebSearchResult) []ClaudeContentBlock {
+	resultItems := make([]map[string]interface{}, 0, len(results))
+	for _, r := range results {
+		item := map[string]interface{}{
+			"type":  "web_search_result",
+			"title": r.Title,
+			"url":   r.URL,
+		}
+		if r.PublishedDate != "" {
+			item["page_age"] = r.PublishedDate
+		}
+		resultItems = append(resultItems, item)
+	}
+	return []ClaudeContentBlock{
+		{
+			Type:  "server_tool_use",
+			ID:    toolUseID,
+			Name:  webSearchToolName,
+			Input: map[string]interface{}{"query": query},
+		},
+		{
+			Type:      "web_search_tool_result",
+			ToolUseID: toolUseID,
+			Content:   resultItems,
+		},
+	}
+}
+
+// spliceNativeCitationBlocks inserts the native web-search citation pair
+// (server_tool_use + web_search_tool_result) into a response's content blocks
+// just BEFORE the first text block, matching Anthropic's ordering (the search
+// blocks precede the cited text answer). If there is no text block, the
+// citation blocks are appended. thinking blocks always stay first.
+func spliceNativeCitationBlocks(blocks []ClaudeContentBlock, toolUseID, query string, results []WebSearchResult) []ClaudeContentBlock {
+	if len(results) == 0 {
+		return blocks
+	}
+	if len(results) > maxWebSearchResults {
+		results = results[:maxWebSearchResults]
+	}
+	citations := buildClaudeWebSearchContentBlocks(toolUseID, query, results)
+	insertAt := len(blocks)
+	for i, b := range blocks {
+		if b.Type == "text" {
+			insertAt = i
+			break
+		}
+	}
+	out := make([]ClaudeContentBlock, 0, len(blocks)+len(citations))
+	out = append(out, blocks[:insertAt]...)
+	out = append(out, citations...)
+	out = append(out, blocks[insertAt:]...)
+	return out
+}
+
 // formatWebSearchForModel renders results as compact text to feed BACK to the
 // model as a tool_result, so the model can ground its answer on them. This is
 // the agentic-loop payload (model → web_search → results → model continues).

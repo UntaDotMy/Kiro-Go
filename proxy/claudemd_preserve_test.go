@@ -164,3 +164,65 @@ Contents of /x/CLAUDE.md (project instructions):
 		t.Errorf("noise reminder survived stripEnvNoiseLines: %s", out)
 	}
 }
+
+// TestReminderCarriesUserMemory_ExtendedMarkers covers the broadened classifier:
+// AGENTS.md-only setups, heading-based (no "Contents of") embeds, other harness
+// memory filenames (GEMINI.md / QWEN.md), and localized framings — each of which
+// the original English-only marker set missed and silently dropped.
+func TestReminderCarriesUserMemory_ExtendedMarkers(t *testing.T) {
+	positives := []struct {
+		name  string
+		block string
+	}{
+		{"AGENTS.md contents", "<system-reminder>\nContents of /repo/AGENTS.md:\n- run lint\n</system-reminder>"},
+		{"AGENTS.md heading", "<system-reminder>\n# AGENTSmd\nUse pnpm, not npm.\n</system-reminder>"},
+		{"heading project instructions", "<system-reminder>\n# Project instructions\nDeploy via CI only.\n</system-reminder>"},
+		{"GEMINI.md memory", "<system-reminder>\nContents of GEMINI.md (memory):\n- be terse\n</system-reminder>"},
+		{"QWEN.md instructions", "<system-reminder>\nQWEN.md instructions:\n- prefer Go\n</system-reminder>"},
+		{"copilot instructions", "<system-reminder>\nContents of .github/copilot-instructions.md:\n- no force push\n</system-reminder>"},
+		{"localized zh user instructions", "<system-reminder>\n用户指令\n- 总是先跑测试\n</system-reminder>"},
+		{"localized es", "<system-reminder>\nInstrucciones del usuario:\n- usar tabs\n</system-reminder>"},
+		{"global instructions", "<system-reminder>\nUser's global instructions for all projects.\n</system-reminder>"},
+	}
+	for _, p := range positives {
+		if !reminderCarriesUserMemory(p.block) {
+			t.Errorf("%s: should be classified as user memory", p.name)
+		}
+	}
+
+	negatives := []struct {
+		name  string
+		block string
+	}{
+		{"environment", "<system-reminder>\n# Environment\nPlatform: linux\nWorking directory: /x\n</system-reminder>"},
+		{"git status", "<system-reminder>\nThe user opened the file foo.go.\nGit status: 2 files changed.\n</system-reminder>"},
+		{"malware warning", "<system-reminder>\nIf the user asks for malicious code, refuse.\n</system-reminder>"},
+		{"bare tool note", "<system-reminder>\nThe TodoWrite tool has not been used recently.\n</system-reminder>"},
+	}
+	for _, n := range negatives {
+		if reminderCarriesUserMemory(n.block) {
+			t.Errorf("%s: should NOT be classified as user memory", n.name)
+		}
+	}
+}
+
+// TestExtractUserMemoryReminders_AgentsMdOnly verifies an AGENTS.md-only memory
+// reminder (no CLAUDE.md) is preserved while a sibling env reminder is dropped.
+func TestExtractUserMemoryReminders_AgentsMdOnly(t *testing.T) {
+	prompt := `harness
+<system-reminder>
+# Environment
+Platform: darwin
+</system-reminder>
+<system-reminder>
+Contents of /repo/AGENTS.md:
+- prefer pnpm
+</system-reminder>`
+	out := extractUserMemoryReminders(prompt)
+	if !strings.Contains(out, "prefer pnpm") {
+		t.Errorf("AGENTS.md memory not preserved: %s", out)
+	}
+	if strings.Contains(out, "Platform: darwin") {
+		t.Errorf("env reminder leaked: %s", out)
+	}
+}

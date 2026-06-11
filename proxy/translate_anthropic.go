@@ -181,7 +181,7 @@ func parseAnthropicSSE(r io.Reader, cb *KiroStreamCallback) error {
 		jsonBuf  strings.Builder
 	}
 	blocks := map[int]*blockState{}
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheRead, cacheCreation int
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -201,6 +201,14 @@ func parseAnthropicSSE(r io.Reader, cb *KiroStreamCallback) error {
 			if msg, ok := ev["message"].(map[string]interface{}); ok {
 				if usage, ok := msg["usage"].(map[string]interface{}); ok {
 					inputTokens = intFromAny(usage["input_tokens"])
+					// Real upstream prompt-cache counts (Anthropic-compatible hosts).
+					// Passed through verbatim — never a local estimate.
+					if v := intFromAny(usage["cache_read_input_tokens"]); v > 0 {
+						cacheRead = v
+					}
+					if v := intFromAny(usage["cache_creation_input_tokens"]); v > 0 {
+						cacheCreation = v
+					}
 				}
 			}
 		case "content_block_start":
@@ -259,6 +267,14 @@ func parseAnthropicSSE(r io.Reader, cb *KiroStreamCallback) error {
 			}
 			if usage, ok := ev["usage"].(map[string]interface{}); ok {
 				outputTokens = intFromAny(usage["output_tokens"])
+				// Anthropic also re-reports cache counts on message_delta usage on
+				// some hosts; keep the latest non-zero values.
+				if v := intFromAny(usage["cache_read_input_tokens"]); v > 0 {
+					cacheRead = v
+				}
+				if v := intFromAny(usage["cache_creation_input_tokens"]); v > 0 {
+					cacheCreation = v
+				}
 			}
 		case "message_stop":
 			// terminal
@@ -269,6 +285,10 @@ func parseAnthropicSSE(r io.Reader, cb *KiroStreamCallback) error {
 	}
 	if cb.OnComplete != nil && (inputTokens > 0 || outputTokens > 0) {
 		cb.OnComplete(inputTokens, outputTokens)
+	}
+	// Pass through real upstream cache counts when the host reported any.
+	if (cacheRead > 0 || cacheCreation > 0) && cb.OnCacheUsage != nil {
+		cb.OnCacheUsage(cacheRead, cacheCreation)
 	}
 	return nil
 }

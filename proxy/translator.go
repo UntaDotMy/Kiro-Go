@@ -537,14 +537,35 @@ func applySystemPromptFilters(prompt string) string {
 // the model keeps honoring CLAUDE.md.
 func reminderCarriesUserMemory(block string) bool {
 	lower := strings.ToLower(block)
-	// Strong, unambiguous markers Claude Code uses when embedding memory files.
+	// Strong, unambiguous markers Claude Code / other harnesses use when embedding
+	// memory files. Kept broad on purpose: a false POSITIVE only preserves a bit
+	// of extra system text, while a false NEGATIVE silently drops the user's
+	// CLAUDE.md — so when in doubt we keep the block.
 	strong := []string{
 		"# claudemd",
+		"# agentsmd",
 		"codebase and user instructions are shown below",
 		"these instructions override any default behavior",
 		"user's private global instructions",
+		"user's global instructions",
 		"user memory",
+		"project memory",
 		"project instructions",
+		"# project instructions",
+		"# user instructions",
+		"global claude code instructions",
+		"memory file",
+		// Localized framings of the Claude Code memory header that we have seen
+		// in the wild (zh / es / fr / de / ja / pt). These mirror the English
+		// "Codebase and user instructions are shown below" / "user instructions".
+		"用户指令",       // zh: user instructions
+		"用户记忆",       // zh: user memory
+		"项目指令",       // zh: project instructions
+		"instrucciones del usuario", // es
+		"instructions de l'utilisateur", // fr
+		"benutzeranweisungen",       // de
+		"ユーザーの指示",  // ja: user instructions
+		"instruções do usuário",     // pt
 	}
 	for _, m := range strong {
 		if strings.Contains(lower, m) {
@@ -552,10 +573,30 @@ func reminderCarriesUserMemory(block string) bool {
 		}
 	}
 	// "Contents of <path>/CLAUDE.md" / "Contents of <path>/AGENTS.md" — the
-	// file-embed header Claude Code prepends to each memory file.
-	if strings.Contains(lower, "contents of") &&
-		(strings.Contains(lower, "claude.md") || strings.Contains(lower, "agents.md")) {
-		return true
+	// file-embed header Claude Code prepends to each memory file. Also match a
+	// bare mention of a memory filename next to "contents"/"内容"/"contenu" so a
+	// localized embed header still preserves the block.
+	memoryFiles := []string{"claude.md", "agents.md", "claude.local.md", ".clauderc", "gemini.md", "qwen.md", "copilot-instructions.md"}
+	hasMemoryFile := false
+	for _, f := range memoryFiles {
+		if strings.Contains(lower, f) {
+			hasMemoryFile = true
+			break
+		}
+	}
+	if hasMemoryFile {
+		for _, head := range []string{"contents of", "contents", "内容", "contenu", "contenido", "inhalt"} {
+			if strings.Contains(lower, head) {
+				return true
+			}
+		}
+		// A reminder that names a memory file AND frames it as instructions/memory
+		// is memory even without the "contents of" header (heading-based embeds).
+		for _, kw := range []string{"instruction", "memory", "memories", "guidance", "指令", "记忆"} {
+			if strings.Contains(lower, kw) {
+				return true
+			}
+		}
 	}
 	return false
 }

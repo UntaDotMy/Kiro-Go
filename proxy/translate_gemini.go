@@ -281,9 +281,15 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cachedTokens int
 	var stopReason string
 	toolSeq := 0
+	// Native grounding (web search) accumulators. groundingMetadata is documented
+	// to arrive on the final chunk (like usageMetadata), but placement can vary,
+	// so we capture the LAST non-empty occurrence across the whole stream rather
+	// than assuming a fixed chunk — correct regardless of where Gemini emits it.
+	var groundingResults []WebSearchResult
+	var groundingQuery string
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -306,10 +312,23 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 					} `json:"parts"`
 				} `json:"content"`
 				FinishReason string `json:"finishReason"`
+				// Native Google Search grounding. groundingChunks[].web.{uri,title}
+				// are the cited sources; webSearchQueries[] are the queries Gemini
+				// ran. Parsed exactly as gemini-cli's web-search tool reads them.
+				GroundingMetadata *struct {
+					GroundingChunks []struct {
+						Web *struct {
+							URI   string `json:"uri"`
+							Title string `json:"title"`
+						} `json:"web"`
+					} `json:"groundingChunks"`
+					WebSearchQueries []string `json:"webSearchQueries"`
+				} `json:"groundingMetadata"`
 			} `json:"candidates"`
 			UsageMetadata *struct {
-				PromptTokenCount     int `json:"promptTokenCount"`
-				CandidatesTokenCount int `json:"candidatesTokenCount"`
+				PromptTokenCount        int `json:"promptTokenCount"`
+				CandidatesTokenCount    int `json:"candidatesTokenCount"`
+				CachedContentTokenCount int `json:"cachedContentTokenCount"`
 			} `json:"usageMetadata"`
 		}
 		if err := json.Unmarshal([]byte(data), &resp); err != nil {
@@ -341,10 +360,33 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 			if cand.FinishReason != "" {
 				stopReason = mapGeminiFinishReason(cand.FinishReason)
 			}
+			// Capture grounding sources from this candidate. Keep the LAST chunk
+			// that actually carries chunks (later chunks supersede earlier partials).
+			if gm := cand.GroundingMetadata; gm != nil && len(gm.GroundingChunks) > 0 {
+				results := make([]WebSearchResult, 0, len(gm.GroundingChunks))
+				for _, ch := range gm.GroundingChunks {
+					if ch.Web == nil || strings.TrimSpace(ch.Web.URI) == "" {
+						continue
+					}
+					results = append(results, WebSearchResult{
+						Title: strings.TrimSpace(ch.Web.Title),
+						URL:   strings.TrimSpace(ch.Web.URI),
+					})
+				}
+				if len(results) > 0 {
+					groundingResults = results
+					if len(gm.WebSearchQueries) > 0 {
+						groundingQuery = strings.Join(gm.WebSearchQueries, "; ")
+					}
+				}
+			}
 		}
 		if resp.UsageMetadata != nil {
 			inputTokens = resp.UsageMetadata.PromptTokenCount
 			outputTokens = resp.UsageMetadata.CandidatesTokenCount
+			if resp.UsageMetadata.CachedContentTokenCount > 0 {
+				cachedTokens = resp.UsageMetadata.CachedContentTokenCount
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -352,6 +394,13 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 	}
 	if cb.OnComplete != nil && (inputTokens > 0 || outputTokens > 0) {
 		cb.OnComplete(inputTokens, outputTokens)
+	}
+	// Pass through the REAL Gemini context-cache hit count (never estimated).
+	if cachedTokens > 0 && cb.OnCacheUsage != nil {
+		cb.OnCacheUsage(cachedTokens, 0)
+	}
+	if len(groundingResults) > 0 && cb.OnWebSearchResults != nil {
+		cb.OnWebSearchResults(groundingQuery, groundingResults)
 	}
 	if stopReason != "" && cb.OnStopReason != nil {
 		cb.OnStopReason(stopReason)

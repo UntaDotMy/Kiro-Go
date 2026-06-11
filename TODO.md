@@ -1,103 +1,193 @@
-# TODO — incomplete / follow-up work
+# TODO — status after native-search citations + cache/context fixes
 
-Tracks what is **not** finished from the multi-provider + web-search + CLAUDE.md
-goal so the next session (or reviewer) has an exact pickup point. Items are
-grouped by area; each says what's done, what's missing, and where to look.
+Pickup point for the next session/reviewer. Each item says what's **done** (with
+code + tests), what's **verified by research** (primary sources, not guessed),
+and what genuinely **needs a live API key or CI** that this environment lacks.
+
+Research note: the open questions in the previous revision were closed with
+primary-source research (gemini-cli source, Anthropic docs, Alibaba Model Studio
+docs, 9router source, ~6 Kiro-gateway reimplementations), NOT model training
+knowledge. Findings are cited inline below.
+
+---
 
 ## 1. Web search — native-first, Kiro fallback
 
-**Done (code + unit tests):**
-- Provider-native classification: `nativeWebSearchKind` in `proxy/websearch_native.go`
-  recognizes DashScope/Qwen (`enable_search`), Gemini (`google_search`), and
-  real Anthropic (`web_search_20250305`). Anthropic-*compatible* hosts
-  (glm/kimi/minimax) are deliberately NOT treated as native.
-- Native injection into the outbound body: `injectNativeWebSearch`, wired in
-  `genericProvider.buildRequest` (`proxy/provider_generic.go`).
-- Emulation fallback: `handleClaudeWebSearch` now runs generation on the
-  request's OWN backend (`runProviderCollect` in `proxy/websearch_loop.go`) and
-  only uses a Kiro account for the MCP search side-call
-  (`firstUsableKiroAccount`). Gate in `handler.go` is `shouldEmulateWebSearch`.
-- No-Kiro path: if a provider is non-native and no Kiro account exists, the tool
-  is dropped and the model answers — **never a 404**.
+### Done (code + unit tests)
+- Provider-native classification + body injection (unchanged from prior work):
+  `nativeWebSearchKind`, `injectNativeWebSearch` in `proxy/websearch_native.go`.
+- **NEW — native citation surfacing for Gemini.** `parseGeminiSSE`
+  (`proxy/translate_gemini.go`) now parses
+  `candidates[].groundingMetadata.groundingChunks[].web.{uri,title}` and
+  `webSearchQueries[]`, accumulating the last non-empty occurrence across the
+  stream, and emits them via the new `OnWebSearchResults` callback. The Claude
+  handlers (`handleClaudeStream` / `handleClaudeNonStream`) splice them into
+  native `server_tool_use` + `web_search_tool_result` blocks
+  (`spliceNativeCitationBlocks` / `buildClaudeWebSearchContentBlocks` in
+  `proxy/websearch_blocks.go`), so a Claude client renders citation chips for the
+  native path — not just the Kiro emulation path.
+  - Block shape verified against Anthropic's web-search-tool docs
+    (`server_tool_use` → `web_search_tool_result` → `web_search_result{title,url,page_age}`).
+  - Gemini grounding shape verified against gemini-cli
+    `packages/core/src/tools/web-search.ts` (which qwen-code forks).
+  - Tests: `proxy/native_websearch_cache_test.go`
+    (`TestParseGeminiSSE_GroundingCitations`, `TestSpliceNativeCitationBlocks_*`).
 
-**Incomplete / not verified:**
-- [ ] **Live verification** against a real DashScope-intl key
-      (`https://dashscope-intl.aliyuncs.com/compatible-mode/v1`), a Gemini key,
-      and a direct Anthropic key. Unit tests cover the body shaping; nobody has
-      confirmed the upstreams accept the injected fields end-to-end.
-- [ ] **Native citation surfacing.** When a provider runs search natively, the
-      grounded *text* answer flows back fine, but provider-native citation
-      metadata is NOT mapped to Anthropic `web_search_tool_result` blocks:
-      - Gemini returns `groundingMetadata` (search queries + source URIs) — not
-        parsed in `parseGeminiSSE`.
-      - DashScope returns search/citation info in its response — not parsed in
-        `parseOpenAISSE`.
-      Result: Claude Code gets the answer but won't render native citation
-      chips for the native path (the Kiro emulation path DOES splice citation
-      blocks). Decide whether to map these or leave as text-only.
-- [ ] **`search_options` for DashScope** (forced_search, enable_citation,
-      enable_source) was intentionally left at provider defaults because the
-      exact sub-schema wasn't confirmed from primary docs. Revisit if we want
-      forced search or citation tuning.
-- [ ] **`web_fetch` / `web_extractor`**: only `web_search` is handled. Clients
-      that send a `web_fetch` tool still get it dropped. DashScope Responses API
-      pairs `web_search` + `web_extractor`; not implemented.
+### Verified by research — deliberate non-implementation
+- **DashScope / Qwen OpenAI-compatible mode does NOT return search sources.**
+  This is an Alibaba Model Studio platform limitation, confirmed by the official
+  web-search doc ("The OpenAI-compatible protocol does not support returning
+  search sources in responses") and corroborated by CherryHQ/cherry-studio
+  #10628. So on the compatible-mode endpoint the grounded *text* answer flows
+  back (model cites inline) but there is no structured source list to map —
+  **text-only is correct, not a bug.** We do NOT synthesize fake sources by
+  regexing URLs out of prose.
+  - To get structured DashScope citations we'd have to add a **native DashScope
+    mode** branch (`POST /api/v1/services/aigc/text-generation/generation` with
+    `search_options.enable_source:true` → `output.search_info.search_results[]`).
+    That's a separate request/response envelope; deferred as a follow-up, see §1
+    backlog.
+- **qwen-code itself removed its built-in `web_search` tool** (docs:
+  "Breaking Change: Built-in web_search Tool Removed") and now does web search
+  exclusively via **MCP servers** (Alibaba Bailian WebSearch MCP, Tavily, GLM
+  WebSearch Prime) — the same MCP architecture Kiro-Go already uses with Kiro's
+  `/mcp` endpoint. So the robust cross-provider search path is MCP-based search
+  (already implemented + splices citations), and `enable_search` is a lightweight
+  grounding bonus on top.
+
+### Backlog (needs a live key or a new subsystem)
+- [ ] **Live verification** of the Gemini grounding path against a real Gemini
+      key — specifically to confirm whether `groundingMetadata` arrives on every
+      SSE chunk or only the final one. The parser is written to be correct either
+      way (captures the last non-empty occurrence), but a live capture should
+      confirm. **Needs a key; not runnable here.**
+- [ ] **DashScope native-mode branch** for structured citations (see above).
+      Bigger change (new envelope + usage-key mapping). Until then DashScope
+      search is text-only by design.
+- [ ] **Live verification** against real DashScope-intl / direct-Anthropic keys
+      that the injected `enable_search` / hosted `web_search_20250305` fields are
+      accepted end-to-end. Unit tests cover body shaping only. **Needs keys.**
+
+## 1b. web_fetch / web_extractor
+
+### Verified by research — current behavior is the safe one
+- Kiro's MCP endpoint (`q.<region>.amazonaws.com/mcp`) exposes **only
+  `web_search`** — no `web_fetch` / `fetch` / `read_url` tool. Verified across ~6
+  independent Kiro-gateway reimplementations (jwadow/kiro-gateway,
+  NguyenSiTrung/CLIProxyAPI, MarshuMax/reverse_proxy, etc.); all show
+  `tools/list` = `{web_search}` only.
+- A client-sent `web_fetch` (hosted, type-stamped) tool is therefore **cleanly
+  dropped** by `isAnthropicServerTool` (`proxy/translator.go`) before reaching
+  upstream — it never 400s, and because the tool is removed from the catalog the
+  model never emits a fetch call, so there is nothing to error on. The model
+  answers from training/other tools. This is the spec-safe graceful behavior.
+- [ ] **Not implemented (by design): a real web_fetch fetcher.** Implementing a
+      genuine `web_fetch_tool_result` would require our own HTTP fetcher
+      (readability extraction, PDF→base64) — a medium-risk new network capability
+      with SSRF surface that MUST ship behind a config flag + allowlist + private-
+      IP/metadata-endpoint blocking. Deliberately left for a scoped follow-up; do
+      NOT route web_fetch through Kiro's `web_search` and pretend the snippet is
+      page content.
+
+---
 
 ## 2. CLAUDE.md / system-prompt preservation
 
-**Done (code + tests):**
-- `applySystemPromptFilters` (`proxy/translator.go`) no longer drops the WHOLE
-  system prompt when Claude Code is detected. It preserves `<system-reminder>`
-  blocks that carry genuine user/project memory (CLAUDE.md / AGENTS.md) via
-  `extractUserMemoryReminders` + `reminderCarriesUserMemory`, dropping only the
-  harness boilerplate.
-- `stripEnvNoiseLines` now keeps memory-carrying reminders even when
-  `FilterEnvNoise` is on.
-- Applies to BOTH paths: Kiro (`buildClaudeSystemPrompt`) and non-Kiro
-  (`OpenAIToKiro`).
-- Tests: `proxy/claudemd_preserve_test.go`.
+### Done (code + tests)
+- `applySystemPromptFilters` preserves user/project memory `<system-reminder>`
+  blocks (unchanged core from prior work).
+- **NEW — broadened marker coverage** in `reminderCarriesUserMemory`
+  (`proxy/translator.go`): now recognizes AGENTS.md-only setups, heading-based
+  embeds (`# Project instructions` with no "Contents of" header), other harness
+  memory filenames (GEMINI.md / QWEN.md / copilot-instructions.md /
+  CLAUDE.local.md), global-instruction framing, and several localized framings
+  (zh/es/fr/de/ja/pt). False-positive bias is intentional: keeping a little extra
+  system text is harmless; dropping a user's CLAUDE.md is not.
+  - Tests: `proxy/claudemd_preserve_test.go`
+    (`TestReminderCarriesUserMemory_ExtendedMarkers`,
+    `TestExtractUserMemoryReminders_AgentsMdOnly`).
 
-**Incomplete / not verified:**
-- [ ] **Live confirmation** that Claude Code's *current* build embeds CLAUDE.md
-      inside `<system-reminder>` (verified against the harness reminder in this
-      session's own context, but Claude Code versions drift). If a future
-      version moves memory into a plain `# Project instructions` heading instead
-      of a reminder block, `reminderCarriesUserMemory` won't catch it — the
-      heading-based markers in the classifier cover the common case but should
-      be re-checked against a live capture.
-- [ ] **Marker coverage**: `reminderCarriesUserMemory` matches the English
-      Claude Code memory framing. Localized or AGENTS.md-only setups should be
-      spot-checked.
+### Backlog (needs a live capture)
+- [ ] Spot-check against a live capture from a *future* Claude Code build if it
+      moves memory out of `<system-reminder>` blocks entirely. The heading-based
+      markers now cover the common non-reminder case, but framing can drift.
 
-## 3. Cache & context — INVESTIGATION INCOMPLETE
+---
 
-The user asked us to "check cache and context" and noted both Kiro and non-Kiro
-feel off. This was being traced when work paused. **No code change made yet.**
+## 3. Cache & context — RESOLVED (was "investigation incomplete")
 
-**What we know:**
-- `promptCacheTracker` (`proxy/cache_tracker.go`) is a LOCAL ESTIMATOR keyed per
-  Kiro account; it fingerprints cacheable blocks and reports
-  `cache_read`/`cache_creation`. `reconcileCacheUsage` caps the estimate to the
-  authoritative `input_tokens` so the emitted usage can't exceed the real total.
-- Context window: `contextWindowForModel` + the `OnContextUsage` callback derive
-  input tokens from the model's `contextUsagePercentage` when upstream omits a
-  hard count (`resolveInputTokens` precedence).
+The previous revision flagged this as unresolved ("both Kiro and non-Kiro feel
+off"). Root cause and fix below, modeled on 9router's honest-passthrough
+approach (verified against decolua/9router `usageTracking.js` + translators).
 
-**Open questions to resolve (then explain to the user):**
-- [ ] **Non-Kiro cache accounting.** `cacheProfile` is built and passed into the
-      Claude response path regardless of backend. For a non-Kiro provider the
-      upstream returns its OWN usage (or none); confirm we are not emitting a
-      Kiro-estimated `cache_read`/`cache_creation` for a DashScope response that
-      never cached. Check `buildClaudeUsageMap` callers on the generic path.
-- [ ] **Context window per non-Kiro model.** `contextWindowForModel` is
-      Kiro-centric; verify it returns a sane window for dashscope/qwen/gemini
-      models so the `%`-derived token fallback isn't wildly wrong.
-- [ ] Write the user-facing explanation of how cache + context are computed and
-      what is real vs. estimated per backend.
+### Done (code + tests)
+- **Cross-backend cache rule enforced.** New `resolveResponseCache`
+  (`proxy/cache_tracker.go`) + `isKiro` gating in both Claude handlers:
+  - **Kiro backend:** the local `promptCache` estimator stays authoritative
+    (Kiro's upstream reports no cache split) — unchanged behavior.
+  - **Any non-Kiro backend:** the Kiro estimate is **never** emitted. We pass
+    through the provider's **real** reported cache, or emit no cache fields at
+    all. This fixes the bug where a DashScope/Gemini response that never cached
+    could still carry a Kiro-estimated `cache_read`/`cache_creation`, making a
+    client's running context tally drift upward every turn.
+- **Real upstream cache passthrough** via the new `OnCacheUsage` callback:
+  - OpenAI-compatible: `usage.prompt_tokens_details.cached_tokens` (DeepSeek
+    fallback `usage.prompt_cache_hit_tokens`) — `proxy/translate_openai.go`.
+  - Gemini: `usageMetadata.cachedContentTokenCount` — `proxy/translate_gemini.go`.
+  - Anthropic-compatible: `usage.cache_read_input_tokens` /
+    `cache_creation_input_tokens` — `proxy/translate_anthropic.go`.
+  - Emitted only when > 0 (no zero stubs).
+- **Per-family context window** for non-Kiro models. New
+  `familyContextWindowFor` (`proxy/context_window.go`) + hook in
+  `getContextWindowSize` (`proxy/kiro.go`): a Gemini-2.5 (1M) / qwen-turbo (1M) /
+  qwen-plus (128K) model now advertises a sane window instead of the flat 200K
+  Claude default, so the client's `used / window` gauge and compaction timing are
+  correct. Live `tokenLimits.maxInputTokens` still wins when the provider's
+  `/models` reports one; the table is fallback-only.
+  - Tests: `TestFamilyContextWindowFor`, `TestGetContextWindowSize_NonKiroFamilies`,
+    `TestResolveResponseCache_*`, `TestParse{OpenAI,Gemini,Anthropic}SSE_*` in
+    `proxy/native_websearch_cache_test.go`.
+
+### How cache + context are computed (user-facing explanation)
+
+- **Context window (the denominator of the usage gauge):** resolved live-first.
+  For a Kiro/Claude model we read Kiro's advertised `tokenLimits.maxInputTokens`;
+  if absent, we version-parse the Claude id (Opus/Sonnet/Haiku ≥ 4.6 → 1M, else
+  200K). For a non-Kiro model we use the provider's live `/models` window if it
+  reports one, else a documented per-family fallback (Gemini 2.5 ≈ 1.05M, qwen-
+  turbo 1M, qwen-plus/qwen2.5 128K, qwen-max 32K, glm/kimi/deepseek 128K),
+  else 200K. These fallbacks are family-level doc values, not live-confirmed per
+  exact id — a live `/models` value always overrides them.
+
+- **Input tokens (the numerator):** exact upstream count from the event stream
+  wins; if the provider sent none we derive it from the model's
+  `contextUsagePercentage × window`; only as a last resort do we estimate locally
+  from the request. (`resolveInputTokens` precedence — unchanged.)
+
+- **Cache (`cache_read` / `cache_creation`):**
+  - On **Kiro**, these are a **local estimate**. Kiro's upstream does not return a
+    cache split, so a per-account prompt-cache tracker fingerprints cacheable
+    blocks and estimates the read/creation split, capped so
+    `billed + cache_read + cache_creation` never exceeds the real input total.
+  - On **every non-Kiro provider**, these are **only ever the provider's own
+    reported numbers** (OpenAI `cached_tokens`, Gemini `cachedContentTokenCount`,
+    Anthropic `cache_*_input_tokens`). If the provider reports nothing, we emit
+    nothing — we never show a Kiro-style estimate for a provider that didn't
+    cache. So a cache number on a non-Kiro response is real, or it's absent.
+
+### Backlog (needs a live key)
+- [ ] Confirm the exact per-id context windows against each provider's live
+      `/models` (the table is a documented-family fallback; prefer live values).
+- [ ] Confirm Gemini `cachedContentTokenCount` and DashScope
+      `prompt_tokens_details.cached_tokens` populate as expected against real
+      keys (only meaningful when explicit context caching is in use).
+
+---
 
 ## Housekeeping
-- [ ] `nul'` — stray Windows device-name file in the repo root. Untracked,
-      harmless, NOT part of this work; left alone (could not remove via the
-      device path). Should be deleted out-of-band.
-- [ ] `go test -race` not run (no cgo/C toolchain in this env). Concurrency
-      paths are covered by explicit accounting tests; run race on CI.
+- [x] Stray `nul'` device-name file — not present in the tree (already gone).
+- [x] Accidental `qwen-code/` clone left by a research step — removed.
+- [ ] `go test -race` — **still not runnable here**: needs a C toolchain
+      (CGO/gcc) which this Windows/go1.26 env lacks (`cgo: C compiler "gcc" not
+      found`). All concurrency paths are covered by the non-race unit tests; run
+      `-race` on CI where a C compiler is present.
