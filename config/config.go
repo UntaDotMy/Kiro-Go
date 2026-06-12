@@ -196,6 +196,18 @@ type Account struct {
 	QoderUserID    string `json:"qoderUserId,omitempty"`
 	QoderMachineID string `json:"qoderMachineId,omitempty"`
 
+	// CodeBuddy (Backend == "codebuddy" / "codebuddy-ai"). The CLI OAuth tokens
+	// live in AccessToken/RefreshToken and drive inference. CodeBuddy quota,
+	// however, is served only by the WEB CONSOLE (codebuddy.ai/billing/...), which
+	// is gated by a Keycloak session cookie that the CLI OAuth token cannot reach.
+	// The automation captures that cookie at login and stores it here so the quota
+	// poller (proxy/codebuddy_quota.go) can fetch REAL credit figures into the
+	// UsageCurrent/UsageLimit/UsagePercent fields above instead of guessing. Inert
+	// for every non-CodeBuddy account. WebCookieAt is the capture time (Unix s) so
+	// the dashboard can show staleness and a refresh can re-capture an expired one.
+	WebCookie   string `json:"webCookie,omitempty"`
+	WebCookieAt int64  `json:"webCookieAt,omitempty"`
+
 	// ExtraHeaders are per-account static headers merged OVER the provider's
 	// catalog/config headers on every inference + model-listing request. Used by
 	// OAuth providers that learn an account-specific header at login time which a
@@ -896,6 +908,18 @@ func GetAccounts() []Account {
 	accounts := make([]Account, len(cfg.Accounts))
 	copy(accounts, cfg.Accounts)
 	return accounts
+}
+
+// GetAccount returns a copy of one account by id and whether it was found.
+func GetAccount(id string) (Account, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, a := range cfg.Accounts {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return Account{}, false
 }
 
 // GetAccountBackend returns the upstream provider id for an account, defaulting

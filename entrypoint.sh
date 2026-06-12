@@ -23,5 +23,6 @@ if [ -d "$DATA_DIR" ]; then
 fi
 
 # Drop privileges to RUN_UID:RUN_GID and exec the binary via tini so signal
-# handling and zombie reaping still work for graceful shutdown.
-exec /sbin/tini -- /sbin/su-exec "$RUN_UID:$RUN_GID" ./kiro-go
+# handling and zombie reaping still work for graceful shutdown. On Debian, tini and
+# gosu are on PATH (/usr/bin), unlike the Alpine image's /sbin/su-exec.
+exec tini -- gosu "$RUN_UID:$RUN_GID" ./kiro-go

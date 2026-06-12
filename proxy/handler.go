@@ -3671,6 +3671,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartCodeBuddyLogin(w, r)
 	case path == "/auth/codebuddy-ai/poll" && r.Method == "POST":
 		h.apiPollCodeBuddyLogin(w, r)
+	case path == "/automation/start" && r.Method == "POST":
+		h.apiStartAutomation(w, r)
+	case path == "/automation/status" && r.Method == "GET":
+		h.apiAutomationStatus(w, r)
+	case path == "/automation/cancel" && r.Method == "POST":
+		h.apiAutomationCancel(w, r)
+	case path == "/automation/complete" && r.Method == "POST":
+		h.apiAutomationComplete(w, r)
+	case strings.HasPrefix(path, "/automation/quota/") && r.Method == "POST":
+		h.apiSyncCodeBuddyQuota(w, r, strings.TrimPrefix(path, "/automation/quota/"))
 	case path == "/auth/kimi-coding/start" && r.Method == "POST":
 		h.apiStartKimiCodingLogin(w, r)
 	case path == "/auth/kimi-coding/poll" && r.Method == "POST":
@@ -4033,9 +4043,9 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["baseURL"].(string); ok && !isKiro {
 		tv := strings.TrimSpace(v)
-		if tv != "" && !strings.HasPrefix(strings.ToLower(tv), "https://") {
+		if tv != "" && !isValidBaseURLScheme(tv) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 			return
 		}
 		// A self-contained custom account's BaseURLOverride is its ONLY URL —

@@ -19,6 +19,19 @@ var errEmptyCodexToken = errors.New("codex token is empty")
 
 func nowUnixSeconds() int64 { return time.Now().Unix() }
 
+// isValidBaseURLScheme reports whether a base URL uses an allowed scheme. Both
+// https and http are accepted: not every endpoint an operator targets serves
+// TLS (self-hosted gateways, LAN/on-prem boxes, localhost, a sidecar reached
+// over plain HTTP). We still reject schemeless input and non-http schemes
+// (file://, ftp://, etc.) so the SSRF guard keeps its teeth — the requirement is
+// "http or https", not "anything".
+func isValidBaseURLScheme(base string) bool {
+	l := strings.ToLower(strings.TrimSpace(base))
+	return strings.HasPrefix(l, "https://") || strings.HasPrefix(l, "http://")
+}
+
+const baseURLSchemeError = "baseURL must use http:// or https://"
+
 // providerCatalogEntry is the dashboard-facing description of an addable
 // provider backend.
 type providerCatalogEntry struct {
@@ -164,9 +177,9 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL is required for a custom provider (e.g. https://api.example.com/v1)"})
 			return
 		}
-		if !strings.HasPrefix(strings.ToLower(base), "https://") {
+		if !isValidBaseURLScheme(base) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 			return
 		}
 		// Routing id/prefix: prefer the operator-supplied alias, else a slug of
@@ -193,9 +206,9 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		// SSRF guard on the optional per-account base URL override.
-		if bu := strings.TrimSpace(req.BaseURL); bu != "" && !strings.HasPrefix(strings.ToLower(bu), "https://") {
+		if bu := strings.TrimSpace(req.BaseURL); bu != "" && !isValidBaseURLScheme(bu) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 			return
 		}
 	}
@@ -402,9 +415,9 @@ func (h *Handler) apiAddProviderAccountsBulk(w http.ResponseWriter, r *http.Requ
 			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL is required for a custom provider (e.g. https://api.example.com/v1)"})
 			return
 		}
-		if !strings.HasPrefix(strings.ToLower(base), "https://") {
+		if !isValidBaseURLScheme(base) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 			return
 		}
 		id := slugifyProviderID(firstNonEmpty(strings.TrimSpace(req.Alias), strings.TrimSpace(req.Name)))
@@ -438,9 +451,9 @@ func (h *Handler) apiAddProviderAccountsBulk(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		if bu := strings.TrimSpace(req.BaseURL); bu != "" {
-			if !strings.HasPrefix(strings.ToLower(bu), "https://") {
+			if !isValidBaseURLScheme(bu) {
 				w.WriteHeader(400)
-				json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+				json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 				return
 			}
 			baseOverride = bu
@@ -665,11 +678,13 @@ func (h *Handler) apiAddCustomProvider(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "baseURL is required"})
 		return
 	}
-	// SSRF guard: restrict custom-provider base URLs to https so they can't be
-	// pointed at file://, plaintext, or internal endpoints (see security review).
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(pc.BaseURL)), "https://") {
+	// SSRF guard: restrict custom-provider base URLs to http(s) so they can't be
+	// pointed at file://, ftp://, or other non-web schemes (see security review).
+	// Both http and https are allowed — self-hosted / LAN / localhost gateways
+	// don't always serve TLS.
+	if !isValidBaseURLScheme(pc.BaseURL) {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+		json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 		return
 	}
 	// Don't let a custom provider shadow a built-in backend id.

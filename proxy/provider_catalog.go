@@ -55,6 +55,28 @@ var aliCoderModels = []string{
 	"qwen-coder-turbo", "qwen-coder-turbo-latest", "qwen-coder-turbo-0919",
 }
 
+// codeBuddyModels is the advisory (display-only) model catalog for CodeBuddy.
+// CodeBuddy exposes NO GET /models endpoint (every /v1, /v2, and /v2/plugin
+// models path returns 404), so the live fetch can never populate the list — this
+// is why the dashboard showed 0 models. We ship the real model ids the gateway
+// accepts as an advisory list (SetAdvisoryModelList), so the count is real and
+// clients can route to a named model; a missing id is never shed because the
+// upstream validates at call time. Shared by both hosts (codebuddy CN +
+// codebuddy-ai international), which expose the same lineup.
+//
+// Source: the CodeBuddy CLI's own model definitions (ported from 9router_wyx0's
+// open-sse/config/providerModels.js `cb` set, smoke-verified against
+// www.codebuddy.ai). "default-model" is the gateway's auto-routed default.
+var codeBuddyModels = []string{
+	"default-model", "default-model-lite",
+	"claude-sonnet-4.6", "claude-opus-4.7-1m", "claude-opus-4.6", "claude-haiku-4.5",
+	"gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.1-codex",
+	"gemini-3.1-pro", "gemini-3.0-flash", "gemini-3.5-flash", "gemini-2.5-flash",
+	"gemini-3.1-flash-lite", "gemini-2.5-pro",
+	"deepseek-v3-0324", "glm-5.0", "glm-5v-turbo", "glm-4.6",
+	"kimi-k2.6", "kimi-k2.5",
+}
+
 // builtinProviders is the data-only catalog. The OpenAI-compatible rows are all
 // served by genericProvider with no per-provider code. Ported from 9router's
 // open-sse/config/providers.js (the LLM subset; TTS/STT/image/embedding-only
@@ -90,8 +112,15 @@ var builtinProviders = []builtinProvider{
 	// Both share the same /v2/plugin/auth OAuth flow (auth/codebuddy_oauth.go); the
 	// backend id selects the host so token refresh hits the gateway the account logged
 	// in against.
-	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent CN)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v1/chat/completions", OAuth: true},
-	{ID: "codebuddy-ai", Alias: "cbai", Name: "CodeBuddy (International)", Dialect: DialectOpenAI, BaseURL: "https://www.codebuddy.ai/v1/chat/completions", OAuth: true},
+	//
+	// The inference endpoint is /v2/chat/completions (OpenAI dialect) — NOT /v1:
+	// probing shows /v1/chat/completions 404s ("Route Not Found") while
+	// /v2/chat/completions returns 401 (exists, needs auth) and /v2/messages 404s
+	// (so it's OpenAI-shaped, not Anthropic). The old /v1 base was the real cause of
+	// both broken inference and the empty model list. CodeBuddy serves no /models
+	// route, so codeBuddyModels is shipped as an advisory list (see above).
+	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent CN)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v2/chat/completions", OAuth: true, Models: codeBuddyModels},
+	{ID: "codebuddy-ai", Alias: "cbai", Name: "CodeBuddy (International)", Dialect: DialectOpenAI, BaseURL: "https://www.codebuddy.ai/v2/chat/completions", OAuth: true, Models: codeBuddyModels},
 	{ID: "qwen", Alias: "qwen", Name: "Qwen (Alibaba)", Dialect: DialectOpenAI, BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", OAuth: true},
 	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions", OAuth: true, Headers: map[string]string{"User-Agent": "iFlow-Cli"},
 		// iFlow's /models endpoint 404s; advisory catalog. Source: iFlow model

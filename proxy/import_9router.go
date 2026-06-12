@@ -214,8 +214,8 @@ func (h *Handler) registerNineRouterNode(n nineRouterNode) (string, bool) {
 	if id == "" || base == "" {
 		return "", false
 	}
-	// SSRF guard parity with apiAddCustomProvider: https only.
-	if !strings.HasPrefix(strings.ToLower(base), "https://") {
+	// SSRF guard parity with apiAddCustomProvider: http(s) only (not file://, etc.).
+	if !isValidBaseURLScheme(base) {
 		return "", false
 	}
 	var dialect string
@@ -386,7 +386,7 @@ func applyNineRouterProviderSpecific(acct *config.Account, backend string, psd m
 	default:
 		// Custom/api-key providers: a baseUrl in providerSpecificData becomes a
 		// per-account override (the ProviderConfig already carries the default).
-		if bu := getStr("baseUrl", "baseURL"); bu != "" && strings.HasPrefix(strings.ToLower(bu), "https://") {
+		if bu := getStr("baseUrl", "baseURL"); bu != "" && isValidBaseURLScheme(bu) {
 			acct.BaseURLOverride = bu
 		}
 	}
