@@ -200,8 +200,8 @@ type Account struct {
 	// live in AccessToken/RefreshToken and drive inference. CodeBuddy quota,
 	// however, is served only by the WEB CONSOLE (codebuddy.ai/billing/...), which
 	// is gated by a Keycloak session cookie that the CLI OAuth token cannot reach.
-	// The automation captures that cookie at login and stores it here so the quota
-	// poller (proxy/codebuddy_quota.go) can fetch REAL credit figures into the
+	// A manually-imported web session cookie is stored here so the quota poller
+	// (proxy/codebuddy_quota.go) can fetch REAL credit figures into the
 	// UsageCurrent/UsageLimit/UsagePercent fields above instead of guessing. Inert
 	// for every non-CodeBuddy account. WebCookieAt is the capture time (Unix s) so
 	// the dashboard can show staleness and a refresh can re-capture an expired one.

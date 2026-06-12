@@ -3671,16 +3671,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartCodeBuddyLogin(w, r)
 	case path == "/auth/codebuddy-ai/poll" && r.Method == "POST":
 		h.apiPollCodeBuddyLogin(w, r)
-	case path == "/automation/start" && r.Method == "POST":
-		h.apiStartAutomation(w, r)
-	case path == "/automation/status" && r.Method == "GET":
-		h.apiAutomationStatus(w, r)
-	case path == "/automation/cancel" && r.Method == "POST":
-		h.apiAutomationCancel(w, r)
-	case path == "/automation/complete" && r.Method == "POST":
-		h.apiAutomationComplete(w, r)
-	case strings.HasPrefix(path, "/automation/quota/") && r.Method == "POST":
-		h.apiSyncCodeBuddyQuota(w, r, strings.TrimPrefix(path, "/automation/quota/"))
+	case strings.HasPrefix(path, "/codebuddy/quota/") && r.Method == "POST":
+		h.apiSyncCodeBuddyQuota(w, r, strings.TrimPrefix(path, "/codebuddy/quota/"))
 	case path == "/auth/kimi-coding/start" && r.Method == "POST":
 		h.apiStartKimiCodingLogin(w, r)
 	case path == "/auth/kimi-coding/poll" && r.Method == "POST":

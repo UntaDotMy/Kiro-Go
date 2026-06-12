@@ -23,13 +23,12 @@ import (
 // 401/403 there. That is precisely why quota could never be tracked without
 // guessing: the value lives behind a cookie the CLI flow never captures.
 //
-// The Automation tab (automation/codebuddy.go) drives a stealth browser through
-// the web login and captures that session cookie into Account.WebCookie. This
-// file turns that cookie into REAL numbers: it POSTs the documented billing
-// query (ProductCode p_tcaca + the TCACA_code_* package codes) and folds the
-// returned CycleCapacity figures into the account's UsageCurrent/UsageLimit/
-// UsagePercent fields — the same fields the dashboard already renders for every
-// other provider. No assumptions, no manual input.
+// The account's CodeBuddy web session cookie is stored in Account.WebCookie
+// (supplied via manual cookie import). This file turns that cookie into REAL
+// numbers: it POSTs the documented billing query (ProductCode p_tcaca + the
+// TCACA_code_* package codes) and folds the returned CycleCapacity figures into
+// the account's UsageCurrent/UsageLimit/UsagePercent fields — the same fields the
+// dashboard already renders for every other provider.
 //
 // Ported from 9router_wyx0's open-sse/services/usage.js (getCodeBuddyUsage /
 // parseCodeBuddyUsage) and src/app/api/oauth/codebuddy/quota-cookie/route.js.
@@ -133,17 +132,17 @@ func codeBuddyUsageBody() []byte {
 }
 
 // FetchCodeBuddyQuota queries the web-console billing API with the account's
-// captured session cookie and returns normalized credit figures. The cookie (not
+// stored session cookie and returns normalized credit figures. The cookie (not
 // the OAuth token) is the credential; an account with no WebCookie returns an
-// error so the caller can prompt a (re-)capture via the Automation tab. The
-// account's own proxy is honored so the poll exits the same egress as inference.
+// error so the caller can prompt a (re-)import of the cookie. The account's own
+// proxy is honored so the poll exits the same egress as inference.
 func FetchCodeBuddyQuota(ctx context.Context, acct *config.Account) (*CodeBuddyQuota, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cookie := normalizeCookie(acct.WebCookie)
 	if cookie == "" {
-		return nil, fmt.Errorf("no CodeBuddy web session cookie captured for account %s; run the Automation login to capture one", acct.ID)
+		return nil, fmt.Errorf("no CodeBuddy web session cookie stored for account %s; import one via the cookie-import flow to enable quota tracking", acct.ID)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", codeBuddyUsageURL, bytes.NewReader(codeBuddyUsageBody()))
@@ -167,7 +166,7 @@ func FetchCodeBuddyQuota(ctx context.Context, acct *config.Account) (*CodeBuddyQ
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("codebuddy web session cookie is not authorized (HTTP %d); re-capture it via the Automation login", resp.StatusCode)
+		return nil, fmt.Errorf("codebuddy web session cookie is not authorized (HTTP %d); re-import a fresh cookie via the cookie-import flow", resp.StatusCode)
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("codebuddy quota endpoint returned HTTP %d", resp.StatusCode)

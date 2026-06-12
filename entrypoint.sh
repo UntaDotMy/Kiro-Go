@@ -26,3 +26,4 @@ fi
 # handling and zombie reaping still work for graceful shutdown. On Debian, tini and
 # gosu are on PATH (/usr/bin), unlike the Alpine image's /sbin/su-exec.
 exec tini -- gosu "$RUN_UID:$RUN_GID" ./kiro-go
+
