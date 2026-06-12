@@ -31,6 +31,5 @@ kiro-research/
 
 # Diagnostic / scratch
 cbcheck*.png
-fpverify*.png
 utils.py
 

@@ -863,10 +863,6 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="8" height="8" rx="1"/><rect x="14" y="2" width="8" height="8" rx="1"/><rect x="2" y="14" width="8" height="8" rx="1"/><path d="M18 14v8M14 18h8"/></svg>
                     <span class="nav-label" data-i18n="tabs.providers"></span>
                 </div>
-                <div class="nav-item" data-tab="automation" onclick="switchTab('automation')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg>
-                    <span class="nav-label" data-i18n="tabs.automation"></span>
-                </div>
                 <div class="nav-item" data-tab="apikeys" onclick="switchTab('apikeys')">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
                     <span class="nav-label" data-i18n="tabs.apikeys"></span>
@@ -1003,130 +999,6 @@
                     <button class="btn btn-sm btn-secondary" onclick="clearProviderSelection()" data-i18n="providers.clearSelection"></button>
                 </div>
                 <div id="providersList" style="padding:0 4px 8px"></div>
-            </div>
-        </div>
-        <div id="tabAutomation" class="tab-content hidden">
-            <!-- View 1: provider picker cards -->
-            <div id="autoView-home">
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title" data-i18n="automation.title">Automation</span>
-                    </div>
-                    <div style="padding:0 20px 16px;font-size:13px;color:#64748b" data-i18n="automation.hint">
-                        Log in to provider accounts with a stealth browser and capture real quota automatically. Pick a provider to begin.
-                    </div>
-                    <div style="padding:0 20px 24px;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px">
-                        <div class="auto-provider-card" style="border:1px solid var(--border,#e2e8f0);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:10px">
-                            <div style="display:flex;align-items:center;gap:10px">
-                                <div style="width:40px;height:40px;border-radius:10px;background:#006EFF1a;display:flex;align-items:center;justify-content:center">
-                                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#006EFF" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M9 9h6v6H9z"/></svg>
-                                </div>
-                                <div>
-                                    <div style="font-weight:700;font-size:15px">CodeBuddy</div>
-                                    <div style="font-size:12px;color:#64748b">Tencent / International</div>
-                                </div>
-                            </div>
-                            <div style="font-size:12px;color:#64748b;flex:1">Auto-login (bulk or single) with stealth browser, real quota capture, and live view.</div>
-                            <button class="btn btn-primary btn-sm" onclick="openAutomationForm('codebuddy')">Start</button>
-                        </div>
-                        <div class="auto-provider-card" style="border:1px dashed var(--border,#e2e8f0);border-radius:12px;padding:18px;display:flex;flex-direction:column;gap:10px;opacity:.6">
-                            <div style="display:flex;align-items:center;gap:10px">
-                                <div style="width:40px;height:40px;border-radius:10px;background:#94a3b81a;display:flex;align-items:center;justify-content:center">
-                                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#94a3b8" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-                                </div>
-                                <div>
-                                    <div style="font-weight:700;font-size:15px">More providers</div>
-                                    <div style="font-size:12px;color:#64748b">Coming soon</div>
-                                </div>
-                            </div>
-                            <div style="font-size:12px;color:#64748b;flex:1">Additional provider automations are on the way.</div>
-                            <button class="btn btn-secondary btn-sm" disabled>Coming soon</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- View 2: config form -->
-            <div id="autoView-form" style="display:none">
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">CodeBuddy automation</span>
-                        <button class="btn btn-secondary btn-sm" onclick="autoShowView('home')">&larr; Back</button>
-                    </div>
-                    <div style="padding:0 20px 20px;display:grid;gap:16px;max-width:760px">
-                        <div style="display:flex;gap:8px">
-                            <button type="button" class="auto-mode-btn btn btn-sm btn-primary" data-mode="bulk" onclick="setAutoMode('bulk')">Bulk</button>
-                            <button type="button" class="auto-mode-btn btn btn-sm btn-secondary" data-mode="single" onclick="setAutoMode('single')">Single</button>
-                        </div>
-                        <div>
-                            <label style="font-size:13px;font-weight:600;display:block;margin-bottom:6px">Host</label>
-                            <select id="autoProvider" style="width:100%;padding:8px 10px;border:1px solid var(--border,#e2e8f0);border-radius:8px">
-                                <option value="codebuddy-ai" selected>CodeBuddy (International)</option>
-                                <option value="codebuddy">CodeBuddy (Tencent CN)</option>
-                            </select>
-                        </div>
-                        <div id="autoBulkWrap">
-                            <label style="font-size:13px;font-weight:600;display:block;margin-bottom:6px">Accounts (one per line — any delimiter: <code>|</code> <code>:</code> <code>,</code> <code>;</code> tab or space)</label>
-                            <textarea id="autoAccounts" rows="7" placeholder="user1@gmail.com|password1&#10;user2@gmail.com|password2" style="width:100%;padding:10px;border:1px solid var(--border,#e2e8f0);border-radius:8px;font-family:monospace;font-size:13px;box-sizing:border-box"></textarea>
-                        </div>
-                        <div id="autoSingleWrap" style="display:none;gap:12px;grid-template-columns:1fr 1fr">
-                            <div>
-                                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:6px">Email</label>
-                                <input id="autoSingleEmail" type="text" placeholder="user@gmail.com" style="width:100%;padding:8px 10px;border:1px solid var(--border,#e2e8f0);border-radius:8px;box-sizing:border-box">
-                            </div>
-                            <div>
-                                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:6px">Password</label>
-                                <input id="autoSinglePassword" type="password" placeholder="password" style="width:100%;padding:8px 10px;border:1px solid var(--border,#e2e8f0);border-radius:8px;box-sizing:border-box">
-                            </div>
-                        </div>
-                        <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
-                            <div>
-                                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:6px">Concurrency (threads)</label>
-                                <input id="autoConcurrency" type="number" min="1" max="10" value="3" style="width:120px;padding:8px 10px;border:1px solid var(--border,#e2e8f0);border-radius:8px">
-                            </div>
-                            <div style="flex:1;min-width:240px">
-                                <label style="font-size:13px;font-weight:600;display:block;margin-bottom:6px">Proxy (optional)</label>
-                                <input id="autoProxy" type="text" placeholder="socks5://user:pass@host:1080" style="width:100%;padding:8px 10px;border:1px solid var(--border,#e2e8f0);border-radius:8px;box-sizing:border-box">
-                            </div>
-                            <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding-bottom:8px">
-                                <input id="autoVisible" type="checkbox"> Show browser window
-                            </label>
-                        </div>
-                        <div>
-                            <button class="btn btn-primary" id="autoStartBtn" onclick="startAutomation()">Start automation</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- View 3: live run -->
-            <div id="autoView-run" style="display:none">
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Running CodeBuddy automation</span>
-                        <div class="card-actions" style="display:flex;gap:8px;align-items:center">
-                            <span id="autoSummary" style="font-size:13px;color:#64748b"></span>
-                            <button class="btn btn-danger btn-sm hidden" id="autoCancelBtn" onclick="cancelAutomation()">Cancel</button>
-                            <button class="btn btn-secondary btn-sm" id="autoNewBtn" onclick="autoShowView('home')" style="display:none">New job</button>
-                        </div>
-                    </div>
-                    <div style="padding:0 20px 20px;display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:18px">
-                        <!-- live frames: one bordered, isolated tile per concurrent worker -->
-                        <div style="min-width:0">
-                            <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:8px">Live browsers <span id="autoFrameLabel" style="font-weight:400"></span></div>
-                            <div id="autoFrameGrid" style="display:grid;gap:12px">
-                                <div id="autoFrameEmpty" style="background:#0f172a;border-radius:10px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:13px">Waiting for live sessions...</div>
-                            </div>
-                            <!-- failures summary -->
-                            <div id="autoFailures" style="margin-top:16px"></div>
-                        </div>
-                        <!-- per-account list + logs -->
-                        <div style="min-width:0">
-                            <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:8px">Accounts</div>
-                            <div id="autoProgressList" style="border:1px solid var(--border,#f1f5f9);border-radius:10px;max-height:520px;overflow:auto"></div>
-                        </div>
-                    </div>
-                </div>
             </div>
         </div>
         <div id="tabApikeys" class="tab-content hidden">
@@ -1479,7 +1351,6 @@
                 'stats.uptime': '运行时长',
                 'tabs.accounts': '账号',
                 'tabs.providers': '提供商',
-                'tabs.automation': '自动化',
                 'tabs.apikeys': 'API 密钥',
                 'providers.title': '提供商',
                 'providers.add': '+ 添加提供商',
@@ -1943,7 +1814,6 @@
                 'stats.uptime': 'Uptime',
                 'tabs.accounts': 'Accounts',
                 'tabs.providers': 'Providers',
-                'tabs.automation': 'Automation',
                 'tabs.apikeys': 'API Keys',
                 'providers.title': 'Providers',
                 'providers.add': '+ Add Provider',
@@ -4832,173 +4702,6 @@
             return { 'Content-Type': 'application/json', 'X-Admin-Password': password };
         }
 
-        // ---- Automation (stealth-browser login + quota capture) ----
-        let autoPollTimer = null;
-        let autoMode = 'bulk';
-        let autoExpanded = {}; // line -> bool (log expanded)
-
-        function autoShowView(view) {
-            ['home', 'form', 'run'].forEach(v => {
-                const el = document.getElementById('autoView-' + v);
-                if (el) el.style.display = (v === view) ? '' : 'none';
-            });
-            if (view !== 'run' && autoPollTimer) { clearInterval(autoPollTimer); autoPollTimer = null; }
-        }
-        function openAutomationForm(provider) {
-            autoShowView('form');
-            setAutoMode('bulk');
-        }
-        function setAutoMode(mode) {
-            autoMode = mode;
-            document.querySelectorAll('.auto-mode-btn').forEach(b => {
-                const on = b.dataset.mode === mode;
-                b.classList.toggle('btn-primary', on);
-                b.classList.toggle('btn-secondary', !on);
-            });
-            document.getElementById('autoBulkWrap').style.display = mode === 'bulk' ? '' : 'none';
-            document.getElementById('autoSingleWrap').style.display = mode === 'single' ? 'grid' : 'none';
-        }
-        async function startAutomation() {
-            const provider = document.getElementById('autoProvider').value;
-            let accounts;
-            if (autoMode === 'single') {
-                const email = (document.getElementById('autoSingleEmail').value || '').trim();
-                const pass = document.getElementById('autoSinglePassword').value || '';
-                if (!email || !pass) { alert('Enter email and password'); return; }
-                accounts = [email + '|' + pass];
-            } else {
-                const raw = document.getElementById('autoAccounts').value || '';
-                accounts = raw.split('\n').map(s => s.trim()).filter(Boolean);
-                if (accounts.length === 0) { alert('Paste at least one email|password line'); return; }
-            }
-            const concurrency = parseInt(document.getElementById('autoConcurrency').value, 10) || 3;
-            const proxyURL = (document.getElementById('autoProxy').value || '').trim();
-            const headless = !document.getElementById('autoVisible').checked;
-            const btn = document.getElementById('autoStartBtn');
-            btn.disabled = true; btn.textContent = 'Starting...';
-            try {
-                const res = await fetch('/admin/api/automation/start', {
-                    method: 'POST', headers: oauthHeaders(),
-                    body: JSON.stringify({ backend: provider, concurrency, proxyURL, headless, accounts })
-                });
-                const data = await res.json();
-                if (!res.ok) { alert(data.error || 'Failed to start'); return; }
-                autoExpanded = {};
-                autoShowView('run');
-                startAutoPolling();
-            } catch (e) { alert('Error: ' + e.message); }
-            finally { btn.disabled = false; btn.textContent = 'Start automation'; }
-        }
-        function startAutoPolling() {
-            if (autoPollTimer) clearInterval(autoPollTimer);
-            loadAutomationStatus();
-            // Poll fast so the live browser frames actually look live (the backend
-            // captures ~3fps; 700ms keeps the view fluid without hammering). Each
-            // payload carries small scaled JPEGs, fine on a local dashboard.
-            autoPollTimer = setInterval(loadAutomationStatus, 700);
-        }
-        async function loadAutomationStatus() {
-            try {
-                const res = await fetch('/admin/api/automation/status', { headers: { 'X-Admin-Password': password } });
-                const data = await res.json();
-                if (!data.job) { autoShowView('home'); return; }
-                if (document.getElementById('autoView-run').style.display === 'none' &&
-                    document.getElementById('autoView-form').style.display === 'none') {
-                    // a job exists but we're on home; surface it
-                    autoShowView('run'); if (!autoPollTimer) startAutoPolling();
-                }
-                renderAutomationJob(data.job);
-            } catch (e) { /* ignore transient */ }
-        }
-        function renderAutomationJob(job) {
-            const summaryEl = document.getElementById('autoSummary');
-            const cancelBtn = document.getElementById('autoCancelBtn');
-            const newBtn = document.getElementById('autoNewBtn');
-            const s = job.summary || {};
-            const failed = (s.failed || 0) + (s.failed_invalid_credentials || 0);
-            summaryEl.textContent = `${s.success || 0} ok · ${failed} failed · ${s.needs_manual || 0} manual · ${s.running || 0} running · ${s.queued || 0} queued / ${s.total || 0}`;
-            if (job.done) { cancelBtn.classList.add('hidden'); newBtn.style.display = ''; if (autoPollTimer) { clearInterval(autoPollTimer); autoPollTimer = null; } }
-            else { cancelBtn.classList.remove('hidden'); newBtn.style.display = 'none'; }
-
-            // live frames: one bordered, isolated tile per concurrent worker. The
-            // backend emits previews[] (one entry per active worker); we scale the
-            // grid columns to the concurrency so 4 concurrent logins show 4 frames
-            // side by side, each updating live from its own browser's screencast.
-            const grid = document.getElementById('autoFrameGrid');
-            const frameEmpty = document.getElementById('autoFrameEmpty');
-            const frameLabel = document.getElementById('autoFrameLabel');
-            const previews = (job.previews && job.previews.length) ? job.previews
-                : (job.preview && job.preview.imageData ? [job.preview] : []);
-            if (previews.length) {
-                const cols = Math.min(previews.length, previews.length <= 1 ? 1 : 2);
-                grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-                frameLabel.textContent = `(${previews.length} live)`;
-                grid.innerHTML = previews.map(p => {
-                    const cap = `${escapeHtml(p.email || '')} · w${p.workerId || '-'} · ${escapeHtml(p.step || p.status || '')}`;
-                    return `<div style="border:2px solid #1e293b;border-radius:10px;overflow:hidden;background:#0f172a">
-                        <div style="aspect-ratio:16/10;display:flex;align-items:center;justify-content:center">
-                            <img src="${p.imageData}" alt="browser preview" style="width:100%;height:100%;object-fit:contain">
-                        </div>
-                        <div style="padding:6px 10px;font-size:11px;color:#cbd5e1;background:#1e293b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${cap}</div>
-                    </div>`;
-                }).join('');
-            } else {
-                frameLabel.textContent = '';
-                grid.style.gridTemplateColumns = '1fr';
-                grid.innerHTML = `<div style="background:#0f172a;border-radius:10px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:13px">${job.done ? 'Job finished.' : 'Waiting for live sessions...'}</div>`;
-            }
-
-            // failures block
-            const failBox = document.getElementById('autoFailures');
-            const fails = job.failures || [];
-            if (fails.length) {
-                failBox.innerHTML = `<div style="border:1px solid #fecaca;background:#fef2f2;border-radius:10px;padding:12px 14px">
-                    <div style="font-weight:700;font-size:13px;color:#b91c1c;margin-bottom:8px">Failed accounts (${fails.length})</div>
-                    ${fails.map(f => `<div style="font-size:12px;color:#7f1d1d;padding:3px 0;display:flex;gap:8px"><span style="font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(f.email)}</span><span style="color:#b91c1c">${escapeHtml(f.message || f.status)}</span></div>`).join('')}
-                </div>`;
-            } else { failBox.innerHTML = ''; }
-
-            // per-account list with expandable logs
-            const statusColor = { success: '#16a34a', failed: '#dc2626', failed_invalid_credentials: '#dc2626', needs_manual: '#d97706', running: '#2563eb', queued: '#64748b', cancelled: '#64748b' };
-            const list = document.getElementById('autoProgressList');
-            list.innerHTML = (job.accounts || []).map(a => {
-                const color = statusColor[a.status] || '#64748b';
-                const manualBtn = a.status === 'needs_manual'
-                    ? `<button class="btn btn-sm btn-secondary" onclick="completeAutomation(${a.line})">Done</button>` : '';
-                const quota = a.quota ? `<div style="font-size:11px;color:#16a34a;margin-top:2px">${escapeHtml(a.quota)}</div>` : '';
-                const expanded = !!autoExpanded[a.line];
-                const logHtml = (expanded && a.log && a.log.length)
-                    ? `<div style="margin-top:6px;padding:8px;background:#f8fafc;border-radius:6px;max-height:160px;overflow:auto">${a.log.map(l => `<div style="font-size:11px;color:#475569;font-family:monospace">${escapeHtml((l.message || l.step || ''))}</div>`).join('')}</div>`
-                    : '';
-                return `<div style="padding:10px 14px;border-bottom:1px solid var(--border,#f1f5f9)">
-                    <div style="display:flex;align-items:center;gap:10px">
-                        <span style="width:24px;color:#94a3b8;font-size:11px">#${a.line}</span>
-                        <div style="flex:1;min-width:0;cursor:pointer" onclick="toggleAutoLog(${a.line})">
-                            <div style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.email)}</div>
-                            <div style="font-size:11px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.message || a.step || '')}${a.workerId ? ' · w' + a.workerId : ''}</div>
-                            ${quota}
-                        </div>
-                        <span style="font-size:11px;font-weight:600;color:${color};white-space:nowrap">${escapeHtml(a.status)}</span>
-                        ${manualBtn}
-                    </div>
-                    ${logHtml}
-                </div>`;
-            }).join('') || '<div style="padding:16px;color:#64748b">No accounts</div>';
-        }
-        function toggleAutoLog(line) {
-            autoExpanded[line] = !autoExpanded[line];
-            loadAutomationStatus();
-        }
-        async function cancelAutomation() {
-            if (!confirm('Cancel the running automation job?')) return;
-            await fetch('/admin/api/automation/cancel', { method: 'POST', headers: oauthHeaders() });
-            loadAutomationStatus();
-        }
-        async function completeAutomation(line) {
-            await fetch('/admin/api/automation/complete', { method: 'POST', headers: oauthHeaders(), body: JSON.stringify({ line }) });
-            loadAutomationStatus();
-        }
-
         // Render the connect modal for a provider id.
         async function openOAuthProvider(id) {
             const flow = OAUTH_FLOWS[id];
@@ -6168,9 +5871,9 @@
         // ---- Section navigation (sidebar) ----
         const SECTION_TITLE_KEY = {
             overview: 'nav.overview', accounts: 'tabs.accounts', providers: 'tabs.providers', apikeys: 'tabs.apikeys',
-            analytics: 'tabs.analytics', settings: 'tabs.settings', api: 'tabs.api', automation: 'tabs.automation'
+            analytics: 'tabs.analytics', settings: 'tabs.settings', api: 'tabs.api'
         };
-        const VALID_TABS = ['overview', 'accounts', 'providers', 'apikeys', 'analytics', 'settings', 'api', 'automation'];
+        const VALID_TABS = ['overview', 'accounts', 'providers', 'apikeys', 'analytics', 'settings', 'api'];
         // updateHash controls whether switchTab writes location.hash. It's false
         // only when switchTab is itself driven BY a hash change (so we don't
         // recurse through the hashchange listener).
@@ -6190,7 +5893,6 @@
             if (tab === 'overview') loadOverview();
             else if (tab === 'providers') loadProviders();
             else if (tab === 'apikeys') loadApiKeys();
-            else if (tab === 'automation') { autoShowView('home'); loadAutomationStatus(); }
             else if (tab === 'analytics') {
                 // Ensure the per-key stats source is populated BEFORE rendering.
                 // On a fresh login restored to #analytics, apikeysData is empty
