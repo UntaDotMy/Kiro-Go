@@ -24,4 +24,13 @@ go.work.sum
 kiro2api/
 kiro-gateway/
 research/
+research_kiro/
+kiro-research/
+9router_wyx0/
 .uirebuild/
+
+# Diagnostic / scratch
+cbcheck*.png
+fpverify*.png
+utils.py
+

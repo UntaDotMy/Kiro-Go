@@ -55,6 +55,28 @@ var aliCoderModels = []string{
 	"qwen-coder-turbo", "qwen-coder-turbo-latest", "qwen-coder-turbo-0919",
 }
 
+// codeBuddyModels is the advisory (display-only) model catalog for CodeBuddy.
+// CodeBuddy exposes NO GET /models endpoint (every /v1, /v2, and /v2/plugin
+// models path returns 404), so the live fetch can never populate the list — this
+// is why the dashboard showed 0 models. We ship the real model ids the gateway
+// accepts as an advisory list (SetAdvisoryModelList), so the count is real and
+// clients can route to a named model; a missing id is never shed because the
+// upstream validates at call time. Shared by both hosts (codebuddy CN +
+// codebuddy-ai international), which expose the same lineup.
+//
+// Source: the CodeBuddy CLI's own model definitions (ported from 9router_wyx0's
+// open-sse/config/providerModels.js `cb` set, smoke-verified against
+// www.codebuddy.ai). "default-model" is the gateway's auto-routed default.
+var codeBuddyModels = []string{
+	"default-model", "default-model-lite",
+	"claude-sonnet-4.6", "claude-opus-4.7-1m", "claude-opus-4.6", "claude-haiku-4.5",
+	"gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.1-codex",
+	"gemini-3.1-pro", "gemini-3.0-flash", "gemini-3.5-flash", "gemini-2.5-flash",
+	"gemini-3.1-flash-lite", "gemini-2.5-pro",
+	"deepseek-v3-0324", "glm-5.0", "glm-5v-turbo", "glm-4.6",
+	"kimi-k2.6", "kimi-k2.5",
+}
+
 // builtinProviders is the data-only catalog. The OpenAI-compatible rows are all
 // served by genericProvider with no per-provider code. Ported from 9router's
 // open-sse/config/providers.js (the LLM subset; TTS/STT/image/embedding-only
@@ -85,9 +107,22 @@ var builtinProviders = []builtinProvider{
 	{ID: "vercel-ai-gateway", Alias: "vercel", Name: "Vercel AI Gateway", Dialect: DialectOpenAI, BaseURL: "https://ai-gateway.vercel.sh/v1/chat/completions"},
 
 	// ---- Coding-assistant OpenAI-compatible providers (ported from 9router) ----
-	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v1/chat/completions"},
+	// CodeBuddy ships two interchangeable official hosts (per the CLI's product.json):
+	// the China gateway copilot.tencent.com and the international site www.codebuddy.ai.
+	// Both share the same /v2/plugin/auth OAuth flow (auth/codebuddy_oauth.go); the
+	// backend id selects the host so token refresh hits the gateway the account logged
+	// in against.
+	//
+	// The inference endpoint is /v2/chat/completions (OpenAI dialect) — NOT /v1:
+	// probing shows /v1/chat/completions 404s ("Route Not Found") while
+	// /v2/chat/completions returns 401 (exists, needs auth) and /v2/messages 404s
+	// (so it's OpenAI-shaped, not Anthropic). The old /v1 base was the real cause of
+	// both broken inference and the empty model list. CodeBuddy serves no /models
+	// route, so codeBuddyModels is shipped as an advisory list (see above).
+	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent CN)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v2/chat/completions", OAuth: true, Models: codeBuddyModels},
+	{ID: "codebuddy-ai", Alias: "cbai", Name: "CodeBuddy (International)", Dialect: DialectOpenAI, BaseURL: "https://www.codebuddy.ai/v2/chat/completions", OAuth: true, Models: codeBuddyModels},
 	{ID: "qwen", Alias: "qwen", Name: "Qwen (Alibaba)", Dialect: DialectOpenAI, BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", OAuth: true},
-	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions",
+	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions", OAuth: true, Headers: map[string]string{"User-Agent": "iFlow-Cli"},
 		// iFlow's /models endpoint 404s; advisory catalog. Source: iFlow model
 		// router (mastra.ai/models/providers/iflowcn) — bare ids (the iflowcn/ prefix
 		// is the router's, not iFlow's API id).
@@ -98,8 +133,8 @@ var builtinProviders = []builtinProvider{
 			"qwen3-max", "qwen3-max-preview", "qwen3-vl-plus",
 		}},
 	{ID: "glm-cn", Alias: "glmcn", Name: "GLM (bigmodel.cn)", Dialect: DialectOpenAI, BaseURL: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"},
-	{ID: "kilocode", Alias: "kilo", Name: "Kilo Code", Dialect: DialectOpenAI, BaseURL: "https://api.kilo.ai/api/openrouter/chat/completions"},
-	{ID: "cline", Alias: "cline", Name: "Cline", Dialect: DialectOpenAI, BaseURL: "https://api.cline.bot/api/v1/chat/completions"},
+	{ID: "kilocode", Alias: "kilo", Name: "Kilo Code", Dialect: DialectOpenAI, BaseURL: "https://api.kilo.ai/api/openrouter/chat/completions", OAuth: true},
+	{ID: "cline", Alias: "cline", Name: "Cline", Dialect: DialectOpenAI, BaseURL: "https://api.cline.bot/api/v1/chat/completions", OAuth: true, Headers: map[string]string{"HTTP-Referer": "https://cline.bot", "X-Title": "Cline"}},
 	{ID: "longcat", Alias: "longcat", Name: "LongCat (Meituan)", Dialect: DialectOpenAI, BaseURL: "https://api.longcat.chat/openai/v1/chat/completions"},
 	{ID: "alicode", Alias: "alicode", Name: "Alibaba Code", Dialect: DialectOpenAI, BaseURL: "https://coding.dashscope.aliyuncs.com/v1/chat/completions", Models: aliCoderModels},
 	{ID: "alicode-intl", Alias: "alicodeintl", Name: "Alibaba Code (Intl)", Dialect: DialectOpenAI, BaseURL: "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions", Models: aliCoderModels},
@@ -113,7 +148,7 @@ var builtinProviders = []builtinProvider{
 	{ID: "dashscope", Alias: "dashscope", Name: "Alibaba Model Studio (China)", Dialect: DialectOpenAI, BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"},
 	{ID: "dashscope-intl", Alias: "dashscopeintl", Name: "Alibaba Model Studio (Intl)", Dialect: DialectOpenAI, BaseURL: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"},
 	{ID: "dashscope-us", Alias: "dashscopeus", Name: "Alibaba Model Studio (US)", Dialect: DialectOpenAI, BaseURL: "https://dashscope-us.aliyuncs.com/compatible-mode/v1/chat/completions"},
-	{ID: "gitlab", Alias: "gitlab", Name: "GitLab Duo", Dialect: DialectOpenAI, BaseURL: "https://gitlab.com/api/v4/chat/completions"},
+	{ID: "gitlab", Alias: "gitlab", Name: "GitLab Duo", Dialect: DialectOpenAI, BaseURL: "https://gitlab.com/api/v4/chat/completions", OAuth: true},
 
 	// ---- Additional OpenAI-compatible inference providers (ported from 9router) ----
 	{ID: "novita", Alias: "novita", Name: "Novita AI", Dialect: DialectOpenAI, BaseURL: "https://api.novita.ai/v3/openai/chat/completions"},
@@ -128,16 +163,97 @@ var builtinProviders = []builtinProvider{
 	{ID: "morph", Alias: "morph", Name: "Morph", Dialect: DialectOpenAI, BaseURL: "https://api.morphllm.com/v1/chat/completions"},
 	{ID: "xiaomi-mimo", Alias: "mimo", Name: "Xiaomi MiMo", Dialect: DialectOpenAI, BaseURL: "https://api.xiaomimimo.com/v1/chat/completions"},
 
+	// GitHub Copilot: OpenAI-compatible inference at api.githubcopilot.com, auth via
+	// the OAuth device flow (auth/github_oauth.go) that mints a short-lived Copilot
+	// token. The editor/copilot headers are REQUIRED by the Copilot gateway.
+	{ID: "github", Alias: "ghcp", Name: "GitHub Copilot", Dialect: DialectOpenAI, BaseURL: "https://api.githubcopilot.com/chat/completions", OAuth: true,
+		Headers: map[string]string{
+			"copilot-integration-id": "vscode-chat",
+			"editor-version":         "vscode/1.110.0",
+			"editor-plugin-version":  "copilot-chat/0.38.0",
+			"User-Agent":             "GitHubCopilotChat/0.38.0",
+			"openai-intent":          "conversation-panel",
+			"x-github-api-version":   "2025-04-01",
+		}},
+
+	// ---- Additional OpenAI-compatible providers ported from 9router's APIKEY_PROVIDERS
+	// set (open-sse/config/providers.js). Bearer auth + DialectOpenAI unless noted.
+	// These had backend config in 9router (some with the UI entry commented out) but
+	// no Kiro-Go catalog row yet. All bring-your-own-key. ----
+	{ID: "byteplus", Alias: "bpm", Name: "BytePlus ModelArk", Dialect: DialectOpenAI, BaseURL: "https://ark.ap-southeast.bytepluses.com/api/coding/v3/chat/completions"},
+	{ID: "volcengine-ark", Alias: "ark", Name: "Volcengine Ark", Dialect: DialectOpenAI, BaseURL: "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"},
+	{ID: "blackbox", Alias: "blackbox", Name: "Blackbox AI", Dialect: DialectOpenAI, BaseURL: "https://api.blackbox.ai/chat/completions"},
+	{ID: "opencode-go", Alias: "ocgo", Name: "OpenCode Go", Dialect: DialectOpenAI, BaseURL: "https://opencode.ai/zen/go/v1/chat/completions"},
+	{ID: "reka", Alias: "reka", Name: "Reka AI", Dialect: DialectOpenAI, BaseURL: "https://api.reka.ai/v1/chat/completions"},
+	{ID: "nlpcloud", Alias: "nlpcloud", Name: "NLP Cloud", Dialect: DialectOpenAI, BaseURL: "https://api.nlpcloud.io/v1/gpu/chatbot"},
+	{ID: "bazaarlink", Alias: "bazaarlink", Name: "BazaarLink", Dialect: DialectOpenAI, BaseURL: "https://bazaarlink.ai/api/v1/chat/completions"},
+	{ID: "completions", Alias: "completions", Name: "Completions.me", Dialect: DialectOpenAI, BaseURL: "https://completions.me/api/v1/chat/completions"},
+	{ID: "freetheai", Alias: "freetheai", Name: "FreeTheAI", Dialect: DialectOpenAI, BaseURL: "https://api.freetheai.xyz/v1/chat/completions"},
+	{ID: "llm7", Alias: "llm7", Name: "LLM7", Dialect: DialectOpenAI, BaseURL: "https://api.llm7.io/v1/chat/completions"},
+	{ID: "lepton", Alias: "lepton", Name: "Lepton AI", Dialect: DialectOpenAI, BaseURL: "https://api.lepton.ai/api/v1/chat/completions"},
+	{ID: "predibase", Alias: "predibase", Name: "Predibase", Dialect: DialectOpenAI, BaseURL: "https://serving.app.predibase.com/v1/chat/completions"},
+	{ID: "nous-research", Alias: "nous", Name: "Nous Research", Dialect: DialectOpenAI, BaseURL: "https://inference-api.nousresearch.com/v1/chat/completions"},
+	{ID: "publicai", Alias: "publicai", Name: "Public AI", Dialect: DialectOpenAI, BaseURL: "https://api.publicai.co/v1/chat/completions"},
+	{ID: "glhf", Alias: "glhf", Name: "glhf.chat", Dialect: DialectOpenAI, BaseURL: "https://glhf.chat/api/openai/v1/chat/completions"},
+	{ID: "puter", Alias: "puter", Name: "Puter AI", Dialect: DialectOpenAI, BaseURL: "https://api.puter.com/puterai/openai/v1/chat/completions"},
+	{ID: "lambda", Alias: "lambda", Name: "Lambda", Dialect: DialectOpenAI, BaseURL: "https://api.lambda.ai/v1/chat/completions"},
+	// enally uses an x-api-key header instead of Bearer (per 9router config).
+	{ID: "enally", Alias: "enally", Name: "Enally", Dialect: DialectOpenAI, AuthHeader: "x-api-key", BaseURL: "https://ai.enally.in/v1/chat/completions"},
+
 	// ---- Anthropic Messages dialect (x-api-key auth) ----
 	{ID: "anthropic", Alias: "anthropic", Name: "Anthropic", Dialect: DialectAnthropic, BaseURL: "https://api.anthropic.com/v1/messages", Headers: sharedClaudeHeaders},
+	// Claude Code: same Anthropic endpoint as the api-key "anthropic" row, but auth
+	// is an OAuth Bearer token (auth/claude_oauth.go), NOT x-api-key — so AuthHeader
+	// is "bearer" and the oauth beta flag is added to the version/beta headers.
+	{ID: "claude-code", Alias: "cc", Name: "Claude Code (OAuth)", Dialect: DialectAnthropic, BaseURL: "https://api.anthropic.com/v1/messages", AuthHeader: "bearer", OAuth: true,
+		Headers: map[string]string{
+			"Anthropic-Version": "2023-06-01",
+			"Anthropic-Beta":    "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14",
+		}},
 	{ID: "glm", Alias: "glm", Name: "GLM Coding", Dialect: DialectAnthropic, BaseURL: "https://api.z.ai/api/anthropic/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "kimi", Alias: "kimi", Name: "Kimi", Dialect: DialectAnthropic, BaseURL: "https://api.kimi.com/coding/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "minimax", Alias: "minimax", Name: "MiniMax", Dialect: DialectAnthropic, BaseURL: "https://api.minimax.io/anthropic/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "minimax-cn", Alias: "minimaxcn", Name: "MiniMax (CN)", Dialect: DialectAnthropic, BaseURL: "https://api.minimaxi.com/anthropic/v1/messages", Headers: sharedClaudeHeaders},
 	{ID: "agentrouter", Alias: "ar", Name: "AgentRouter", Dialect: DialectAnthropic, BaseURL: "https://agentrouter.org/v1/messages", Headers: sharedClaudeHeaders},
+	// Kimi Coding (Moonshot): Anthropic-compatible coding endpoint, but auth is the
+	// OAuth device flow (auth/kimi_coding_oauth.go), not a pasted api key. /models 404s.
+	{ID: "kimi-coding", Alias: "kc", Name: "Kimi Coding (Moonshot)", Dialect: DialectAnthropic, BaseURL: "https://api.kimi.com/coding/v1/messages", Headers: sharedClaudeHeaders, OAuth: true},
 
 	// ---- Google Gemini dialect (x-goog-api-key auth) ----
 	{ID: "gemini", Alias: "gemini", Name: "Gemini", Dialect: DialectGemini, BaseURL: "https://generativelanguage.googleapis.com/v1beta/models"},
+	// Gemini CLI (Cloud Code Assist): bespoke provider (proxy/provider_gemini_cli.go)
+	// with Google OAuth login. BaseURL is informational — the provider hardcodes the
+	// cloudcode-pa endpoint.
+	{ID: "gemini-cli", Alias: "gcli", Name: "Gemini CLI (Cloud Code Assist)", Dialect: DialectGeminiCLI, BaseURL: "https://cloudcode-pa.googleapis.com/v1internal", OAuth: true},
+	// Antigravity: second Cloud Code Assist provider (bespoke, proxy/provider_antigravity.go),
+	// Google OAuth login with its own client + the daily-cloudcode endpoint.
+	{ID: "antigravity", Alias: "ag", Name: "Antigravity (Cloud Code Assist)", Dialect: DialectGeminiCLI, BaseURL: "https://daily-cloudcode-pa.googleapis.com/v1internal", OAuth: true},
+	// Vertex AI: bespoke provider (proxy/provider_vertex.go) with Service-Account JSON
+	// auth. Dialect is informational — the provider builds the regional URL + Gemini
+	// body itself. OAuth:true routes it to the SA-import connect flow, not api-key paste.
+	{ID: "vertex", Alias: "vertex", Name: "Vertex AI (Service Account)", Dialect: DialectGemini, BaseURL: "https://aiplatform.googleapis.com", OAuth: true},
+
+	// ---- Ollama dialect (/api/chat NDJSON) ----
+	// ollama is the hosted Ollama Cloud (Bearer api key); ollama-local targets a
+	// local daemon (no auth). Both speak /api/chat and list models at /api/tags.
+	{ID: "ollama", Alias: "ollama", Name: "Ollama Cloud", Dialect: DialectOllama, BaseURL: "https://ollama.com/api/chat"},
+	{ID: "ollama-local", Alias: "ollamalocal", Name: "Ollama (Local)", Dialect: DialectOllama, BaseURL: "http://localhost:11434/api/chat"},
+
+	// ---- Web-subscription providers (cookie auth, bespoke providers) ----
+	// grok-web (grok.com sso cookie) and perplexity-web (perplexity.ai session
+	// cookie). Dialect is informational — both have bespoke providers that build the
+	// request and parse the custom stream. OAuth:true routes to the cookie-import flow.
+	{ID: "grok-web", Alias: "gw", Name: "Grok (Web Subscription)", Dialect: DialectOpenAI, BaseURL: "https://grok.com/rest/app-chat/conversations/new", OAuth: true},
+	{ID: "perplexity-web", Alias: "pw", Name: "Perplexity (Web Subscription)", Dialect: DialectOpenAI, BaseURL: "https://www.perplexity.ai/rest/sse/perplexity_ask", OAuth: true},
+	// Cursor IDE: bespoke provider (proxy/provider_cursor.go) speaking Connect-RPC
+	// protobuf. Token + machine id are imported from the Cursor IDE. Dialect is
+	// informational. OAuth:true routes to the token-import flow.
+	{ID: "cursor", Alias: "cur", Name: "Cursor IDE", Dialect: DialectOpenAI, BaseURL: "https://api2.cursor.sh", OAuth: true},
+
+	// ---- Embedding providers (OpenAI-compatible /embeddings; served via the
+	// /v1/embeddings passthrough, see embeddings.go) ----
+	{ID: "voyage-ai", Alias: "voyage", Name: "Voyage AI (Embeddings)", Dialect: DialectOpenAI, BaseURL: "https://api.voyageai.com/v1/embeddings"},
+	{ID: "jina-ai", Alias: "jina", Name: "Jina AI (Embeddings)", Dialect: DialectOpenAI, BaseURL: "https://api.jina.ai/v1/embeddings"},
 }
 
 // builtinByID / builtinByAlias index the catalog for O(1) lookup. Built once at

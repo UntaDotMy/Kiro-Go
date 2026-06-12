@@ -816,6 +816,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleOpenAIChat(w, r)
+	case path == "/v1/embeddings" || path == "/embeddings":
+		if !h.validateApiKey(r) {
+			h.sendOpenAIError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
+		if h.enforceGlobalRateLimit(w, "embeddings") {
+			return
+		}
+		h.handleEmbeddings(w, r)
 	case path == "/v1/responses" || path == "/responses" || path == "/openai/v1/responses" || path == "/backend-api/codex/responses":
 		// Codex CLI uses /backend-api/codex/responses; the OpenAI Responses
 		// API path is /v1/responses. Both routes accept either HTTP POST
@@ -3654,6 +3663,70 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartQwenLogin(w, r)
 	case path == "/auth/qwen/poll" && r.Method == "POST":
 		h.apiPollQwenLogin(w, r)
+	case path == "/auth/codebuddy/start" && r.Method == "POST":
+		h.apiStartCodeBuddyLogin(w, r)
+	case path == "/auth/codebuddy/poll" && r.Method == "POST":
+		h.apiPollCodeBuddyLogin(w, r)
+	case path == "/auth/codebuddy-ai/start" && r.Method == "POST":
+		h.apiStartCodeBuddyLogin(w, r)
+	case path == "/auth/codebuddy-ai/poll" && r.Method == "POST":
+		h.apiPollCodeBuddyLogin(w, r)
+	case path == "/automation/start" && r.Method == "POST":
+		h.apiStartAutomation(w, r)
+	case path == "/automation/status" && r.Method == "GET":
+		h.apiAutomationStatus(w, r)
+	case path == "/automation/cancel" && r.Method == "POST":
+		h.apiAutomationCancel(w, r)
+	case path == "/automation/complete" && r.Method == "POST":
+		h.apiAutomationComplete(w, r)
+	case strings.HasPrefix(path, "/automation/quota/") && r.Method == "POST":
+		h.apiSyncCodeBuddyQuota(w, r, strings.TrimPrefix(path, "/automation/quota/"))
+	case path == "/auth/kimi-coding/start" && r.Method == "POST":
+		h.apiStartKimiCodingLogin(w, r)
+	case path == "/auth/kimi-coding/poll" && r.Method == "POST":
+		h.apiPollKimiCodingLogin(w, r)
+	case path == "/auth/kilocode/start" && r.Method == "POST":
+		h.apiStartKilocodeLogin(w, r)
+	case path == "/auth/kilocode/poll" && r.Method == "POST":
+		h.apiPollKilocodeLogin(w, r)
+	case path == "/auth/github/start" && r.Method == "POST":
+		h.apiStartGitHubLogin(w, r)
+	case path == "/auth/github/poll" && r.Method == "POST":
+		h.apiPollGitHubLogin(w, r)
+	case path == "/auth/claude/start" && r.Method == "POST":
+		h.apiStartClaudeLogin(w, r)
+	case path == "/auth/claude/complete" && r.Method == "POST":
+		h.apiCompleteClaudeLogin(w, r)
+	case path == "/auth/xai/start" && r.Method == "POST":
+		h.apiStartXaiLogin(w, r)
+	case path == "/auth/xai/poll" && r.Method == "POST":
+		h.apiPollXaiLogin(w, r)
+	case path == "/auth/cline/start" && r.Method == "POST":
+		h.apiStartClineLogin(w, r)
+	case path == "/auth/cline/complete" && r.Method == "POST":
+		h.apiCompleteClineLogin(w, r)
+	case path == "/auth/iflow/start" && r.Method == "POST":
+		h.apiStartIFlowLogin(w, r)
+	case path == "/auth/iflow/poll" && r.Method == "POST":
+		h.apiPollIFlowLogin(w, r)
+	case path == "/auth/gitlab/start" && r.Method == "POST":
+		h.apiStartGitLabLogin(w, r)
+	case path == "/auth/gitlab/complete" && r.Method == "POST":
+		h.apiCompleteGitLabLogin(w, r)
+	case path == "/auth/gemini-cli/start" && r.Method == "POST":
+		h.apiStartGeminiCLILogin(w, r)
+	case path == "/auth/gemini-cli/poll" && r.Method == "POST":
+		h.apiPollGeminiCLILogin(w, r)
+	case path == "/auth/antigravity/start" && r.Method == "POST":
+		h.apiStartAntigravityLogin(w, r)
+	case path == "/auth/antigravity/poll" && r.Method == "POST":
+		h.apiPollAntigravityLogin(w, r)
+	case path == "/auth/vertex/import" && r.Method == "POST":
+		h.apiImportVertexServiceAccount(w, r)
+	case path == "/auth/cookie/import" && r.Method == "POST":
+		h.apiImportCookieProvider(w, r)
+	case path == "/auth/cursor/import" && r.Method == "POST":
+		h.apiImportCursorToken(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -3970,9 +4043,9 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["baseURL"].(string); ok && !isKiro {
 		tv := strings.TrimSpace(v)
-		if tv != "" && !strings.HasPrefix(strings.ToLower(tv), "https://") {
+		if tv != "" && !isValidBaseURLScheme(tv) {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL must use https://"})
+			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
 			return
 		}
 		// A self-contained custom account's BaseURLOverride is its ONLY URL —
@@ -4630,6 +4703,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"host":                     config.GetHost(),
 		"allowOverUsage":           config.GetAllowOverUsage(),
 		"webSearchEnabled":         config.GetWebSearchEnabled(),
+		"webSearchProvider":        config.GetWebSearchProvider(),
+		"webSearchApiKeySet":       config.GetWebSearchAPIKey() != "",
 		"toolSearchEnabled":        config.GetToolSearchEnabled(),
 		"globalRateLimitPerMinute": config.GetGlobalRateLimitPerMinute(),
 	})
@@ -4773,6 +4848,8 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		CurrentPassword          *string `json:"currentPassword,omitempty"`
 		AllowOverUsage           *bool   `json:"allowOverUsage,omitempty"`
 		WebSearchEnabled         *bool   `json:"webSearchEnabled,omitempty"`
+		WebSearchProvider        *string `json:"webSearchProvider,omitempty"`
+		WebSearchApiKey          *string `json:"webSearchApiKey,omitempty"`
 		ToolSearchEnabled        *bool   `json:"toolSearchEnabled,omitempty"`
 		GlobalRateLimitPerMinute *int    `json:"globalRateLimitPerMinute,omitempty"`
 	}
@@ -4811,6 +4888,44 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Web-search emulation toggle (opt-in; default off).
 	if req.WebSearchEnabled != nil {
 		if err := config.UpdateWebSearchEnabled(*req.WebSearchEnabled); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// External web-search provider selection (default "kiro"). When set to an
+	// external provider, validate the id and (re)persist provider + key. An empty
+	// provider string resets to the Kiro MCP default; a nil pointer leaves it
+	// unchanged. The key is only overwritten when supplied.
+	if req.WebSearchProvider != nil {
+		prov := strings.ToLower(strings.TrimSpace(*req.WebSearchProvider))
+		if prov != "" && prov != "kiro" {
+			valid := false
+			for _, id := range externalSearchProviderIDs() {
+				if id == prov {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "unknown webSearchProvider; valid: kiro, " + strings.Join(externalSearchProviderIDs(), ", ")})
+				return
+			}
+		}
+		key := config.GetWebSearchAPIKey()
+		if req.WebSearchApiKey != nil {
+			key = *req.WebSearchApiKey
+		}
+		if err := config.UpdateWebSearchProvider(prov, key); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	} else if req.WebSearchApiKey != nil {
+		// Key supplied without changing the provider — update just the key.
+		if err := config.UpdateWebSearchProvider(config.GetWebSearchProvider(), *req.WebSearchApiKey); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

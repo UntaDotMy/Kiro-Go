@@ -32,7 +32,7 @@ func TestBuiltinProviderCatalogNoDuplicates(t *testing.T) {
 		}
 
 		switch p.Dialect {
-		case DialectOpenAI, DialectAnthropic, DialectGemini:
+		case DialectOpenAI, DialectAnthropic, DialectGemini, DialectOllama, DialectGeminiCLI:
 			// ok
 		default:
 			t.Errorf("provider %q has unsupported dialect %q", p.ID, p.Dialect)

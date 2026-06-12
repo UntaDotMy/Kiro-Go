@@ -307,15 +307,25 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 		assistantBlocks := buildAssistantToolUseBlocks(res.content, searchCalls)
 		messages = append(messages, ClaudeMessage{Role: "assistant", Content: assistantBlocks})
 
-		// The MCP search side-call ALWAYS runs on a Kiro account, regardless of the
-		// inference backend (the search endpoint is Kiro-specific). Resolve it once
-		// per round.
+		// Resolve the search backend once per round. Default is Kiro's MCP search
+		// (Kiro account required); when an external provider is configured
+		// (config.WebSearchProvider), searches go there instead and NO Kiro account
+		// is needed — so a pure DashScope/Gemini deployment can still emulate
+		// hosted web_search.
 		searchAccount := h.firstUsableKiroAccount()
+		extProvider := config.GetWebSearchProvider()
+		extKey := config.GetWebSearchAPIKey()
 
 		var resultBlocks []interface{}
 		for _, call := range searchCalls {
 			query := extractWebSearchQuery(call.Input)
-			results, searchErr := performKiroWebSearch(context.Background(), searchAccount, query)
+			var results []WebSearchResult
+			var searchErr error
+			if extProvider != "" && extProvider != "kiro" {
+				results, searchErr = performExternalWebSearch(context.Background(), extProvider, extKey, query)
+			} else {
+				results, searchErr = performKiroWebSearch(context.Background(), searchAccount, query)
+			}
 			logWebSearch(query, len(results), searchErr)
 
 			feedback := formatWebSearchForModel(query, results)

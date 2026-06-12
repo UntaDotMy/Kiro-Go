@@ -27,9 +27,19 @@ func init() {
 	RegisterProvider(&genericProvider{dialect: DialectOpenAI})
 	RegisterProvider(&genericProvider{dialect: DialectAnthropic})
 	RegisterProvider(&genericProvider{dialect: DialectGemini})
+	RegisterProvider(&genericProvider{dialect: DialectOllama})
 }
 
 func (g *genericProvider) Name() string { return "generic:" + string(g.dialect) }
+
+// sharedOpenAIInference is a reusable generic OpenAI provider instance for callers
+// that need model-fetching/inference for an api-key account without owning their
+// own instance (e.g. the iFlow login handler, whose resolved apiKey routes through
+// the generic OpenAI path).
+var sharedOpenAIInference = &genericProvider{dialect: DialectOpenAI}
+
+// genericOpenAIInference returns the shared generic OpenAI provider instance.
+func genericOpenAIInference() *genericProvider { return sharedOpenAIInference }
 
 // providerSettings is the resolved, ready-to-use config for one backend id,
 // merged from the built-in catalog and/or a user config.ProviderConfig plus any
@@ -90,6 +100,21 @@ func resolveProviderSettings(acct *config.Account) (providerSettings, bool) {
 	if acct != nil && strings.TrimSpace(acct.BaseURLOverride) != "" {
 		ps.baseURL = strings.TrimSpace(acct.BaseURLOverride)
 	}
+	// Per-account ExtraHeaders merge OVER the provider's static headers (e.g.
+	// Kilo Code's X-Kilocode-OrganizationID learned at login). Copy-on-merge so we
+	// never mutate the shared catalog map.
+	if acct != nil && len(acct.ExtraHeaders) > 0 {
+		merged := make(map[string]string, len(ps.headers)+len(acct.ExtraHeaders))
+		for k, v := range ps.headers {
+			merged[k] = v
+		}
+		for k, v := range acct.ExtraHeaders {
+			if strings.TrimSpace(v) != "" {
+				merged[k] = v
+			}
+		}
+		ps.headers = merged
+	}
 	return ps, true
 }
 
@@ -108,8 +133,11 @@ func (ps providerSettings) apiBase() string {
 		return strings.TrimSuffix(u, "/messages")
 	case DialectGemini:
 		return u
+	case DialectOllama:
+		// Ollama base is the API root (.../api); the catalog stores .../api/chat.
+		return strings.TrimSuffix(u, "/chat")
 	default: // openai-compatible
-		for _, suffix := range []string{"/chat/completions", "/responses", "/completions"} {
+		for _, suffix := range []string{"/chat/completions", "/responses", "/completions", "/embeddings"} {
 			if strings.HasSuffix(u, suffix) {
 				return strings.TrimSuffix(u, suffix)
 			}
@@ -126,19 +154,25 @@ func (ps providerSettings) chatURL() string {
 	switch ps.dialect {
 	case DialectAnthropic:
 		return base + "/messages"
+	case DialectOllama:
+		return base + "/chat"
 	default:
 		return base + "/chat/completions"
 	}
 }
 
 // modelsURL returns the GET model-listing endpoint. OpenAI/Anthropic expose
-// {base}/models; Gemini's base IS the models endpoint.
+// {base}/models; Gemini's base IS the models endpoint; Ollama uses {base}/tags.
 func (ps providerSettings) modelsURL() string {
 	base := ps.apiBase()
-	if ps.dialect == DialectGemini {
+	switch ps.dialect {
+	case DialectGemini:
 		return base
+	case DialectOllama:
+		return base + "/tags"
+	default:
+		return base + "/models"
 	}
-	return base + "/models"
 }
 
 // RefreshToken is a no-op for api-key providers: there is nothing to renew, so we
@@ -416,6 +450,11 @@ func (g *genericProvider) buildRequest(ps providerSettings, nr *NormalizedReques
 			body = injectNativeWebSearch(nativeKind, body)
 		}
 		return url, body, err
+	case DialectOllama:
+		// Ollama's /api/chat takes an OpenAI-ish messages array but its own envelope
+		// (stream flag at top level, no max_tokens). buildOllamaChatBody converts.
+		body, err := buildOllamaChatBody(nr, upstreamModel)
+		return ps.chatURL(), body, err
 	default:
 		return "", nil, fmt.Errorf("unsupported dialect %q", ps.dialect)
 	}
@@ -430,6 +469,8 @@ func (g *genericProvider) parseStream(ps providerSettings, r io.Reader, cb *Kiro
 		return parseAnthropicSSE(r, cb)
 	case DialectGemini:
 		return parseGeminiSSE(r, cb)
+	case DialectOllama:
+		return parseOllamaStream(r, cb)
 	default:
 		return fmt.Errorf("unsupported dialect %q", ps.dialect)
 	}
