@@ -153,12 +153,28 @@ func (h *Handler) handleDashboardWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// Apply the SAME per-IP brute-force lockout as the HTTP admin path
+	// (handler.go admin gate). Without this the WS upgrade was an unthrottled
+	// password-guessing oracle: an attacker could retry passwords as fast as
+	// bcrypt allows, bypassing the lockout that protects /admin/api/*. Gate the
+	// attempt BEFORE VerifyPassword so a locked-out IP never even reaches the
+	// (expensive, but still finite-rate) compare.
+	if !h.allowAdminAttempt(r) {
+		w.WriteHeader(429)
+		return
+	}
 	if !config.VerifyPassword(password) {
-		// Don't reveal whether the issue was missing protocol vs wrong
+		// Count this failure toward the per-IP lockout, exactly like the HTTP
+		// path. Don't reveal whether the issue was missing protocol vs wrong
 		// password — both surface as 401 to the upgrade attempt.
+		h.recordAdminFailure(r)
+		logger.Warnf("[DashboardWS] failed auth from %s", clientIP(r))
 		w.WriteHeader(401)
 		return
 	}
+	// Successful auth clears the IP's failure counter so a previously-suspect IP
+	// that gets the password right isn't left rate-limited.
+	h.resetAdminFailures(r)
 
 	// Echo a STATIC, non-sensitive subprotocol back so the browser handshake
 	// completes without leaking the password in the 101 response header. The

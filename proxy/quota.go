@@ -148,13 +148,23 @@ func (h *Handler) recordAttemptError(err error, accountID string) {
 	h.checkOverageError(err, accountID)
 }
 
-// maxFailoverAttempts bounds how many distinct accounts a single request will
-// try before giving up. Each attempt picks a different eligible account
-// (the failed ones are excluded), so this also caps worst-case added latency
-// to maxFailoverAttempts upstream round-trips. 3 is enough to ride over a
-// couple of accounts that throttle at call time without turning one client
-// request into a pool-wide stampede.
-const maxFailoverAttempts = 3
+// maxFailoverAttempts is the CEILING on how many distinct accounts a single
+// request will try before giving up. The actual budget per request is
+// min(eligibleAccounts, maxFailoverAttempts) — see failoverBudget — so a small
+// pool isn't over-tried and a large pool isn't artificially capped at a tiny
+// constant while many healthy accounts go untried (the reliability gap the pool
+// audit flagged). Each attempt picks a different eligible account (failed ones
+// are excluded), so this also bounds worst-case added latency to this many
+// upstream round-trips. The ceiling keeps a pathological pool (hundreds of
+// dead accounts) from turning one client request into a pool-wide stampede.
+const maxFailoverAttempts = 10
+
+// minFailoverAttempts is the FLOOR on the per-request attempt budget. It applies
+// when the addressable pool size can't be determined (count returns 0, e.g. a
+// bespoke test pool) so failover still has the historical headroom to ride over
+// a couple of just-throttled accounts. It also guarantees a single-account pool
+// still gets a real attempt.
+const minFailoverAttempts = 3
 
 // saturationPollHint is the upper bound (inclusive) on a pool retryAfter that
 // the dispatcher treats as "busy, slot will free shortly" rather than "cooling,

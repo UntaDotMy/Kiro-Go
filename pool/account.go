@@ -176,6 +176,17 @@ type cooldownEntry struct {
 	lastErrorAt     time.Time     // for decay
 	consecutiveErrs int           // consecutive non-quota errors
 
+	// quotaExhaustedUntil marks a HARD quota / OVERAGE park (HTTP 402 OVERAGE),
+	// set by RecordQuotaExhaustion, distinct from the short soft-429 `until`. A
+	// 402 OVERAGE means the upstream REJECTED the request because the account is
+	// billed past its cap, so re-routing there just produces more 402s for the
+	// whole park window. Unlike the soft cooldown, this park is honored by EVERY
+	// strategy — including "fast" — because fast's cooldown bypass (route by free
+	// capacity) only makes sense for a transient throttle, not an exhausted
+	// account. Cleared on a successful request (RecordSuccess) or an explicit
+	// health clear. Zero = not parked.
+	quotaExhaustedUntil time.Time
+
 	// Adaptive concurrency (least-request strategy). inflight is the number of
 	// requests currently reserved on this account; limit is the live ceiling the
 	// picker enforces. limit==0 means "uninitialized" — treated as the pool's
@@ -868,6 +879,18 @@ func (p *AccountPool) pick(backend, model string, exclude map[string]bool, reser
 		if isTokenLimitExhausted(*acc) {
 			continue
 		}
+		// Hard quota / OVERAGE park is honored by EVERY strategy, INCLUDING
+		// "fast". A 402 OVERAGE means the upstream rejected the request because
+		// the account is billed past its cap; routing there again just yields
+		// more 402s for the whole park window. This is distinct from the soft
+		// 429 cooldown below, which fast deliberately bypasses (route by free
+		// capacity). Cleared by RecordSuccess / ClearSoftCooldownIfHealthy.
+		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.quotaExhaustedUntil) {
+			if soonest.IsZero() || cd.quotaExhaustedUntil.Before(soonest) {
+				soonest = cd.quotaExhaustedUntil
+			}
+			continue
+		}
 		// Soft 429 cooldown is honored by every strategy EXCEPT "fast", which
 		// routes purely by free capacity — an in-use account simply isn't picked
 		// until it frees, and a 429'd account is steered around by load, not by a
@@ -1212,6 +1235,7 @@ func (p *AccountPool) RecordSuccess(id string) {
 	initial, max := p.concurrencyBounds()
 	// Clear soft-cooldown / error state.
 	cd.until = time.Time{}
+	cd.quotaExhaustedUntil = time.Time{} // a success means the account is serving again
 	cd.consecutiveErrs = 0
 	cd.lastSleep = 0
 	// Grow the limit, gated on actually using it so an idle account doesn't
@@ -1396,6 +1420,10 @@ func (p *AccountPool) RecordQuotaExhaustion(id string) {
 	cd.lastErrorAt = now
 	cd.until = now.Add(quotaExhaustedCooldown)
 	cd.lastSleep = quotaExhaustedCooldown
+	// Mark the HARD quota park so EVERY strategy (incl. "fast") skips this
+	// account until the park expires — a 402 OVERAGE means the request was
+	// rejected, so fast's "route by free capacity" cooldown bypass must not apply.
+	cd.quotaExhaustedUntil = now.Add(quotaExhaustedCooldown)
 	cd.consecutiveErrs = 0
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
@@ -1408,12 +1436,16 @@ func (p *AccountPool) RecordQuotaExhaustion(id string) {
 // ClearSoftCooldownIfHealthy is called from RefreshAccountInfo after a
 // successful refresh confirms the account is still healthy (well under its
 // usage limit). It clears the soft cooldown so the account can re-enter
-// rotation immediately rather than waiting for the cooldown to expire.
+// rotation immediately rather than waiting for the cooldown to expire. The
+// hard quota/OVERAGE park is cleared too: a refresh that confirms the account
+// is under its limit means the overage condition is gone, so the account should
+// rejoin rotation without waiting out the full park window.
 func (p *AccountPool) ClearSoftCooldownIfHealthy(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if cd, ok := p.cooldowns[id]; ok {
 		cd.until = time.Time{}
+		cd.quotaExhaustedUntil = time.Time{}
 		cd.consecutiveErrs = 0
 		cd.lastSleep = 0
 	}
@@ -1455,6 +1487,58 @@ func (p *AccountPool) AvailableCount() int {
 		}
 		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			continue
+		}
+		count++
+	}
+	return count
+}
+
+// EligibleCountForBackendModel reports how many DISTINCT accounts a request for
+// (backend, model) could be routed to right now, applying the same eligibility
+// predicate as the picker EXCEPT the per-account concurrency gate (which is a
+// transient "busy", not "can't serve"): backend match, model match, token not
+// about to expire, per-account token cap not exhausted, and — for every strategy
+// except "fast" — not currently in soft 429 cooldown. backend == "" / model == ""
+// mean "no constraint" on that dimension, matching pick().
+//
+// The failover dispatcher uses this to size its attempt budget to the real
+// addressable pool instead of a fixed constant, so a large pool isn't capped at
+// 3 tries while many healthy accounts go untried. It intentionally counts
+// cooled accounts as eligible under "fast" (fast routes by free capacity, not
+// cooldown), exactly as pick() would consider them.
+func (p *AccountPool) EligibleCountForBackendModel(backend, model string) int {
+	strategy := strategyResolver()
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	modelKey := strings.ToLower(strings.TrimSpace(model))
+	backendKey := strings.ToLower(strings.TrimSpace(backend))
+
+	count := 0
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if backendKey != "" && config.GetAccountBackend(acc) != backendKey {
+			continue
+		}
+		if modelKey != "" && !p.accountHasModel(acc.ID, modelKey) {
+			continue
+		}
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			continue
+		}
+		if isTokenLimitExhausted(*acc) {
+			continue
+		}
+		// Hard quota / OVERAGE park is honored by every strategy (incl. fast).
+		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.quotaExhaustedUntil) {
+			continue
+		}
+		if strategy != "fast" {
+			if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd.until) {
+				continue
+			}
 		}
 		count++
 	}

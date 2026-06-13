@@ -1,26 +1,44 @@
 package proxy
 
+import (
+	"os"
+
+	"kiro-go/logger"
+)
+
 // ============================================================================
 // Gemini JSON-Schema sanitization.
 //
-// Gemini's functionDeclarations.parameters accepts only a SUBSET of JSON Schema
-// (an OpenAPI-3.0 "Schema" object). A request whose tool schema carries keywords
-// outside that subset — which Claude Code, OpenAI SDKs, and most MCP tools emit by
-// default ($schema, additionalProperties, $ref, oneOf/anyOf/allOf, const, format
-// on the wrong types, etc.) — is rejected with HTTP 400, and the WHOLE request
-// fails. So tool calling to any Gemini provider is dead-on-arrival unless we strip
-// the unsupported keywords first.
+// Gemini's functionDeclarations.parameters accepts an OpenAPI-3.0-style "Schema"
+// object — a SUBSET of JSON Schema. A request carrying keywords outside that
+// subset ($schema, additionalProperties, $ref, oneOf/allOf/not, if/then/else,
+// etc.) is rejected with HTTP 400 and the WHOLE request fails, so tool calling to
+// any Gemini provider is dead-on-arrival unless we strip those first.
 //
-// This mirrors 9router's cleanJSONSchemaForAntigravity: recursively drop the
-// unsupported constraint keywords, convert const->enum, coerce a type array to a
-// single type, infer a missing object type, and prune required[] to declared
-// properties. We intentionally keep it conservative — we only REMOVE/normalize, we
-// never invent constraints — so a valid (if looser) schema always survives.
+// EARLIER this sanitizer was over-aggressive: it flattened anyOf to its first
+// branch (discarding union/alternative semantics) and stripped every numeric /
+// string / array constraint (minItems, minLength, pattern, minimum, …). But the
+// current Gemini Schema proto DOES support those — flattening and stripping them
+// silently weakened tool schemas for no benefit. We now:
+//   - PRESERVE anyOf as a real union (each branch recursively sanitized), except
+//     at the parameters ROOT where Gemini requires an object type.
+//   - RETAIN the constraints Gemini supports (minItems/maxItems, minLength/
+//     maxLength, minProperties/maxProperties, pattern, minimum/maximum, nullable,
+//     enum, default).
+//   - Still STRIP the genuinely-unsupported keywords (structural composition,
+//     exclusiveMinimum/Maximum, multipleOf, uniqueItems) and filter `format` to
+//     Gemini's allowed values, emitting a debug diagnostic when a constraint is
+//     dropped so operators can see what was lost.
+//
+// Escape hatch: KIRO_GEMINI_STRICT_SCHEMA=1 restores the old aggressive strip
+// (drop ALL constraints + flatten anyOf) for an operator whose Gemini-compatible
+// endpoint is older/stricter and 400s on the richer schema.
 // ============================================================================
 
-// geminiUnsupportedSchemaKeys are JSON-Schema keywords Gemini's function-calling
-// schema validator rejects. Recursively deleted from every schema node.
-var geminiUnsupportedSchemaKeys = map[string]bool{
+// geminiAlwaysStripKeys are JSON-Schema keywords Gemini's function-calling schema
+// validator rejects in EVERY mode — structural composition, schema plumbing, and
+// the numeric constraints with no Gemini equivalent. Recursively deleted.
+var geminiAlwaysStripKeys = map[string]bool{
 	"$schema":               true,
 	"$id":                   true,
 	"$ref":                  true,
@@ -40,35 +58,55 @@ var geminiUnsupportedSchemaKeys = map[string]bool{
 	"not":                   true,
 	"allOf":                 true,
 	"oneOf":                 true,
-	// anyOf is handled specially (Gemini DOES support a limited anyOf, but the
-	// safest portable behavior is to flatten it — see sanitizeGeminiSchema).
-	"patternProperty":  true,
-	"pattern":          true,
-	"minLength":        true,
-	"maxLength":        true,
-	"minItems":         true,
-	"maxItems":         true,
-	"uniqueItems":      true,
-	"minProperties":    true,
-	"maxProperties":    true,
+	"patternProperty":       true,
+	// No Gemini Schema equivalent — these would 400.
 	"exclusiveMinimum": true,
 	"exclusiveMaximum": true,
 	"multipleOf":       true,
-	// Gemini's function-calling schema only accepts a narrow set of `format`
-	// values (date-time/enum for strings, int32/int64 for integers, float/double
-	// for numbers) and 400s on anything else — and stock tools emit "uri",
-	// "uuid", "email", "hostname", etc. Stripping it entirely (as 9router does)
-	// is the portable, no-400 choice; it only loses a soft hint.
-	"format":           true,
-	"default":          true,
+	"uniqueItems":      true,
+	// Soft hints Gemini ignores; cheaper to drop than risk a validator quirk.
 	"examples":         true,
 	"example":          true,
-	"title":            true,
 	"readOnly":         true,
 	"writeOnly":        true,
 	"deprecated":       true,
 	"contentEncoding":  true,
 	"contentMediaType": true,
+}
+
+// geminiConstraintKeys are validation constraints the modern Gemini Schema proto
+// SUPPORTS. They are retained by default and only stripped in strict mode
+// (KIRO_GEMINI_STRICT_SCHEMA=1). Listed so the strict path knows what to drop and
+// the diagnostic knows what it's dropping.
+var geminiConstraintKeys = map[string]bool{
+	"minLength":     true,
+	"maxLength":     true,
+	"minItems":      true,
+	"maxItems":      true,
+	"minProperties": true,
+	"maxProperties": true,
+	"pattern":       true,
+	"minimum":       true,
+	"maximum":       true,
+	"nullable":      true,
+}
+
+// geminiAllowedFormats is the set of `format` values Gemini's function-calling
+// schema accepts. Any other format value (uri, uuid, email, hostname, …) makes
+// Gemini 400, so we drop those while keeping the supported ones.
+var geminiAllowedFormats = map[string]bool{
+	"enum":      true,
+	"date-time": true,
+	"int32":     true,
+	"int64":     true,
+	"float":     true,
+	"double":    true,
+}
+
+// geminiStrictSchema reports whether the operator opted into the old aggressive
+// strip via KIRO_GEMINI_STRICT_SCHEMA=1.
+func geminiStrictSchema() bool {
+	return os.Getenv("KIRO_GEMINI_STRICT_SCHEMA") == "1"
 }
 
 // sanitizeGeminiToolSchema returns a Gemini-safe copy of a tool's input schema.
@@ -90,7 +128,9 @@ func sanitizeGeminiToolSchema(schema interface{}) map[string]interface{} {
 const maxGeminiSchemaDepth = 64
 
 // sanitizeGeminiSchema recursively cleans one schema node. Returns the cleaned
-// value (a map for object/array schemas, passed through for leaves).
+// value (a map for object/array schemas, passed through for leaves). depth==0 is
+// the parameters root, where Gemini requires an object type (anyOf is flattened
+// there because a bare union root is rejected).
 func sanitizeGeminiSchema(v interface{}, depth int) interface{} {
 	if depth > maxGeminiSchemaDepth {
 		return map[string]interface{}{"type": "string"}
@@ -99,10 +139,20 @@ func sanitizeGeminiSchema(v interface{}, depth int) interface{} {
 	if !ok {
 		return v
 	}
+	strict := geminiStrictSchema()
 
 	out := make(map[string]interface{}, len(node))
 	for k, val := range node {
-		if geminiUnsupportedSchemaKeys[k] {
+		if geminiAlwaysStripKeys[k] {
+			continue
+		}
+		// Supported constraints: retained by default, dropped only in strict mode.
+		if geminiConstraintKeys[k] {
+			if strict {
+				logger.Debugf("[Gemini] Dropping constraint %q (KIRO_GEMINI_STRICT_SCHEMA)", k)
+				continue
+			}
+			out[k] = val
 			continue
 		}
 		switch k {
@@ -126,9 +176,17 @@ func sanitizeGeminiSchema(v interface{}, depth int) interface{} {
 				out["items"] = sanitizeGeminiSchema(val, depth+1)
 			}
 		case "anyOf":
-			// Flatten anyOf to its first viable branch — Gemini's support is
-			// inconsistent and a bare anyOf at the parameters root is rejected.
-			if arr, ok := val.([]interface{}); ok && len(arr) > 0 {
+			arr, ok := val.([]interface{})
+			if !ok || len(arr) == 0 {
+				continue
+			}
+			if strict || depth == 0 {
+				// Strict mode, or the parameters ROOT (Gemini needs an object type
+				// there, not a bare union): flatten to the first viable branch and
+				// merge its keys, preserving the prior conservative behavior.
+				if depth == 0 && !strict {
+					logger.Debugf("[Gemini] Flattening root-level anyOf to its first branch (Gemini requires an object root)")
+				}
 				if first := sanitizeGeminiSchema(arr[0], depth+1); first != nil {
 					if fm, ok := first.(map[string]interface{}); ok {
 						for fk, fv := range fm {
@@ -138,12 +196,28 @@ func sanitizeGeminiSchema(v interface{}, depth int) interface{} {
 						}
 					}
 				}
+				continue
 			}
+			// PRESERVE the union: sanitize each branch and keep anyOf. Gemini's
+			// Schema proto supports anyOf in nested property positions.
+			branches := make([]interface{}, 0, len(arr))
+			for _, b := range arr {
+				branches = append(branches, sanitizeGeminiSchema(b, depth+1))
+			}
+			out["anyOf"] = branches
 		case "const":
 			// const X -> enum:[X] (Gemini has no const).
 			out["enum"] = []interface{}{val}
 		case "type":
 			out["type"] = normalizeGeminiType(val)
+		case "format":
+			// Keep only the format values Gemini accepts; drop the rest (uri, uuid,
+			// email, …) which would 400 the whole request.
+			if s, ok := val.(string); ok && geminiAllowedFormats[s] {
+				out["format"] = s
+			} else if ok {
+				logger.Debugf("[Gemini] Dropping unsupported format %q", s)
+			}
 		default:
 			out[k] = val
 		}

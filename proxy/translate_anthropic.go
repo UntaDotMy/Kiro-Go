@@ -141,10 +141,24 @@ func openAIToAnthropicMessages(msgs []OpenAIMessage) (string, []map[string]inter
 			}
 			out = append(out, map[string]interface{}{"role": "assistant", "content": blocks})
 		default: // user
-			out = append(out, map[string]interface{}{
-				"role":    "user",
-				"content": extractOpenAIMessageText(m.Content),
-			})
+			imgs := extractOpenAIImages(m.Content)
+			if len(imgs) > 0 {
+				// Multimodal user turn: text block (if any) + one image block per
+				// image, in the Anthropic content-array shape.
+				blocks := make([]map[string]interface{}, 0, len(imgs)+1)
+				if txt := extractOpenAIMessageText(m.Content); txt != "" {
+					blocks = append(blocks, map[string]interface{}{"type": "text", "text": txt})
+				}
+				for _, img := range imgs {
+					blocks = append(blocks, kiroImageToAnthropicBlock(img))
+				}
+				out = append(out, map[string]interface{}{"role": "user", "content": blocks})
+			} else {
+				out = append(out, map[string]interface{}{
+					"role":    "user",
+					"content": extractOpenAIMessageText(m.Content),
+				})
+			}
 		}
 	}
 	return system.String(), out

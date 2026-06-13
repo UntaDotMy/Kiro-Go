@@ -121,7 +121,8 @@ func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker 
 // "" means "no constraint" (legacy behavior — every account is eligible). All
 // account selection goes through the backend-scoped reserving picker.
 func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort string, worker streamWorker, countGlobalFailure bool) (committed bool, retryAfter time.Duration, err error) {
-	tried := make(map[string]bool, maxFailoverAttempts)
+	budget := h.failoverBudget(backend, model)
+	tried := make(map[string]bool, budget)
 	var lastErr error
 	var lastRetryAfter time.Duration
 
@@ -135,7 +136,7 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 		}
 	}
 
-	for attempt := 0; attempt < maxFailoverAttempts; attempt++ {
+	for attempt := 0; attempt < budget; attempt++ {
 		account, poolRetryAfter, ok := h.acquireWithAdmissionWaitBackend(backend, model, tried)
 		if !ok {
 			// No (more) eligible accounts. If the pool is merely cooling or
@@ -163,7 +164,7 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 		// nothing.
 		committedThisAttempt, workErr := func() (bool, error) {
 			defer h.pool.Release(account.ID)
-			return h.runOneAttempt(account, worker, attempt)
+			return h.runOneAttempt(account, worker, attempt, budget)
 		}()
 
 		if committedThisAttempt {
@@ -192,11 +193,33 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 			return false, lastRetryAfter, workErr
 		}
 		logger.Infof("[Failover] Account %s failed with retryable error (attempt %d/%d), rotating: %v",
-			redactForLog(account.Email), attempt+1, maxFailoverAttempts, workErr)
+			redactForLog(account.Email), attempt+1, budget, workErr)
 	}
 
 	recordTerminal()
 	return false, lastRetryAfter, lastErr
+}
+
+// failoverBudget sizes the per-request attempt budget to the addressable pool:
+// min(eligibleAccounts, maxFailoverAttempts), floored at minFailoverAttempts.
+// This replaces the old fixed cap of 3 so a large pool doesn't surface a 503/429
+// while many untried healthy accounts remain, while the ceiling still bounds
+// worst-case latency and a stampede on a pathological pool. When the pool can't
+// report a count (nil pool, or a bespoke test pool returning 0), we fall back to
+// the floor — preserving the historical behavior.
+func (h *Handler) failoverBudget(backend, model string) int {
+	if h.pool == nil {
+		return minFailoverAttempts
+	}
+	eligible := h.pool.EligibleCountForBackendModel(backend, model)
+	budget := eligible
+	if budget > maxFailoverAttempts {
+		budget = maxFailoverAttempts
+	}
+	if budget < minFailoverAttempts {
+		budget = minFailoverAttempts
+	}
+	return budget
 }
 
 // acquireWithAdmissionWait wraps the pool's reserving picker with a bounded wait
@@ -263,11 +286,12 @@ func (h *Handler) acquireWithAdmissionWaitBackend(backend, model string, tried m
 // runOneAttempt performs token refresh + a single worker invocation for one
 // account. It returns (committed, err). A token-refresh failure is returned as a
 // retryable error tagged via tokenRefreshFailure so the dispatcher rotates
-// without treating it as an upstream error.
-func (h *Handler) runOneAttempt(account *config.Account, worker streamWorker, attempt int) (bool, error) {
+// without treating it as an upstream error. budget is the request's total
+// attempt budget, used only for the log line's "n/total" framing.
+func (h *Handler) runOneAttempt(account *config.Account, worker streamWorker, attempt, budget int) (bool, error) {
 	if tokErr := h.ensureValidToken(account); tokErr != nil {
 		logger.Warnf("[Failover] Token refresh failed for %s (attempt %d/%d): %v",
-			redactForLog(account.Email), attempt+1, maxFailoverAttempts, tokErr)
+			redactForLog(account.Email), attempt+1, budget, tokErr)
 		return false, tokenRefreshFailure{tokErr}
 	}
 	return worker(account)

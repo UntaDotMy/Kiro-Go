@@ -2947,6 +2947,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if reqBackend != "kiro" {
 		poolModel = upstreamModel
 	}
+	// respEchoModel is the model id reflected back in the response. On the Kiro
+	// path a non-Claude id is silently remapped to a Claude model (e.g. gpt-4o ->
+	// claude-sonnet-4.5); echoing the requested id would tell the client it got
+	// GPT when it actually got Claude. Reflect the model ACTUALLY served instead.
+	// For non-Kiro backends the served model is the real upstream id, so the
+	// requested id is already honest and is echoed unchanged.
+	respEchoModel := openAIResponseEchoModel(reqBackend, req.Model, actualModel)
 	baseNR := &NormalizedRequest{
 		Model:         upstreamModel,
 		ClientDialect: DialectOpenAI,
@@ -2960,9 +2967,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	worker := func(account *config.Account) (bool, error) {
 		kiroPayload.ProfileArn = "" // re-resolve per attempt account
 		if req.Stream {
-			return h.handleOpenAIStream(reqCtx, w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+			return h.handleOpenAIStream(reqCtx, w, account, kiroPayload, req.Model, respEchoModel, thinking, estimatedInputTokens, matchedKeyID)
 		}
-		return h.handleOpenAINonStream(reqCtx, w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, matchedKeyID)
+		return h.handleOpenAINonStream(reqCtx, w, account, kiroPayload, req.Model, respEchoModel, thinking, estimatedInputTokens, matchedKeyID)
 	}
 
 	committed, retryAfter, err := h.runWithFailoverBackend(reqBackend, poolModel, matchedKeyID, kiroPayload.ResolvedEffort, worker)
@@ -2988,7 +2995,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 // handleOpenAIStream OpenAI 流式响应. Returns (committed, err): defers the
 // first chunk so a pre-commit failure can fail over to another account.
-func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
+// model is the requested id (used for upstream routing + usage recording);
+// respEchoModel is the id reflected back to the client (the model actually
+// served — see respEchoModel in handleOpenAIChat).
+func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model, respEchoModel string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
@@ -2999,10 +3009,11 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
-	// Echo the canonical Anthropic dash form so SDKs / Claude Code resolve the
-	// model id correctly on every chunk; the inbound dotted form (e.g.
-	// "claude-opus-4.7") is kept in `model` for upstream routing.
-	respModel := canonicalAnthropicModelID(model)
+	// Echo the model that was ACTUALLY served (canonical dash form). On the Kiro
+	// path a non-Claude requested id was remapped to a Claude model upstream, so
+	// respEchoModel carries the served Claude id rather than the requested id;
+	// the inbound dotted form is kept in `model` for upstream routing.
+	respModel := canonicalAnthropicModelID(respEchoModel)
 	var toolCalls []ToolCall
 	var toolCallIndex int
 	var inputTokens, outputTokens int
@@ -3194,7 +3205,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				"id":      chatID,
 				"object":  "chat.completion.chunk",
 				"created": time.Now().Unix(),
-				"model":   canonicalAnthropicModelID(model),
+				"model":   respModel,
 				"choices": []map[string]interface{}{{
 					"index": 0,
 					"delta": map[string]interface{}{
@@ -3290,7 +3301,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		"id":      chatID,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
-		"model":   canonicalAnthropicModelID(model),
+		"model":   respModel,
 		"choices": []map[string]interface{}{{
 			"index":         0,
 			"delta":         map[string]interface{}{},
@@ -3312,7 +3323,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 
 // handleOpenAINonStream OpenAI 非流式响应. Returns (committed, err); on a
 // pre-commit upstream failure returns (false, err) for dispatcher failover.
-func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
+// model is the requested id (upstream routing + usage recording); respEchoModel
+// is the id reflected back to the client (the model actually served).
+func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model, respEchoModel string, thinking bool, estimatedInputTokens int, apiKeyID string) (bool, error) {
 	var content string
 	var reasoningContent string
 	var toolUses []KiroToolUse
@@ -3376,7 +3389,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 	}
 
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason)
+	resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, respEchoModel, thinkingFormat, upstreamStopReason)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
 	return true, nil
