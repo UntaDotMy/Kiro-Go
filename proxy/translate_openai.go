@@ -139,8 +139,9 @@ func claudeToOpenAIMessages(req *ClaudeRequest) []map[string]interface{} {
 
 // claudeUserMessageToOpenAI maps a Claude user message. A user message carrying
 // tool_result blocks becomes one or more OpenAI "tool" role messages; plain text
-// becomes a single "user" message. (Images are best-effort: text is preserved;
-// generic OpenAI-compatible providers vary in vision support.)
+// becomes a single "user" message. Image blocks are forwarded as OpenAI
+// image_url content parts so vision input survives the cross-dialect hop (the
+// user message then carries a multimodal content array instead of a string).
 func claudeUserMessageToOpenAI(content interface{}) []map[string]interface{} {
 	if s, ok := content.(string); ok {
 		return []map[string]interface{}{{"role": "user", "content": s}}
@@ -152,6 +153,7 @@ func claudeUserMessageToOpenAI(content interface{}) []map[string]interface{} {
 
 	var out []map[string]interface{}
 	var text strings.Builder
+	images := extractClaudeImages(content)
 	for _, b := range blocks {
 		block, ok := b.(map[string]interface{})
 		if !ok {
@@ -171,7 +173,18 @@ func claudeUserMessageToOpenAI(content interface{}) []map[string]interface{} {
 			})
 		}
 	}
-	if text.Len() > 0 {
+	if len(images) > 0 {
+		// Multimodal user message: text part (if any) + one image_url part per
+		// image. OpenAI-compatible vision endpoints accept this content array.
+		parts := make([]map[string]interface{}, 0, len(images)+1)
+		if text.Len() > 0 {
+			parts = append(parts, map[string]interface{}{"type": "text", "text": text.String()})
+		}
+		for _, img := range images {
+			parts = append(parts, kiroImageToOpenAIPart(img))
+		}
+		out = append(out, map[string]interface{}{"role": "user", "content": parts})
+	} else if text.Len() > 0 {
 		out = append(out, map[string]interface{}{"role": "user", "content": text.String()})
 	}
 	if len(out) == 0 {

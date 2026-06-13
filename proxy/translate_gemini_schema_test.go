@@ -9,10 +9,11 @@ import (
 // TestSanitizeGeminiToolSchemaStripsUnsupported is the regression guard for the
 // blocking bug: Gemini's function-calling schema validator REJECTS stock JSON
 // Schema keywords that Claude Code, OpenAI SDKs, and MCP tools emit by default
-// ($schema, additionalProperties, $ref, oneOf/allOf/not, pattern, format-ish
-// constraints). An unsanitized schema makes Gemini 400 the WHOLE request, so tool
-// calling to any Gemini provider is dead on arrival. This pins that the
-// unsupported keywords are removed while the usable structure survives.
+// ($schema, additionalProperties, $ref, oneOf/allOf/not). An unsanitized schema
+// makes Gemini 400 the WHOLE request, so tool calling to any Gemini provider is
+// dead on arrival. This pins that the genuinely-unsupported keywords are removed
+// while the usable structure AND the constraints Gemini supports survive (the
+// sanitizer no longer over-strips minLength/maxLength/pattern/default — see s9).
 func TestSanitizeGeminiToolSchemaStripsUnsupported(t *testing.T) {
 	raw := `{
 		"$schema": "http://json-schema.org/draft-07/schema#",
@@ -50,26 +51,28 @@ func TestSanitizeGeminiToolSchemaStripsUnsupported(t *testing.T) {
 		t.Errorf("type = %v, want object", cleaned["type"])
 	}
 
-	// Property-level constraints stripped, but the property + its type survive.
+	// Property-level: the property + its type survive, AND the constraints Gemini
+	// supports (minLength/maxLength/pattern) are now PRESERVED (s9 — they were
+	// being over-stripped before, silently weakening the schema).
 	props := cleaned["properties"].(map[string]interface{})
 	city := props["city"].(map[string]interface{})
 	if city["type"] != "string" {
 		t.Errorf("city.type = %v, want string", city["type"])
 	}
 	for _, k := range []string{"minLength", "maxLength", "pattern"} {
-		if _, present := city[k]; present {
-			t.Errorf("city.%s should be stripped", k)
+		if _, present := city[k]; !present {
+			t.Errorf("city.%s is a Gemini-supported constraint and should be preserved", k)
 		}
 	}
-	// enum is supported and must survive; default is not.
+	// enum and default are both supported and must survive.
 	unit := props["unit"].(map[string]interface{})
 	if _, present := unit["enum"]; !present {
 		t.Errorf("unit.enum should survive")
 	}
-	if _, present := unit["default"]; present {
-		t.Errorf("unit.default should be stripped")
+	if _, present := unit["default"]; !present {
+		t.Errorf("unit.default should survive (Gemini Schema supports default)")
 	}
-	// Nested object cleaned recursively.
+	// Nested object cleaned recursively (additionalProperties still unsupported).
 	opts := props["opts"].(map[string]interface{})
 	if _, present := opts["additionalProperties"]; present {
 		t.Errorf("nested additionalProperties should be stripped")

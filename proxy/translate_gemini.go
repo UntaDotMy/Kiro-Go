@@ -129,9 +129,19 @@ func openAIToGeminiContents(msgs []OpenAIMessage) (string, []map[string]interfac
 				}},
 			})
 		default: // user
+			parts := []map[string]interface{}{}
+			if txt := extractOpenAIMessageText(m.Content); txt != "" {
+				parts = append(parts, map[string]interface{}{"text": txt})
+			}
+			for _, img := range extractOpenAIImages(m.Content) {
+				parts = append(parts, kiroImageToGeminiPart(img))
+			}
+			if len(parts) == 0 {
+				parts = append(parts, map[string]interface{}{"text": ""})
+			}
 			contents = append(contents, map[string]interface{}{
 				"role":  "user",
-				"parts": []map[string]interface{}{{"text": extractOpenAIMessageText(m.Content)}},
+				"parts": parts,
 			})
 		}
 	}
@@ -183,6 +193,12 @@ func claudeToGeminiContents(msgs []ClaudeMessage) []map[string]interface{} {
 			case "text":
 				if t, ok := blk["text"].(string); ok && t != "" {
 					parts = append(parts, map[string]interface{}{"text": t})
+				}
+			case "image", "image_url", "input_image":
+				// Forward vision input as a Gemini inlineData part instead of
+				// dropping it.
+				if img := extractImageFromClaudeBlock(blk); img != nil {
+					parts = append(parts, kiroImageToGeminiPart(*img))
 				}
 			case "tool_use":
 				id, _ := blk["id"].(string)

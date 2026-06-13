@@ -177,7 +177,7 @@ func TestRunOneAttemptTagsTokenRefreshFailure(t *testing.T) {
 		return true, nil
 	}
 
-	committed, err := h.runOneAttempt(acct, worker, 0)
+	committed, err := h.runOneAttempt(acct, worker, 0, minFailoverAttempts)
 	if committed {
 		t.Fatal("a pre-commit token-refresh failure must not be committed")
 	}

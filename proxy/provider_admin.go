@@ -8,7 +8,10 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +34,80 @@ func isValidBaseURLScheme(base string) bool {
 }
 
 const baseURLSchemeError = "baseURL must use http:// or https://"
+
+// validateProviderBaseURL is the SSRF guard for operator-supplied custom-provider
+// base URLs. Adding a custom provider triggers a SERVER-SIDE GET {baseURL}/models
+// fetch (FetchModelsForAccount), so an unguarded base URL lets a compromised or
+// SSRF-chained admin session reach internal hosts — most dangerously the cloud
+// instance-metadata endpoint (169.254.169.254), stealing instance credentials.
+//
+// Policy (matches the operator-chosen posture):
+//   - Always reject a non-http(s) scheme or schemeless input (the old check).
+//   - Always reject link-local / cloud-metadata targets (169.254.0.0/16, fe80::/10)
+//     and the unspecified address — never a legitimate provider endpoint, and the
+//     real exploit vector. No env can re-enable these in the default flow.
+//   - Loopback (127.0.0.0/8, ::1) and private/RFC1918 LAN addresses stay ALLOWED
+//     by default, because a self-hosted Ollama/LM Studio/vLLM on localhost or a LAN
+//     box is the common legitimate reason to add a custom provider. Setting
+//     KIRO_STRICT_PROVIDER_URLS=1 additionally blocks loopback + private ranges for
+//     operators who never self-host.
+//
+// A literal-IP host is checked directly; a hostname is resolved and EVERY resolved
+// address is checked (re-validation after DNS) so a name like "metadata.internal"
+// that resolves to 169.254.169.254 cannot slip past. Resolution is best-effort: a
+// host that doesn't resolve at validation time is allowed through (the proxy host
+// may legitimately not resolve from this machine). Returns "" when valid, else an
+// operator-facing error message.
+func validateProviderBaseURL(base string) string {
+	if !isValidBaseURLScheme(base) {
+		return baseURLSchemeError
+	}
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil {
+		return "baseURL is not a valid URL: " + err.Error()
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "baseURL has no host"
+	}
+	strict := os.Getenv("KIRO_STRICT_PROVIDER_URLS") == "1"
+	if ip := net.ParseIP(host); ip != nil {
+		return providerIPDisallowed(ip, strict)
+	}
+	if addrs, err := net.LookupHost(host); err == nil {
+		for _, addr := range addrs {
+			ip := net.ParseIP(addr)
+			if ip == nil {
+				continue
+			}
+			if msg := providerIPDisallowed(ip, strict); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+// providerIPDisallowed reports why a resolved provider base-URL IP is refused, or
+// "" when allowed. Link-local/metadata and the unspecified address are ALWAYS
+// refused; loopback + private ranges are refused only in strict mode.
+func providerIPDisallowed(ip net.IP, strict bool) string {
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return "baseURL resolves to a link-local address (e.g. cloud metadata 169.254.169.254); refused."
+	}
+	if ip.IsUnspecified() {
+		return "baseURL resolves to the unspecified address (0.0.0.0/::); refused."
+	}
+	if strict {
+		if ip.IsLoopback() {
+			return "baseURL resolves to a loopback address; refused (KIRO_STRICT_PROVIDER_URLS=1). Unset it to allow localhost providers."
+		}
+		if ip.IsPrivate() {
+			return "baseURL resolves to a private/RFC1918 address; refused (KIRO_STRICT_PROVIDER_URLS=1). Unset it to allow LAN providers."
+		}
+	}
+	return ""
+}
 
 // providerCatalogEntry is the dashboard-facing description of an addable
 // provider backend.
@@ -177,9 +254,9 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL is required for a custom provider (e.g. https://api.example.com/v1)"})
 			return
 		}
-		if !isValidBaseURLScheme(base) {
+		if msg := validateProviderBaseURL(base); msg != "" {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
 			return
 		}
 		// Routing id/prefix: prefer the operator-supplied alias, else a slug of
@@ -206,10 +283,12 @@ func (h *Handler) apiAddProviderAccount(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		// SSRF guard on the optional per-account base URL override.
-		if bu := strings.TrimSpace(req.BaseURL); bu != "" && !isValidBaseURLScheme(bu) {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
-			return
+		if bu := strings.TrimSpace(req.BaseURL); bu != "" {
+			if msg := validateProviderBaseURL(bu); msg != "" {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": msg})
+				return
+			}
 		}
 	}
 
@@ -415,9 +494,9 @@ func (h *Handler) apiAddProviderAccountsBulk(w http.ResponseWriter, r *http.Requ
 			json.NewEncoder(w).Encode(map[string]string{"error": "baseURL is required for a custom provider (e.g. https://api.example.com/v1)"})
 			return
 		}
-		if !isValidBaseURLScheme(base) {
+		if msg := validateProviderBaseURL(base); msg != "" {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
 			return
 		}
 		id := slugifyProviderID(firstNonEmpty(strings.TrimSpace(req.Alias), strings.TrimSpace(req.Name)))
@@ -451,9 +530,9 @@ func (h *Handler) apiAddProviderAccountsBulk(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		if bu := strings.TrimSpace(req.BaseURL); bu != "" {
-			if !isValidBaseURLScheme(bu) {
+			if msg := validateProviderBaseURL(bu); msg != "" {
 				w.WriteHeader(400)
-				json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
+				json.NewEncoder(w).Encode(map[string]string{"error": msg})
 				return
 			}
 			baseOverride = bu
@@ -678,13 +757,14 @@ func (h *Handler) apiAddCustomProvider(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "baseURL is required"})
 		return
 	}
-	// SSRF guard: restrict custom-provider base URLs to http(s) so they can't be
-	// pointed at file://, ftp://, or other non-web schemes (see security review).
-	// Both http and https are allowed — self-hosted / LAN / localhost gateways
-	// don't always serve TLS.
-	if !isValidBaseURLScheme(pc.BaseURL) {
+	// SSRF guard: restrict custom-provider base URLs to http(s) and block
+	// link-local/cloud-metadata targets (and, under KIRO_STRICT_PROVIDER_URLS,
+	// loopback/private). Adding a provider triggers a server-side /models fetch,
+	// so an unguarded URL could reach 169.254.169.254. Both http and https are
+	// allowed — self-hosted / LAN / localhost gateways don't always serve TLS.
+	if msg := validateProviderBaseURL(pc.BaseURL); msg != "" {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": baseURLSchemeError})
+		json.NewEncoder(w).Encode(map[string]string{"error": msg})
 		return
 	}
 	// Don't let a custom provider shadow a built-in backend id.

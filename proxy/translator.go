@@ -225,6 +225,24 @@ func canonicalAnthropicModelID(model string) string {
 	return strings.ReplaceAll(model, ".", "-")
 }
 
+// openAIResponseEchoModel decides which model id an OpenAI-dialect response
+// reflects back to the client. The bug it fixes: on the Kiro path a non-Claude
+// id (gpt-4o/gpt-4/gpt-3.5-turbo) is silently remapped to a Claude model, but
+// the response used to echo the REQUESTED id — telling a client it got GPT when
+// it actually got Claude. We now reflect the model ACTUALLY served:
+//   - Kiro backend: echo the resolved upstream id (servedModel) when it differs,
+//     so a gpt-4o request that ran on claude-sonnet-4.5 says so.
+//   - Non-Kiro backends: the served model IS the requested upstream id, so the
+//     requested id is already honest and is echoed unchanged.
+//
+// The returned id is canonicalized to the dash form SDKs expect.
+func openAIResponseEchoModel(backend, requestedModel, servedModel string) string {
+	if backend == "kiro" && servedModel != "" {
+		return canonicalAnthropicModelID(servedModel)
+	}
+	return canonicalAnthropicModelID(requestedModel)
+}
+
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
@@ -1732,7 +1750,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 转换工具
-	kiroTools := convertOpenAITools(req.Tools)
+	kiroTools, toolNameMap := convertOpenAITools(req.Tools)
 
 	// Enforce upstream invariants on the tool history. Mirrors the protection
 	// applied to the Claude path; without it, OpenAI-shaped clients that
@@ -1750,6 +1768,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		Origin:  origin,
 		Images:  currentImages,
 	}
+
+	// Restore map so OnToolUse hands the client back the original (un-sanitized)
+	// tool name in tool_calls, matching the Claude path's ToolNameMap behavior.
+	payload.ToolNameMap = toolNameMap
 
 	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
 		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
@@ -2276,23 +2298,37 @@ func parseBase64Image(data, format string) *KiroImage {
 	}
 }
 
-func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
+// convertOpenAITools converts OpenAI function tools into Kiro tool specs. It
+// applies the SAME name pipeline as convertClaudeTools — sanitizeToolName (Kiro
+// requires pure camelCase: no underscores/dashes) then shortenToolName (64-char
+// cap) — and returns a restore map from the sanitized name back to the client's
+// original so KiroToClaude/OpenAI response rendering can hand the client back the
+// name it sent. Without the sanitize step, an OpenAI client tool like
+// "get_weather" reached Kiro verbatim and could trigger HTTP 400 "Improperly
+// formed request", and any name we DID alter (length) had no restore entry, so
+// the client saw a mangled tool name in tool_calls.
+func convertOpenAITools(tools []OpenAITool) ([]KiroToolWrapper, map[string]string) {
 	if len(tools) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	result := make([]KiroToolWrapper, 0, len(tools))
+	nameMap := make(map[string]string)
 	for _, tool := range tools {
 		if tool.Type != "function" {
 			continue
 		}
+		sanitized := shortenToolName(sanitizeToolName(tool.Function.Name))
+		if sanitized != tool.Function.Name {
+			nameMap[sanitized] = tool.Function.Name
+		}
 		wrapper := KiroToolWrapper{}
-		wrapper.ToolSpecification.Name = shortenToolName(tool.Function.Name)
+		wrapper.ToolSpecification.Name = sanitized
 		wrapper.ToolSpecification.Description = normalizeToolDescription(tool.Function.Description, tool.Function.Name)
 		wrapper.ToolSpecification.InputSchema = InputSchema{JSON: tool.Function.Parameters}
 		result = append(result, wrapper)
 	}
-	return result
+	return result, nameMap
 }
 
 // ==================== Kiro -> OpenAI 转换 ====================

@@ -68,11 +68,15 @@ type APIKey struct {
 	DailyTokens   int     `json:"dailyTokens,omitempty"`
 	DailyCredits  float64 `json:"dailyCredits,omitempty"`
 
-	// Per-minute / per-hour rate limits (request count only).
+	// Per-minute / per-hour rate limits (request count only). The bucket keys
+	// identify the current window and MUST be persisted (exported JSON) so a
+	// process restart inside a window doesn't reset them to empty — which would
+	// make the rollover check below fire and zero MinuteRequests/HourRequests,
+	// letting a restart loop bypass the short-window limit. Mirrors CountersDate.
 	MinuteReqLimit  int    `json:"minuteReqLimit,omitempty"`
 	HourReqLimit    int    `json:"hourReqLimit,omitempty"`
-	minuteBucketKey string // not persisted
-	hourBucketKey   string // not persisted
+	MinuteBucketKey string `json:"minuteBucketKey,omitempty"`
+	HourBucketKey   string `json:"hourBucketKey,omitempty"`
 	MinuteRequests  int    `json:"minuteRequests,omitempty"`
 	HourRequests    int    `json:"hourRequests,omitempty"`
 
@@ -520,13 +524,13 @@ func checkAPIKeyLimit(id, model string, checkModel bool) (rejected bool, reason 
 			}
 		}
 		curMin := minuteBucket(k.ResetTZ)
-		if k.minuteBucketKey != curMin {
-			k.minuteBucketKey = curMin
+		if k.MinuteBucketKey != curMin {
+			k.MinuteBucketKey = curMin
 			k.MinuteRequests = 0
 		}
 		curHour := hourBucket(k.ResetTZ)
-		if k.hourBucketKey != curHour {
-			k.hourBucketKey = curHour
+		if k.HourBucketKey != curHour {
+			k.HourBucketKey = curHour
 			k.HourRequests = 0
 		}
 		if k.MinuteReqLimit > 0 && k.MinuteRequests+1 > k.MinuteReqLimit {
@@ -610,13 +614,13 @@ func ConsumeAPIKey(id string, tokens int, credits float64, model string) (reject
 		// Roll over minute / hour / periodic buckets BEFORE recording so usage
 		// lands in the current window.
 		curMin := minuteBucket(k.ResetTZ)
-		if k.minuteBucketKey != curMin {
-			k.minuteBucketKey = curMin
+		if k.MinuteBucketKey != curMin {
+			k.MinuteBucketKey = curMin
 			k.MinuteRequests = 0
 		}
 		curHour := hourBucket(k.ResetTZ)
-		if k.hourBucketKey != curHour {
-			k.hourBucketKey = curHour
+		if k.HourBucketKey != curHour {
+			k.HourBucketKey = curHour
 			k.HourRequests = 0
 		}
 		bucket := periodBucketKey(k.ResetPeriod, k.ResetTZ)

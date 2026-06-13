@@ -449,32 +449,55 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 		})
 	}
 
-	callback := &KiroStreamCallback{
-		OnText: func(text string, isThinking bool) {
-			if isThinking {
-				if !includeReasoning {
-					return
-				}
-				emitReasoningStart()
-				reasoningBuf.WriteString(text)
-				h.sendResponsesEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]interface{}{
-					"type":            "response.reasoning_summary_text.delta",
-					"sequence_number": nextSeq(),
-					"item_id":         reasoningItemID,
-					"output_index":    reasoningIndex,
-					"summary_index":   0,
-					"delta":           text,
-				})
+	emitReasoningDelta := func(delta string) {
+		if !includeReasoning || delta == "" {
+			return
+		}
+		emitReasoningStart()
+		reasoningBuf.WriteString(delta)
+		h.sendResponsesEvent(w, flusher, "response.reasoning_summary_text.delta", map[string]interface{}{
+			"type":            "response.reasoning_summary_text.delta",
+			"sequence_number": nextSeq(),
+			"item_id":         reasoningItemID,
+			"output_index":    reasoningIndex,
+			"summary_index":   0,
+			"delta":           delta,
+		})
+	}
+
+	// Route ALL upstream text through the shared thinkingTextProcessor so inline
+	// <thinking>...</thinking> tags emitted as ordinary assistantResponseEvent
+	// text are parsed into reasoning deltas instead of leaking verbatim into
+	// output_text.delta — matching the Claude /v1/messages and OpenAI chat stream
+	// paths. The emitter maps the processor's thinking-state to Responses events:
+	//   state 0 -> assistant message text (closing any open reasoning item first)
+	//   state 1/2/3 -> reasoning_summary_text deltas
+	// The reasoning item is closed lazily when ordinary text follows or at
+	// Finalize(), preserving the existing output_index ordering.
+	processor := newThinkingProcessor(thinking, func(text string, thinkingState int) {
+		if thinkingState == 0 {
+			if text == "" {
 				return
 			}
-			// Once real assistant text starts, close any open reasoning item first
-			// so the message item has the next output_index slot.
 			if reasoningStarted && !messageStarted {
 				emitReasoningDone()
 			}
 			emitMessageDelta(text)
+			return
+		}
+		// thinkingState 1/2/3: thinking content -> reasoning deltas.
+		emitReasoningDelta(text)
+	}, allowReasoningSource, allowTagSource)
+
+	callback := &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			processor.Process(text, isThinking)
 		},
 		OnToolUse: func(tu KiroToolUse) {
+			// Flush any buffered thinking/text (and close an open thinking block)
+			// before tool output so a partial <thinking> tag can't straddle the
+			// tool-call boundary.
+			processor.Finalize()
 			// Close text + reasoning before emitting tool calls.
 			if reasoningStarted && !messageStarted {
 				emitReasoningDone()
@@ -548,6 +571,8 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 	}
 
 	if err := h.callProviderForKiro(ctx, account, payload, model, thinking, callback); err != nil {
+		// Flush any buffered thinking/text before surfacing the error.
+		processor.Finalize()
 		h.handleUpstreamError(err, account.ID, model, apiKeyID, payload.ResolvedEffort)
 		// Emit failure events Codex understands.
 		h.sendResponsesEvent(w, flusher, "response.failed", map[string]interface{}{
@@ -561,6 +586,10 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 		})
 		return
 	}
+
+	// Flush the thinking processor so any held tail (a partial tag hedge) is
+	// emitted before we close the items.
+	processor.Finalize()
 
 	// Close any open reasoning / message items.
 	if reasoningStarted && reasoningBuf.Len() > 0 && !messageStarted {

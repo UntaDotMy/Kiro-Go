@@ -234,24 +234,37 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	)
 	nextSeq := func() int { seq++; return seq }
 
-	callback := &KiroStreamCallback{
-		OnText: func(text string, isThinking bool) {
-			if isThinking {
-				if !includeReasoning {
-					return
-				}
-				reasoningBuf.WriteString(text)
-				send("response.reasoning_summary_text.delta", map[string]interface{}{
-					"type": "response.reasoning_summary_text.delta", "sequence_number": nextSeq(), "delta": text,
-				})
+	// Route all upstream text through the shared thinkingTextProcessor so inline
+	// <thinking>...</thinking> emitted as ordinary assistant text is parsed into
+	// reasoning deltas instead of leaking into output_text.delta — matching the
+	// SSE Responses path and the Claude/OpenAI stream paths.
+	processor := newThinkingProcessor(thinking, func(text string, thinkingState int) {
+		if thinkingState == 0 {
+			if text == "" {
 				return
 			}
 			messageBuf.WriteString(text)
 			send("response.output_text.delta", map[string]interface{}{
 				"type": "response.output_text.delta", "sequence_number": nextSeq(), "delta": text,
 			})
+			return
+		}
+		// thinkingState 1/2/3: thinking content -> reasoning deltas.
+		if !includeReasoning || text == "" {
+			return
+		}
+		reasoningBuf.WriteString(text)
+		send("response.reasoning_summary_text.delta", map[string]interface{}{
+			"type": "response.reasoning_summary_text.delta", "sequence_number": nextSeq(), "delta": text,
+		})
+	}, allowReasoningSource, allowTagSource)
+
+	callback := &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			processor.Process(text, isThinking)
 		},
 		OnToolUse: func(tu KiroToolUse) {
+			processor.Finalize()
 			argsStr, _ := json.Marshal(tu.Input)
 			send("response.function_call_arguments.done", map[string]interface{}{
 				"type": "response.function_call_arguments.done", "sequence_number": nextSeq(),
@@ -278,6 +291,7 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	wsCtx := withNormalizedRequest(r.Context(), baseNR)
 
 	if err := h.callProviderForKiro(wsCtx, account, kiroPayload, mappedModel, thinking, callback); err != nil {
+		processor.Finalize()
 		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID, kiroPayload.ResolvedEffort)
 		send("response.failed", map[string]interface{}{
 			"type":            "response.failed",
@@ -286,6 +300,8 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
+	// Flush any buffered thinking/text before computing final usage + closing.
+	processor.Finalize()
 
 	if inputTokens <= 0 {
 		inputTokens = estimatedInputTokens
