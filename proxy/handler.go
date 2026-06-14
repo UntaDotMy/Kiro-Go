@@ -471,6 +471,16 @@ func (h *Handler) triggerAccountRefresh(accountID string) {
 		if acc == nil || !acc.Enabled || acc.AccessToken == "" {
 			return
 		}
+		// Non-Kiro accounts must NOT hit the AWS RefreshAccountInfo path: that calls
+		// the CodeWhisperer endpoint, which 403s a CodeBuddy/Codex/etc. token ("the
+		// bearer token included in the request is invalid"). Route them through their
+		// provider's refresh (token renewal + per-provider quota poll) instead — the
+		// same split the background sweep uses.
+		if config.GetAccountBackend(acc) != "kiro" {
+			h.backgroundRefreshNonKiro(acc)
+			h.broadcastDashboardUpdate()
+			return
+		}
 		info, err := RefreshAccountInfo(acc)
 		if err != nil {
 			logger.Debugf("[LazyRefresh] Failed to refresh %s: %v", acc.Email, err)
@@ -3686,6 +3696,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPollCodeBuddyLogin(w, r)
 	case strings.HasPrefix(path, "/codebuddy/quota/") && r.Method == "POST":
 		h.apiSyncCodeBuddyQuota(w, r, strings.TrimPrefix(path, "/codebuddy/quota/"))
+	case strings.HasPrefix(path, "/codebuddy/cookie/") && r.Method == "POST":
+		h.apiImportCodeBuddyCookie(w, r, strings.TrimPrefix(path, "/codebuddy/cookie/"))
 	case path == "/auth/kimi-coding/start" && r.Method == "POST":
 		h.apiStartKimiCodingLogin(w, r)
 	case path == "/auth/kimi-coding/poll" && r.Method == "POST":
@@ -4711,6 +4723,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"webSearchProvider":        config.GetWebSearchProvider(),
 		"webSearchApiKeySet":       config.GetWebSearchAPIKey() != "",
 		"toolSearchEnabled":        config.GetToolSearchEnabled(),
+		"codeBuddyFilterEnabled":   config.GetCodeBuddyFilterEnabled(),
 		"globalRateLimitPerMinute": config.GetGlobalRateLimitPerMinute(),
 	})
 }
@@ -4856,6 +4869,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchProvider        *string `json:"webSearchProvider,omitempty"`
 		WebSearchApiKey          *string `json:"webSearchApiKey,omitempty"`
 		ToolSearchEnabled        *bool   `json:"toolSearchEnabled,omitempty"`
+		CodeBuddyFilterEnabled   *bool   `json:"codeBuddyFilterEnabled,omitempty"`
 		GlobalRateLimitPerMinute *int    `json:"globalRateLimitPerMinute,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4893,6 +4907,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Web-search emulation toggle (opt-in; default off).
 	if req.WebSearchEnabled != nil {
 		if err := config.UpdateWebSearchEnabled(*req.WebSearchEnabled); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// CodeBuddy outbound-request sanitization toggle (default on).
+	if req.CodeBuddyFilterEnabled != nil {
+		if err := config.UpdateCodeBuddyFilterEnabled(*req.CodeBuddyFilterEnabled); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

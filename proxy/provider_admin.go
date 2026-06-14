@@ -1290,6 +1290,17 @@ func (h *Handler) apiPollCodeBuddyLogin(w http.ResponseWriter, r *http.Request) 
 	if tokens.ExpiresIn > 0 {
 		acct.ExpiresAt = nowUnixSeconds() + int64(tokens.ExpiresIn)
 	}
+	// Capture the account profile (email/nickname) from /v2/plugin/accounts so the
+	// dashboard shows who this account is instead of a blank row. Best-effort: a
+	// lookup failure leaves the generic nickname and an empty email.
+	if id, ierr := FetchCodeBuddyIdentity(r.Context(), &acct); ierr == nil {
+		if id.Email != "" {
+			acct.Email = id.Email
+		}
+		if id.Nickname != "" {
+			acct.Nickname = id.Nickname
+		}
+	}
 	if err := config.AddAccount(acct); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

@@ -384,6 +384,15 @@ func (g *genericProvider) Call(ctx context.Context, acct *config.Account, nr *No
 		return err
 	}
 
+	// CodeBuddy runs server-side content moderation that rejects competitor brand
+	// tokens ("Claude"/"Anthropic") — which saturate the Claude Code system prompt —
+	// with a canned Chinese refusal surfaced to the client as a policy violation.
+	// Neutralize the outbound body (model id preserved) so the request clears the
+	// filter. Gated on the global toggle (default on); no-op for other backends.
+	if isCodeBuddyBackend(ps.id) && config.GetCodeBuddyFilterEnabled() {
+		body = sanitizeCodeBuddyBody(body)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return err

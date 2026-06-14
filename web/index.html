@@ -1103,6 +1103,17 @@
                 <button class="btn btn-primary" onclick="saveWebSearchConfig()">Save Web Search</button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title">CodeBuddy</span></div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:10px">
+                        <label class="switch"><input type="checkbox" id="codeBuddyFilterEnabled"><span class="slider"></span></label>
+                        <span>Enable CodeBuddy content filter</span>
+                    </label>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">CodeBuddy's server-side moderation rejects requests that mention competitor brands ("Claude"/"Anthropic"), which fill the Claude Code system prompt — you'd see "系统检测到您当前输入的信息存在敏感内容" / a Usage Policy error. When on (default), the proxy replaces the system prompt with a neutral one and rewrites brand tokens before forwarding to CodeBuddy accounts, so requests clear the filter. Turn off to send requests unmodified.</small>
+                </div>
+                <button class="btn btn-primary" onclick="saveCodeBuddyConfig()">Save CodeBuddy</button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.thinkingSuffix"></label>
@@ -2615,14 +2626,34 @@
                     method: 'POST', headers: { 'X-Admin-Password': password }
                 });
                 const d = await res.json();
+                // For CodeBuddy accounts, also sync upstream quota so the Quota column
+                // populates (and surface any quota error, e.g. an expired OAuth token).
+                const acct = (accountsData || []).find(x => x.id === id);
+                const backend = acct ? (acct.backend || '').toLowerCase() : '';
+                let quotaMsg = '';
+                if (backend === 'codebuddy' || backend === 'codebuddy-ai') {
+                    try {
+                        const qres = await fetch('/admin/api/codebuddy/quota/' + id, {
+                            method: 'POST', headers: { 'X-Admin-Password': password }
+                        });
+                        const qd = await qres.json();
+                        if (qres.ok && qd.status === 'ok') {
+                            quotaMsg = '\nQuota: ' + (qd.used || 0).toFixed(0) + ' / ' + (qd.total || 0).toFixed(0) + ' (' + (qd.plan || '') + ')';
+                        } else {
+                            quotaMsg = '\nQuota sync failed: ' + (qd.error || qd.warning || 'unknown');
+                        }
+                    } catch (qe) {
+                        quotaMsg = '\nQuota sync error';
+                    }
+                }
                 if (d.success) {
                     // Re-pull accounts so modelCount updates, then re-render whichever
                     // tab is showing this account (providers or accounts).
                     await loadAccounts();
                     if (activeDashboardTab() === 'providers') renderProviders();
-                    alert(t('detail.refreshModelCache') + ' OK (' + (d.count || 0) + ' models)');
+                    alert(t('detail.refreshModelCache') + ' OK (' + (d.count || 0) + ' models)' + quotaMsg);
                 } else {
-                    alert(t('common.failed') + ': ' + (d.error || ''));
+                    alert(t('common.failed') + ': ' + (d.error || '') + quotaMsg);
                 }
             } catch (e) {
                 alert(t('common.failed'));
@@ -3531,6 +3562,11 @@
                 if (wsKey) wsKey.value = '';
                 onWebSearchProviderChange();
             }
+            const cbFilter = document.getElementById('codeBuddyFilterEnabled');
+            if (cbFilter) {
+                // Default on: treat a missing field as enabled.
+                cbFilter.checked = d.codeBuddyFilterEnabled !== false;
+            }
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
@@ -3562,6 +3598,18 @@
                 loadSettings();
             } else {
                 alert('Failed to save web search settings');
+            }
+        }
+        async function saveCodeBuddyConfig() {
+            const res = await fetch('/admin/api/settings', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ codeBuddyFilterEnabled: document.getElementById('codeBuddyFilterEnabled').checked })
+            });
+            if (res.ok) {
+                alert('CodeBuddy settings saved');
+                loadSettings();
+            } else {
+                alert('Failed to save CodeBuddy settings');
             }
         }
         async function loadThinkingConfig() {
@@ -4326,6 +4374,10 @@
                 const usedSum = accts.reduce((s, a) => s + (a.totalTokens || 0), 0);
                 const limitSum = accts.reduce((s, a) => s + (a.tokenLimit > 0 ? a.tokenLimit : 0), 0);
                 const exhausted = accts.filter(a => a.tokenLimitReached).length;
+                // Aggregate upstream quota (CodeBuddy credits / Codex windows) across the
+                // card's accounts, so the collapsed header shows quota without expanding.
+                const quotaUsedSum = accts.reduce((s, a) => s + (a.usageLimit > 0 ? (a.usageCurrent || 0) : 0), 0);
+                const quotaLimitSum = accts.reduce((s, a) => s + (a.usageLimit > 0 ? a.usageLimit : 0), 0);
                 const rows = accts.map(a => {
                     const ok = a.hasToken || a.hasApiKey;
                     const statusBadge = ok
@@ -4351,6 +4403,17 @@
                         }
                     }
                     const name = a.nickname || a.email || a.id.slice(0, 8);
+                    // Quota cell: show used / limit + a percentage bar when the upstream
+                    // reports a usage allowance (CodeBuddy credits, Codex windows, etc.).
+                    // Accounts with no quota signal (usageLimit 0) show a dash.
+                    let quotaCell = '<span style="color:var(--muted)">—</span>';
+                    if (a.usageLimit > 0) {
+                        const pct = Math.max(0, Math.min(100, (a.usagePercent || 0) * 100));
+                        const qClass = pct > 90 ? 'critical' : pct > 70 ? 'high' : '';
+                        const resetHint = a.nextResetDate ? ' title="resets ' + escapeHtml(String(a.nextResetDate)) + '"' : '';
+                        quotaCell = '<div class="mini-usage"' + resetHint + '><div class="usage-bar"><div class="usage-fill ' + qClass + '" style="width:' + pct + '%"></div></div>' +
+                            '<div class="usage-text"><span>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + '</span><span>' + pct.toFixed(0) + '%</span></div></div>';
+                    }
                     const actions = '<div class="row-actions">' +
                         '<button class="btn btn-sm btn-icon btn-secondary" onclick="refreshAccountModels(\'' + a.id + '\')" title="' + t('providers.refreshModels') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg></button>' +
                         '<button class="btn btn-sm btn-secondary" onclick="editProviderAccount(\'' + a.id + '\')">' + t('common.edit') + '</button>' +
@@ -4364,6 +4427,7 @@
                         '<td><div class="row-meta">' + statusBadge + enabledBadge + planBadge + modelsBadge + limitBadge + '</div></td>' +
                         '<td class="cell-num">' + (a.requestCount || 0) + '</td>' +
                         '<td class="cell-num">' + formatNum(a.totalTokens || 0) + '</td>' +
+                        '<td>' + quotaCell + '</td>' +
                         '<td>' + actions + '</td>' +
                         '</tr>';
                 }).join('');
@@ -4374,6 +4438,7 @@
                 // exhausted-key warning when any key in the card is spent.
                 let usageStr = formatNum(usedSum) + ' ' + t('accounts.tokens');
                 if (limitSum > 0) usageStr += ' / ' + formatNum(limitSum) + ' ' + t('providers.tokLimit');
+                if (quotaLimitSum > 0) usageStr += ' · ' + t('accounts.mainQuota') + ' ' + quotaUsedSum.toFixed(0) + ' / ' + quotaLimitSum.toFixed(0);
                 let exhaustedStr = exhausted > 0
                     ? ' · <span style="color:var(--danger,#dc2626)">' + t('providers.tokExhaustedN', exhausted) + '</span>'
                     : '';
@@ -4393,6 +4458,7 @@
                     '<th style="width:32px;text-align:center"><input type="checkbox" title="' + t('providers.selectAll') + '" onclick=\'toggleProviderGroup(' + JSON.stringify(groupIds) + ',this.checked)\'' + (allChecked ? ' checked' : '') + '></th>' +
                     '<th>' + t('providers.account') + '</th><th>' + t('providers.status') + '</th>' +
                     '<th class="cell-num">' + t('accounts.requests') + '</th><th class="cell-num">' + t('accounts.tokens') + '</th>' +
+                    '<th>' + t('accounts.mainQuota') + '</th>' +
                     '<th style="text-align:right"> </th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
                     '</div>';
             }).join('');
