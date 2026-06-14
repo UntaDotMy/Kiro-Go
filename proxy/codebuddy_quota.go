@@ -9,6 +9,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,8 +35,13 @@ import (
 // parseCodeBuddyUsage) and src/app/api/oauth/codebuddy/quota-cookie/route.js.
 
 const (
-	codeBuddyUsageURL  = "https://www.codebuddy.ai/billing/meter/get-user-resource"
-	codeBuddyProductCN = "p_tcaca"
+	// codeBuddyUsageURLCookie is the billing endpoint the WEB CONSOLE hits (no /v2),
+	// used by the cookie fallback path. codeBuddyUsagePathOAuth is the /v2 billing
+	// path the IDE OAuth token uses (per 9router open-sse/services/usage.js).
+	codeBuddyUsageURLCookie = "https://www.codebuddy.ai/billing/meter/get-user-resource"
+	codeBuddyUsagePathOAuth = "/v2/billing/meter/get-user-resource"
+	codeBuddyAccountsPath   = "/v2/plugin/accounts"
+	codeBuddyProductCN      = "p_tcaca"
 )
 
 // codeBuddyPackageCodes are the billing "package" identifiers the web console
@@ -71,12 +77,15 @@ type CodeBuddyQuota struct {
 
 // codeBuddyUsageRequest is the billing query body. The time range is "now" to
 // ~101 years out so every active package is in-window (mirrors 9router).
+// PackageCodes is omitempty: the OAuth path omits it (the gateway resolves the
+// caller's own packages from the token), while the cookie path sends the full
+// list (the web console queries by explicit package id).
 type codeBuddyUsageRequest struct {
 	PageNumber               int      `json:"PageNumber"`
 	PageSize                 int      `json:"PageSize"`
 	ProductCode              string   `json:"ProductCode"`
 	Status                   []int    `json:"Status"`
-	PackageCodes             []string `json:"PackageCodes"`
+	PackageCodes             []string `json:"PackageCodes,omitempty"`
 	PackageEndTimeRangeBegin string   `json:"PackageEndTimeRangeBegin"`
 	PackageEndTimeRangeEnd   string   `json:"PackageEndTimeRangeEnd"`
 }
@@ -87,19 +96,96 @@ type codeBuddyUsageRequest struct {
 type codeBuddyBillingAccount struct {
 	PackageCode string `json:"PackageCode"`
 
-	CycleCapacitySizePrecise   *float64 `json:"CycleCapacitySizePrecise"`
-	CycleCapacitySize          *float64 `json:"CycleCapacitySize"`
-	CapacitySizePrecise        *float64 `json:"CapacitySizePrecise"`
-	CapacitySize               *float64 `json:"CapacitySize"`
-	CycleCapacityRemainPrecise *float64 `json:"CycleCapacityRemainPrecise"`
-	CapacityRemainPrecise      *float64 `json:"CapacityRemainPrecise"`
-	CapacityRemain             *float64 `json:"CapacityRemain"`
-	CapacityUsedPrecise        *float64 `json:"CapacityUsedPrecise"`
-	CapacityUsed               *float64 `json:"CapacityUsed"`
+	CycleCapacitySizePrecise   *codeBuddyNum `json:"CycleCapacitySizePrecise"`
+	CycleCapacitySize          *codeBuddyNum `json:"CycleCapacitySize"`
+	CapacitySizePrecise        *codeBuddyNum `json:"CapacitySizePrecise"`
+	CapacitySize               *codeBuddyNum `json:"CapacitySize"`
+	CycleCapacityRemainPrecise *codeBuddyNum `json:"CycleCapacityRemainPrecise"`
+	CapacityRemainPrecise      *codeBuddyNum `json:"CapacityRemainPrecise"`
+	CapacityRemain             *codeBuddyNum `json:"CapacityRemain"`
+	CapacityUsedPrecise        *codeBuddyNum `json:"CapacityUsedPrecise"`
+	CapacityUsed               *codeBuddyNum `json:"CapacityUsed"`
 
-	CycleEndTime     string `json:"CycleEndTime"`
-	DeductionEndTime string `json:"DeductionEndTime"`
-	ExpiredTime      string `json:"ExpiredTime"`
+	CycleEndTime     codeBuddyTime `json:"CycleEndTime"`
+	DeductionEndTime codeBuddyTime `json:"DeductionEndTime"`
+	ExpiredTime      codeBuddyTime `json:"ExpiredTime"`
+}
+
+// codeBuddyNum is a numeric billing field (capacity, remaining, used) that
+// CodeBuddy returns inconsistently as a JSON number OR a JSON string (e.g.
+// "1000.00"). Unmarshals both forms into a float64; a non-numeric string or null
+// becomes 0 (callers gate on the pointer being non-nil for "present").
+type codeBuddyNum float64
+
+func (c *codeBuddyNum) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		*c = 0
+		return nil
+	}
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		str = strings.TrimSpace(str)
+		if str == "" {
+			*c = 0
+			return nil
+		}
+		f, err := strconv.ParseFloat(str, 64)
+		if err != nil {
+			return err
+		}
+		*c = codeBuddyNum(f)
+		return nil
+	}
+	var f float64
+	if err := json.Unmarshal(b, &f); err != nil {
+		return err
+	}
+	*c = codeBuddyNum(f)
+	return nil
+}
+
+// codeBuddyTime is a reset-timestamp field that CodeBuddy returns inconsistently:
+// sometimes as an ISO/date string ("2026-07-01 00:00:00"), sometimes as a numeric
+// Unix timestamp (seconds or milliseconds), and sometimes null. It unmarshals all
+// of those into a normalized string so the rest of the parser can treat resets
+// uniformly. A numeric value is rendered as RFC3339 in UTC; a string is kept
+// verbatim.
+type codeBuddyTime string
+
+func (c *codeBuddyTime) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		*c = ""
+		return nil
+	}
+	// String form: strip the surrounding quotes and keep verbatim.
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		*c = codeBuddyTime(strings.TrimSpace(str))
+		return nil
+	}
+	// Numeric form: Unix seconds or milliseconds. Heuristic: >= 1e12 is ms.
+	var n float64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	if n <= 0 {
+		*c = ""
+		return nil
+	}
+	secs := int64(n)
+	if n >= 1e12 {
+		secs = int64(n) / 1000
+	}
+	*c = codeBuddyTime(time.Unix(secs, 0).UTC().Format(time.RFC3339))
+	return nil
 }
 
 // normalizeCookie collapses a raw cookie blob into a single "k=v; k=v" header
@@ -115,37 +201,200 @@ func normalizeCookie(cookie string) string {
 	return strings.Join(out, "; ")
 }
 
-func codeBuddyUsageBody() []byte {
+// codeBuddyUsageBody builds the billing query body. When includePackages is true
+// (cookie path) the full package-code list is sent; when false (OAuth path) it is
+// omitted, matching the IDE CLI which lets the gateway resolve the caller's own
+// packages from the token.
+func codeBuddyUsageBody(includePackages bool) []byte {
 	now := time.Now()
 	end := now.AddDate(101, 0, 0)
 	fmtTime := func(t time.Time) string { return t.Format("2006-01-02 15:04:05") }
-	b, _ := json.Marshal(codeBuddyUsageRequest{
+	body := codeBuddyUsageRequest{
 		PageNumber:               1,
 		PageSize:                 200,
 		ProductCode:              codeBuddyProductCN,
 		Status:                   []int{0, 3},
-		PackageCodes:             codeBuddyPackageCodes,
 		PackageEndTimeRangeBegin: fmtTime(now),
 		PackageEndTimeRangeEnd:   fmtTime(end),
-	})
+	}
+	if includePackages {
+		body.PackageCodes = codeBuddyPackageCodes
+	}
+	b, _ := json.Marshal(body)
 	return b
 }
 
-// FetchCodeBuddyQuota queries the web-console billing API with the account's
-// stored session cookie and returns normalized credit figures. The cookie (not
-// the OAuth token) is the credential; an account with no WebCookie returns an
-// error so the caller can prompt a (re-)import of the cookie. The account's own
-// proxy is honored so the poll exits the same egress as inference.
+// codeBuddyBillingHost returns the bare host (no scheme) the billing + identity
+// calls target for an account. The international site (codebuddy-ai) and the CN
+// gateway (codebuddy) both serve billing from www.codebuddy.ai per the reference
+// implementation, so that is the default; a per-account BaseURLOverride host wins
+// if one is set.
+func codeBuddyBillingHost(acct *config.Account) string {
+	if acct != nil && strings.TrimSpace(acct.BaseURLOverride) != "" {
+		u := strings.TrimSpace(acct.BaseURLOverride)
+		u = strings.TrimPrefix(u, "https://")
+		u = strings.TrimPrefix(u, "http://")
+		if i := strings.IndexAny(u, "/"); i >= 0 {
+			u = u[:i]
+		}
+		if u != "" {
+			return u
+		}
+	}
+	return "www.codebuddy.ai"
+}
+
+// CodeBuddyIdentity is the account profile served by /v2/plugin/accounts: the
+// display email/nickname shown in the dashboard plus the uid/enterpriseId the
+// billing call needs as headers.
+type CodeBuddyIdentity struct {
+	UID          string
+	EnterpriseID string
+	Email        string
+	Nickname     string
+}
+
+// FetchCodeBuddyIdentity looks up the account profile (email, nickname, uid,
+// enterpriseId) via the authenticated /v2/plugin/accounts endpoint. Used both at
+// login (to populate the dashboard email) and by the quota poll (to carry the
+// X-User-Id / X-Enterprise-Id headers the gateway expects). A failure is
+// non-fatal — callers fall back to whatever they already have.
+func FetchCodeBuddyIdentity(ctx context.Context, acct *config.Account) (CodeBuddyIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	host := codeBuddyBillingHost(acct)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+host+codeBuddyAccountsPath, nil)
+	if err != nil {
+		return CodeBuddyIdentity{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(acct.AccessToken))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Domain", host)
+
+	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(acct)).Do(req)
+	if err != nil {
+		return CodeBuddyIdentity{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != 200 {
+		return CodeBuddyIdentity{}, fmt.Errorf("codebuddy accounts endpoint returned HTTP %d", resp.StatusCode)
+	}
+	var d struct {
+		Data struct {
+			Accounts []struct {
+				UID          string `json:"uid"`
+				EnterpriseID string `json:"enterpriseId"`
+				Email        string `json:"email"`
+				Nickname     string `json:"nickname"`
+				LastLogin    any    `json:"lastLogin"`
+			} `json:"accounts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return CodeBuddyIdentity{}, fmt.Errorf("codebuddy accounts parse failed: %w", err)
+	}
+	if len(d.Data.Accounts) == 0 {
+		return CodeBuddyIdentity{}, nil
+	}
+	// Prefer the account flagged lastLogin, else the first row (mirrors 9router).
+	chosen := d.Data.Accounts[0]
+	for _, a := range d.Data.Accounts {
+		if a.LastLogin != nil {
+			chosen = a
+			break
+		}
+	}
+	return CodeBuddyIdentity{
+		UID:          chosen.UID,
+		EnterpriseID: chosen.EnterpriseID,
+		Email:        chosen.Email,
+		Nickname:     chosen.Nickname,
+	}, nil
+}
+
+// FetchCodeBuddyQuota returns normalized credit figures for a CodeBuddy account.
+// It uses the IDE OAuth access token as the PRIMARY credential — the same token
+// inference uses — so quota tracking is automatic with no manual step (this is
+// what the official CLI and 9router do; the earlier "cookie only" assumption was
+// wrong). When a web session cookie has been imported it is used as a fallback if
+// the OAuth path is rejected. The account's own proxy is honored so the poll exits
+// the same egress as inference.
 func FetchCodeBuddyQuota(ctx context.Context, acct *config.Account) (*CodeBuddyQuota, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cookie := normalizeCookie(acct.WebCookie)
-	if cookie == "" {
-		return nil, fmt.Errorf("no CodeBuddy web session cookie stored for account %s; import one via the cookie-import flow to enable quota tracking", acct.ID)
+
+	// Primary: IDE OAuth token (automatic — no cookie needed).
+	if strings.TrimSpace(acct.AccessToken) != "" {
+		q, err := fetchCodeBuddyQuotaOAuth(ctx, acct)
+		if err == nil {
+			return q, nil
+		}
+		// OAuth failed. Fall through to the cookie path only if a cookie exists;
+		// otherwise surface the OAuth error so the operator knows the token is stale.
+		if normalizeCookie(acct.WebCookie) == "" {
+			return nil, err
+		}
+		logger.Debugf("[CodeBuddy] OAuth quota fetch failed for %s, trying stored cookie: %v", acct.ID, err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", codeBuddyUsageURL, bytes.NewReader(codeBuddyUsageBody()))
+	// Fallback: imported web session cookie.
+	return fetchCodeBuddyQuotaCookie(ctx, acct)
+}
+
+// fetchCodeBuddyQuotaOAuth fetches quota using the IDE OAuth access token, with
+// the identity headers resolved from /v2/plugin/accounts. This is the automatic
+// path: it needs nothing beyond the token the login flow already captured.
+func fetchCodeBuddyQuotaOAuth(ctx context.Context, acct *config.Account) (*CodeBuddyQuota, error) {
+	host := codeBuddyBillingHost(acct)
+	identity, _ := FetchCodeBuddyIdentity(ctx, acct)
+	uid, enterpriseID := identity.UID, identity.EnterpriseID
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+host+codeBuddyUsagePathOAuth, bytes.NewReader(codeBuddyUsageBody(false)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(acct.AccessToken))
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Domain", host)
+	if uid != "" {
+		req.Header.Set("X-User-Id", uid)
+	}
+	if enterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", enterpriseID)
+		req.Header.Set("X-Tenant-Id", enterpriseID)
+	}
+
+	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(acct)).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("codebuddy quota request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return nil, fmt.Errorf("codebuddy IDE OAuth token was rejected (HTTP %d); the token may be expired", resp.StatusCode)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("codebuddy quota endpoint returned HTTP %d", resp.StatusCode)
+	}
+	return parseCodeBuddyQuota(raw)
+}
+
+// fetchCodeBuddyQuotaCookie fetches quota using a manually-imported web session
+// cookie. Retained as a fallback for accounts whose OAuth token can't reach the
+// billing API (rare). An account with no cookie returns an error.
+func fetchCodeBuddyQuotaCookie(ctx context.Context, acct *config.Account) (*CodeBuddyQuota, error) {
+	cookie := normalizeCookie(acct.WebCookie)
+	if cookie == "" {
+		return nil, fmt.Errorf("no CodeBuddy credential available for account %s: OAuth token rejected and no web session cookie stored", acct.ID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", codeBuddyUsageURLCookie, bytes.NewReader(codeBuddyUsageBody(true)))
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +415,7 @@ func FetchCodeBuddyQuota(ctx context.Context, acct *config.Account) (*CodeBuddyQ
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("codebuddy web session cookie is not authorized (HTTP %d); re-import a fresh cookie via the cookie-import flow", resp.StatusCode)
+		return nil, fmt.Errorf("codebuddy web session cookie is not authorized (HTTP %d); re-import a fresh cookie", resp.StatusCode)
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("codebuddy quota endpoint returned HTTP %d", resp.StatusCode)
@@ -175,8 +424,9 @@ func FetchCodeBuddyQuota(ctx context.Context, acct *config.Account) (*CodeBuddyQ
 }
 
 // parseCodeBuddyQuota extracts and sums the credit figures from the billing
-// response. Tolerates the wrapped {Response:{Data:{Accounts:[]}}}, the
-// {data:{accounts:[]}}, and the bare {Accounts:[]} shapes.
+// response. Tolerates the OAuth-path {data:{Response:{Data:{Accounts:[]}}}}, the
+// web-console {Response:{Data:{Accounts:[]}}}, the {data:{accounts:[]}}, and the
+// bare {Accounts:[]} shapes (mirrors 9router parseCodeBuddyUsage envelope order).
 func parseCodeBuddyQuota(raw []byte) (*CodeBuddyQuota, error) {
 	var env struct {
 		Response struct {
@@ -185,6 +435,11 @@ func parseCodeBuddyQuota(raw []byte) (*CodeBuddyQuota, error) {
 			} `json:"Data"`
 		} `json:"Response"`
 		Data struct {
+			Response struct {
+				Data struct {
+					Accounts []codeBuddyBillingAccount `json:"Accounts"`
+				} `json:"Data"`
+			} `json:"Response"`
 			Accounts []codeBuddyBillingAccount `json:"Accounts"`
 			Lower    []codeBuddyBillingAccount `json:"accounts"`
 		} `json:"data"`
@@ -193,7 +448,10 @@ func parseCodeBuddyQuota(raw []byte) (*CodeBuddyQuota, error) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("codebuddy quota parse failed: %w", err)
 	}
-	accounts := env.Response.Data.Accounts
+	accounts := env.Data.Response.Data.Accounts
+	if len(accounts) == 0 {
+		accounts = env.Response.Data.Accounts
+	}
 	if len(accounts) == 0 {
 		accounts = env.Data.Accounts
 	}
@@ -223,7 +481,7 @@ func parseCodeBuddyQuota(raw []byte) (*CodeBuddyQuota, error) {
 		}
 		safeTotal := 0.0
 		if total != nil {
-			safeTotal = *total
+			safeTotal = float64(*total)
 		} else if used != nil || remaining != nil {
 			safeTotal = deref(used) + deref(remaining)
 		}
@@ -239,12 +497,12 @@ func parseCodeBuddyQuota(raw []byte) (*CodeBuddyQuota, error) {
 		q.Total += max0(safeTotal)
 		q.Remaining += max0(safeRemaining)
 		q.Used += max0(safeUsed)
-		q.ResetAt = earlierReset(q.ResetAt, firstNonBlank(a.CycleEndTime, a.DeductionEndTime, a.ExpiredTime))
+		q.ResetAt = earlierReset(q.ResetAt, firstNonBlank(string(a.CycleEndTime), string(a.DeductionEndTime), string(a.ExpiredTime)))
 	}
 	return q, nil
 }
 
-func firstFloat(vals ...*float64) *float64 {
+func firstFloat(vals ...*codeBuddyNum) *codeBuddyNum {
 	for _, v := range vals {
 		if v != nil {
 			return v
@@ -253,11 +511,11 @@ func firstFloat(vals ...*float64) *float64 {
 	return nil
 }
 
-func deref(v *float64) float64 {
+func deref(v *codeBuddyNum) float64 {
 	if v == nil {
 		return 0
 	}
-	return *v
+	return float64(*v)
 }
 
 func max0(v float64) float64 {
@@ -311,6 +569,19 @@ func SyncCodeBuddyQuota(ctx context.Context, acctID string) (*CodeBuddyQuota, er
 	}
 
 	update := acct
+	// Backfill the display email/nickname for accounts created before identity
+	// capture (or where login's best-effort lookup failed). Only fills blanks so a
+	// user-edited nickname is never overwritten.
+	if strings.TrimSpace(acct.Email) == "" {
+		if id, ierr := FetchCodeBuddyIdentity(ctx, &acct); ierr == nil {
+			if id.Email != "" {
+				update.Email = id.Email
+			}
+			if strings.TrimSpace(acct.Nickname) == "" && id.Nickname != "" {
+				update.Nickname = id.Nickname
+			}
+		}
+	}
 	update.UsageLimit = q.Total
 	update.UsageCurrent = q.Used
 	if q.Total > 0 {

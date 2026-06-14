@@ -152,4 +152,16 @@ func (h *Handler) backgroundRefreshNonKiro(account *config.Account) {
 	if config.GetAccountBackend(account) == "codex" {
 		h.refreshCodexAccountUsage(context.Background(), account)
 	}
+
+	// CodeBuddy: quota is served by the web-console billing API, reachable with the
+	// IDE OAuth access token (the same credential inference uses) — so this is fully
+	// automatic, no manual cookie needed. Fold the live credit figures into the
+	// account's Usage* fields so the dashboard tracks real usage.
+	if backend := config.GetAccountBackend(account); backend == "codebuddy" || backend == "codebuddy-ai" {
+		if strings.TrimSpace(account.AccessToken) != "" || strings.TrimSpace(account.WebCookie) != "" {
+			if _, err := SyncCodeBuddyQuota(context.Background(), account.ID); err != nil {
+				logger.Debugf("[BackgroundRefresh] CodeBuddy quota sync failed for %s: %v", redactForLog(account.Email), err)
+			}
+		}
+	}
 }

@@ -197,14 +197,12 @@ type Account struct {
 	QoderMachineID string `json:"qoderMachineId,omitempty"`
 
 	// CodeBuddy (Backend == "codebuddy" / "codebuddy-ai"). The CLI OAuth tokens
-	// live in AccessToken/RefreshToken and drive inference. CodeBuddy quota,
-	// however, is served only by the WEB CONSOLE (codebuddy.ai/billing/...), which
-	// is gated by a Keycloak session cookie that the CLI OAuth token cannot reach.
-	// A manually-imported web session cookie is stored here so the quota poller
-	// (proxy/codebuddy_quota.go) can fetch REAL credit figures into the
-	// UsageCurrent/UsageLimit/UsagePercent fields above instead of guessing. Inert
-	// for every non-CodeBuddy account. WebCookieAt is the capture time (Unix s) so
-	// the dashboard can show staleness and a refresh can re-capture an expired one.
+	// live in AccessToken/RefreshToken and drive BOTH inference AND quota: the
+	// web-console billing API (codebuddy.ai/v2/billing/...) accepts the IDE OAuth
+	// Bearer token, so quota tracking is automatic with no manual step (see
+	// proxy/codebuddy_quota.go). WebCookie is an OPTIONAL fallback: a manually
+	// imported web session cookie used only if the OAuth token is rejected. Inert
+	// for every non-CodeBuddy account. WebCookieAt is the capture time (Unix s).
 	WebCookie   string `json:"webCookie,omitempty"`
 	WebCookieAt int64  `json:"webCookieAt,omitempty"`
 
@@ -462,6 +460,17 @@ type Config struct {
 	// upstream MCP endpoint is not guaranteed on every account tier/region; a
 	// failed call falls back to dropping the tool so a request never breaks.
 	WebSearchEnabled *bool `json:"webSearchEnabled,omitempty"`
+
+	// CodeBuddyFilterEnabled turns on outbound request sanitization for CodeBuddy
+	// (Tencent) accounts. CodeBuddy runs server-side content moderation that flags
+	// competitor brand tokens — "Claude"/"Anthropic", which saturate the Claude Code
+	// system prompt — and rejects the request with a canned Chinese refusal that
+	// Claude Code surfaces as a Usage Policy error. When on (the default), the proxy
+	// replaces the Claude Code system prompt with a neutral one and rewrites brand
+	// tokens in the rest of the body before forwarding, so normal coding traffic
+	// clears the filter. ON by default: a nil pointer means "use the default (on)";
+	// set explicitly to false to send requests unmodified.
+	CodeBuddyFilterEnabled *bool `json:"codeBuddyFilterEnabled,omitempty"`
 
 	// ToolSearchEnabled turns on proxy-side emulation of Anthropic's Tool Search
 	// feature (the tool_search_tool_regex / tool_search_tool_bm25 server tools).
@@ -1020,6 +1029,22 @@ func DisableAccountOverage(id string) error {
 		}
 	}
 	return nil
+}
+
+// SetAccountWebCookie stores a CodeBuddy web-console session cookie on an account
+// (and stamps the capture time) so the quota poller can fetch real credit figures.
+// Returns an error if no account matches the id.
+func SetAccountWebCookie(id, cookie string, capturedAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].WebCookie = cookie
+			cfg.Accounts[i].WebCookieAt = capturedAt
+			return Save()
+		}
+	}
+	return fmt.Errorf("account %s not found", id)
 }
 
 // UpdateAccountOverageStatus persists the cached snapshot of the REAL AWS
@@ -1870,6 +1895,27 @@ func UpdateWebSearchEnabled(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.WebSearchEnabled = &enabled
+	return Save()
+}
+
+// GetCodeBuddyFilterEnabled reports whether outbound CodeBuddy request
+// sanitization is on. Default TRUE: a nil pointer (fresh install or a config that
+// predates this field) means "use the default", which is on. Only an explicit
+// false opts out.
+func GetCodeBuddyFilterEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.CodeBuddyFilterEnabled == nil {
+		return true
+	}
+	return *cfg.CodeBuddyFilterEnabled
+}
+
+// UpdateCodeBuddyFilterEnabled persists the CodeBuddy sanitization toggle.
+func UpdateCodeBuddyFilterEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.CodeBuddyFilterEnabled = &enabled
 	return Save()
 }
 
