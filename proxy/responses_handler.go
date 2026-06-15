@@ -201,7 +201,7 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits, 0)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -611,7 +611,7 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 	// reflects this request's per-account credits/tokens (see handler.go).
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits, 0)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)

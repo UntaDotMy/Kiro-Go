@@ -501,19 +501,41 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 	return applySystemPromptFilters(systemPrompt)
 }
 
-// applySystemPromptFilters runs the full filter chain on a system prompt:
+// kiroKeywordReplacer rewrites residual competitor brand tokens in the kept
+// content so no fingerprintable Anthropic/Claude token reaches the Kiro upstream.
+// Modeled on codeBuddyKeywordReplacer. Order matters: strings.Replacer matches
+// argument order at each position, so multi-word phrases precede single-word
+// fallbacks.
+var kiroKeywordReplacer = strings.NewReplacer(
+	"Anthropic's official CLI for Claude", "Amazon's official CLI for Kiro",
+	"Claude Code", "Kiro",
+	"claude code", "kiro",
+	"Claude", "Kiro",
+	"claude", "kiro",
+	"Anthropic", "Amazon",
+	"anthropic", "amazon",
+)
+
+// applySystemPromptFilters runs the full filter chain on a system prompt.
 //
-//  1. Detect Claude Code CLI system prompt -> drop the HARNESS boilerplate
-//     (gated by FilterClaudeCode toggle) WHILE preserving genuine user/project
-//     memory (CLAUDE.md / AGENTS.md) that Claude Code embeds inside
-//     <system-reminder> blocks. The proxy used to replace the prompt with a
-//     static "Help the user..." line, but the standalone replacement was itself
-//     recognizable as fake injection — so it then dropped the system prompt
-//     ENTIRELY. That over-corrected: when CLAUDE.md rode inside the system
-//     prompt it was thrown away too, which is why the model stopped honoring it.
-//     We now keep the user-memory reminders (real user instructions, not
-//     fingerprintable harness text) and drop only the Anthropic harness
-//     boilerplate. Tool definitions still travel via the structured tools field.
+// CRITICAL — why we do NOT fabricate a replacement identity line:
+// Kiro / CodeWhisperer has no system-message slot. Whatever this function
+// returns is PREPENDED to the user's turn as plain text (see ClaudeToKiro:
+// finalContent = systemPrompt + "\n\n" + userContent). The CodeBuddy filter can
+// safely swap in "You are CodeBuddy Code." because CodeBuddy keeps a real
+// role:"system" message — the line is invisible as identity. Here it is not:
+// a fabricated sentence like "You are Kiro…" lands inside the user stream, the
+// model reads it as text the user typed, and derails into injection-detection
+// (the meta-commentary echo and mid-stream reasoning cut-off the operator saw).
+//
+// So when a Claude Code harness prompt is detected we:
+//  1. Detect Claude Code CLI system prompt (gated by FilterClaudeCode) and KEEP
+//     only genuine user/project memory (CLAUDE.md / AGENTS.md) that Claude Code
+//     embeds inside <system-reminder> blocks, rewriting residual brand tokens.
+//     We prepend NOTHING synthetic. Harness scaffolding is removed (that is the
+//     filter's whole job); the user's own messages are never touched — they ride
+//     in their own fields. When there is no embedded memory the result is empty,
+//     which means "add no preamble", NOT "drop the user's content".
 //  2. Strip "--- SYSTEM PROMPT ---" boundary markers (gated by FilterStripBoundaries).
 //  3. Strip environment-noise lines and noisy <system-reminder> blocks (gated by
 //     FilterEnvNoise) — memory reminders are preserved even here.
@@ -529,19 +551,20 @@ func applySystemPromptFilters(prompt string) string {
 
 	cfg := config.GetPromptFilterConfig()
 
-	// 1. Detect Claude Code CLI system prompt → strip harness boilerplate but
-	//    keep any embedded user/project memory (CLAUDE.md / AGENTS.md). Dropping
-	//    the whole prompt lost that memory; preserving the memory reminders keeps
-	//    the user's instructions flowing to the model without re-introducing a
-	//    fingerprintable fake-injection line.
 	if cfg.FilterClaudeCode && isClaudeCodeSystemPrompt(prompt) {
+		// Keep genuine CLAUDE.md / AGENTS.md memory; fabricate no identity line.
+		// Run the shared noise filters over the preserved memory so a stray
+		// billing-header line riding alongside it can't trip upstream moderation,
+		// then rewrite residual brand tokens (Claude→Kiro, Anthropic→Amazon).
 		memory := extractUserMemoryReminders(prompt)
 		if memory == "" {
 			return ""
 		}
-		// Run the shared noise filters over the preserved memory so a stray
-		// billing-header line riding alongside it can't trip upstream moderation.
-		return applySharedFiltersWithConfig(memory, cfg)
+		cleaned := applySharedFiltersWithConfig(memory, cfg)
+		if cleaned == "" {
+			return ""
+		}
+		return kiroKeywordReplacer.Replace(cleaned)
 	}
 
 	return applySharedFiltersWithConfig(prompt, cfg)

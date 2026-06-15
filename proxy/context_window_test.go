@@ -103,3 +103,48 @@ func TestClampPercent(t *testing.T) {
 		}
 	}
 }
+
+// TestContextWindowForModelDefaultsTo1M is the regression guard for the reported
+// TestContextWindowForClaudeClient is the regression guard for the FIELD-OBSERVED
+// bug: with a plain model id (claude-opus-4-8) Claude Code meters against 200K and
+// only switches to 1M for the [1M] model variant (which sends the context-1m beta
+// header). When the proxy back-converts Kiro's contextUsagePercentage it MUST use
+// the same window the client meters against, or the gauge desyncs — a 1M-scaled
+// count read against a 200K assumption overshoots ~5x and pegs at 100% with no
+// auto-compaction. So contextWindowForClaudeClient caps at 200K unless allow1M.
+//
+// contextWindowForModel still returns the model's true window (1M for 4.6+); the
+// GATE is what keys the reported window to the client's beta opt-in.
+func TestContextWindowForClaudeClient(t *testing.T) {
+	h := newHandlerWithModelCache(nil)
+
+	// Plain (no beta): a 1M-capable model is reported as 200K to match the client.
+	if got := h.contextWindowForClaudeClient("claude-opus-4-8", false); got != defaultContextWindow {
+		t.Errorf("opus-4-8 without 1M beta = %d, want %d (capped to client meter)", got, defaultContextWindow)
+	}
+	// Beta opt-in ([1M] variant): the true 1M window is honored.
+	if got := h.contextWindowForClaudeClient("claude-opus-4-8", true); got != 1_000_000 {
+		t.Errorf("opus-4-8 with 1M beta = %d, want 1000000", got)
+	}
+	// Sub-1M model: 200K either way (no inflation when the client opts in).
+	if got := h.contextWindowForClaudeClient("claude-sonnet-4.5", true); got != defaultContextWindow {
+		t.Errorf("sonnet-4.5 with beta = %d, want %d", got, defaultContextWindow)
+	}
+
+	// The underlying resolver is unchanged: it still reports the model's true
+	// window; only the client-facing gate caps it.
+	if got := h.contextWindowForModel("claude-opus-4-8"); got != 1_000_000 {
+		t.Errorf("contextWindowForModel(opus-4-8) = %d, want 1000000 (true window, ungated)", got)
+	}
+
+	// Live tokenLimits 1M is also gated to 200K when the client did not opt in.
+	hLive := newHandlerWithModelCache([]ModelInfo{
+		{ModelId: "claude-opus-4.7", TokenLimits: tokenLimits(1_000_000, 32000)},
+	})
+	if got := hLive.contextWindowForClaudeClient("claude-opus-4.7", false); got != defaultContextWindow {
+		t.Errorf("live-1M without beta = %d, want %d (capped)", got, defaultContextWindow)
+	}
+	if got := hLive.contextWindowForClaudeClient("claude-opus-4.7", true); got != 1_000_000 {
+		t.Errorf("live-1M with beta = %d, want 1000000", got)
+	}
+}

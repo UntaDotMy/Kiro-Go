@@ -205,6 +205,42 @@ func resolveModelEffort(rawEffort string, supportedLevels []string) (string, boo
 	return best, true
 }
 
+// buildEffortSchema reconstructs the minimal AdditionalModelRequestFieldsSchema
+// fragment that modelEffortLevels reads, from a flat list of supported levels.
+// It is the inverse of modelEffortLevels and is used to rehydrate a persisted
+// per-model effort list (config.KnownModelEffort) back into a cached ModelInfo
+// on boot, so graded effort works immediately after a restart instead of being
+// silently dropped until the first live ListAvailableModels refresh lands.
+// Returns nil for an empty list so callers attach no schema (no effort support).
+func buildEffortSchema(levels []string) map[string]interface{} {
+	if len(levels) == 0 {
+		return nil
+	}
+	enum := make([]interface{}, 0, len(levels))
+	for _, l := range levels {
+		if l = strings.ToLower(strings.TrimSpace(l)); l != "" {
+			enum = append(enum, l)
+		}
+	}
+	if len(enum) == 0 {
+		return nil
+	}
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"output_config": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"effort": map[string]interface{}{
+						"type": "string",
+						"enum": enum,
+					},
+				},
+			},
+		},
+	}
+}
+
 // buildEffortRequestFields wraps a resolved effort level into the
 // additionalModelRequestFields payload shape the Kiro upstream expects:
 //

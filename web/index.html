@@ -1103,17 +1103,6 @@
                 <button class="btn btn-primary" onclick="saveWebSearchConfig()">Save Web Search</button>
             </div>
             <div class="card">
-                <div class="card-header"><span class="card-title">CodeBuddy</span></div>
-                <div class="form-group">
-                    <label style="display:flex;align-items:center;gap:10px">
-                        <label class="switch"><input type="checkbox" id="codeBuddyFilterEnabled"><span class="slider"></span></label>
-                        <span>Enable CodeBuddy content filter</span>
-                    </label>
-                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">CodeBuddy's server-side moderation rejects requests that mention competitor brands ("Claude"/"Anthropic"), which fill the Claude Code system prompt — you'd see "系统检测到您当前输入的信息存在敏感内容" / a Usage Policy error. When on (default), the proxy replaces the system prompt with a neutral one and rewrites brand tokens before forwarding to CodeBuddy accounts, so requests clear the filter. Turn off to send requests unmodified.</small>
-                </div>
-                <button class="btn btn-primary" onclick="saveCodeBuddyConfig()">Save CodeBuddy</button>
-            </div>
-            <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.thinkingSuffix"></label>
@@ -1249,6 +1238,13 @@
                                 <span data-i18n="settings.filterStripBoundaries"></span>
                             </label>
                             <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterStripBoundariesHint"></small>
+                        </div>
+                        <div>
+                            <label style="display:flex;align-items:center;gap:10px">
+                                <label class="switch"><input type="checkbox" id="codeBuddyFilterEnabled"><span class="slider"></span></label>
+                                <span data-i18n="settings.filterCodeBuddy"></span>
+                            </label>
+                            <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterCodeBuddyHint"></small>
                         </div>
                     </div>
                 </div>
@@ -1543,12 +1539,14 @@
                 'settings.proxySaved': '代理设置已保存',
                 'settings.promptFilter': 'System Prompt 过滤',
                 'settings.builtinFilters': '内置过滤器',
-                'settings.filterClaudeCode': '丢弃 Claude Code 系统提示',
-                'settings.filterClaudeCodeHint': '仅作用于请求的 SYSTEM 字段。检测到 Claude Code 内置系统提示时，整个 system 字段被丢弃——工具定义仍通过结构化 tools 字段传递，模型使用训练时的默认表现来组织回复。目的：避免上游模型把脚手架提示词识别为伪造的注入。注意：CLAUDE.md / AGENTS.md 并不在 system 字段中（它们随第一条用户消息传递），所以此开关不影响它们。建议：开启。',
+                'settings.filterClaudeCode': 'Kiro 内容过滤',
+                'settings.filterClaudeCodeHint': '仅作用于 Kiro/CodeWhisperer 账号，针对请求的 SYSTEM 字段。检测到 Claude Code 内置系统提示时，移除脚手架样板并保留你真正的 CLAUDE.md / AGENTS.md 记忆，同时改写残留的品牌词（Claude→Kiro，Anthropic→Amazon）。不添加任何合成内容：Kiro 没有独立的 system 消息槽，此处保留的内容会被前置到你的第一条用户消息中——若伪造一行身份说明，会被模型当作用户输入的文字并对其评论，因此不添加。没有内嵌记忆时结果为空（不加前缀），你自己的消息绝不会被改动。目的：避免上游模型把脚手架提示词识别为伪造注入，同时不丢失你的指令。建议：开启。',
                 'settings.filterEnvNoise': '过滤环境噪音行',
-                'settings.filterEnvNoiseHint': '移除注入的噪音：环境变量、Git 状态、最近提交、以及保留的计费头行——并且会丢弃整个 <system-reminder>…</system-reminder> 块。重要：Claude Code 把 CLAUDE.md 和 AGENTS.md 的内容放在 <system-reminder> 块里传递，因此保持开启会在这些项目记忆文件到达模型之前将其一并删除。若希望 CLAUDE.md / AGENTS.md 指令生效请关闭——代价是每次请求的 token 增多（环境/Git 噪音会一并带上），并失去计费头清理。建议：除非依赖 CLAUDE.md，否则开启。',
+                'settings.filterEnvNoiseHint': '仅作用于 Kiro/CodeWhisperer 账号。从系统提示和用户消息中移除注入的噪音：环境变量、Git 状态、最近提交、以及保留的 x-anthropic-billing-header 行（该头若到达 CodeWhisperer/Bedrock 会返回 HTTP 400）。同时丢弃整个 <system-reminder>…</system-reminder> 块，但携带 CLAUDE.md / AGENTS.md 记忆的块会被保留。默认关闭：除非遇到计费头 400 或想精简环境/Git 噪音，否则保持关闭即可——开启无害，但正常使用并不需要。',
                 'settings.filterStripBoundaries': '清理边界标记',
-                'settings.filterStripBoundariesHint': '从客户端提交的系统提示中清除 --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- 等边界标记行（代理本身已不再发出这类标记）。纯属外观清理，不影响 CLAUDE.md 或工具行为。可安全保持开启。',
+                'settings.filterStripBoundariesHint': '仅作用于 Kiro/CodeWhisperer 账号。从客户端提交的提示中清除 --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- 等边界标记行。代理本身已不再发出这类标记，因此仅对极少数会发送它们的客户端有意义。纯属外观清理，不影响 CLAUDE.md 或工具行为。默认关闭：仅当你的客户端会注入这些标记时才开启。',
+                'settings.filterCodeBuddy': 'CodeBuddy 内容过滤',
+                'settings.filterCodeBuddyHint': '仅作用于 CodeBuddy 账号。CodeBuddy 的服务端审核会拒绝提及竞品品牌（"Claude"/"Anthropic"）的请求，而这些词填满了 Claude Code 系统提示——你会看到"系统检测到您当前输入的信息存在敏感内容"/ 用量策略错误。开启时（默认），代理在转发前把系统提示替换为中性提示（"You are CodeBuddy Code."）并改写品牌词，使请求通过审核。CodeBuddy 保留真正的 system 消息槽，因此该中性行在其中是不可见的。关闭则原样发送。建议：开启。',
                 'settings.savePromptFilter': '保存过滤设置',
                 'settings.promptFilterSaved': '过滤设置已保存',
                 'settings.customRules': '自定义过滤规则',
@@ -2006,12 +2004,14 @@
                 'settings.proxySaved': 'Proxy settings saved',
                 'settings.promptFilter': 'System Prompt Filter',
                 'settings.builtinFilters': 'Built-in Filters',
-                'settings.filterClaudeCode': 'Drop Claude Code system prompts',
-                'settings.filterClaudeCodeHint': 'Targets the request SYSTEM field only. When the Claude Code CLI built-in system prompt is detected, the whole system field is dropped — your tool definitions still travel via the structured tools field, and the model styles its replies from its training defaults. Purpose: stop the upstream model from fingerprinting the harness prompt as a fake injection. Note: CLAUDE.md / AGENTS.md do NOT live in the system field (they ride in the first user message), so this toggle does not affect them. Recommended: ON.',
+                'settings.filterClaudeCode': 'Kiro content filter',
+                'settings.filterClaudeCodeHint': 'Kiro/CodeWhisperer accounts only. Targets the request SYSTEM field. When the Claude Code CLI built-in system prompt is detected, the harness scaffolding is removed and your genuine CLAUDE.md / AGENTS.md memory is preserved, with residual brand tokens rewritten (Claude→Kiro, Anthropic→Amazon). Nothing synthetic is added: Kiro has no system-message slot, so anything kept here is prepended to your first user turn — a fabricated identity line would read as user-typed text and make the model comment on it, so we add none. When there is no embedded memory the result is empty (no preamble); your own messages are never touched. Purpose: stop the upstream model from fingerprinting the harness prompt as a fake injection, without losing your instructions. Recommended: ON.',
                 'settings.filterEnvNoise': 'Strip environment noise lines',
-                'settings.filterEnvNoiseHint': 'Removes injected noise: environment variables, git status, recent commits, and the reserved billing-header line — and it drops whole <system-reminder>…</system-reminder> blocks. IMPORTANT: Claude Code delivers CLAUDE.md and AGENTS.md content INSIDE <system-reminder> blocks, so leaving this ON also strips your project memory files before they reach the model. Turn OFF if you want CLAUDE.md / AGENTS.md instructions honored — the tradeoff is more tokens per request (the env/git noise rides along) and loss of the billing-header strip. Recommended: ON unless you rely on CLAUDE.md.',
+                'settings.filterEnvNoiseHint': 'Kiro/CodeWhisperer accounts only. Removes injected noise from the system prompt and user messages: environment variables, git status, recent commits, and the reserved x-anthropic-billing-header line (CodeWhisperer/Bedrock returns HTTP 400 if that header reaches it). It also drops whole <system-reminder>…</system-reminder> blocks EXCEPT those carrying CLAUDE.md / AGENTS.md memory, which are preserved. Default OFF: leave it off unless you hit a billing-header 400 or want the env/git noise trimmed — turning it on costs nothing but is not required for normal use.',
                 'settings.filterStripBoundaries': 'Clean boundary markers',
-                'settings.filterStripBoundariesHint': 'Strips --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- marker lines from client-supplied system prompts (the proxy itself no longer emits them). Cosmetic cleanup with no effect on CLAUDE.md or tool behavior. Safe to leave ON.',
+                'settings.filterStripBoundariesHint': 'Kiro/CodeWhisperer accounts only. Strips --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- marker lines from client-supplied prompts. The proxy itself no longer emits these markers, so this only matters for the rare client that sends them. Purely cosmetic, no effect on CLAUDE.md or tool behavior. Default OFF: turn on only if your client injects these markers.',
+                'settings.filterCodeBuddy': 'CodeBuddy content filter',
+                'settings.filterCodeBuddyHint': 'CodeBuddy accounts only. CodeBuddy\'s server-side moderation rejects requests that mention competitor brands ("Claude"/"Anthropic"), which fill the Claude Code system prompt — you\'d see "系统检测到您当前输入的信息存在敏感内容" / a Usage Policy error. When ON (default), the proxy replaces the system prompt with a neutral one ("You are CodeBuddy Code.") and rewrites brand tokens before forwarding, so requests clear the filter. CodeBuddy keeps a real system-message slot, so the neutral line is invisible there. Turn OFF to send requests unmodified. Recommended: ON.',
                 'settings.savePromptFilter': 'Save Filter Settings',
                 'settings.promptFilterSaved': 'Filter settings saved',
                 'settings.customRules': 'Custom Filter Rules',
@@ -2778,13 +2778,13 @@
                 '</div>';
             document.getElementById('detailBody').innerHTML =
                 '<div class="detail-section"><h4>' + t('detail.basicInfo') + '</h4><div class="detail-grid">' +
-                '<div class="detail-item"><div class="detail-label">' + t('detail.email') + '</div><div class="detail-value">' + getDisplayEmail(a.email, null) + '</div></div>' +
-                '<div class="detail-item"><div class="detail-label">' + t('detail.userId') + '</div><div class="detail-value">' + (a.userId || '-') + '</div></div>' +
-                '<div class="detail-item"><div class="detail-label">' + t('detail.authMethod') + '</div><div class="detail-value">' + formatAuthMethod(a.provider || a.authMethod) + '</div></div>' +
-                '<div class="detail-item"><div class="detail-label">' + t('detail.region') + '</div><div class="detail-value">' + (a.region || 'us-east-1') + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.email') + '</div><div class="detail-value">' + escapeHTML(getDisplayEmail(a.email, null)) + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.userId') + '</div><div class="detail-value">' + escapeHTML(a.userId || '-') + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.authMethod') + '</div><div class="detail-value">' + escapeHTML(formatAuthMethod(a.provider || a.authMethod)) + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.region') + '</div><div class="detail-value">' + escapeHTML(a.region || 'us-east-1') + '</div></div>' +
                 '</div></div>' +
                 '<div class="detail-section"><h4>' + t('detail.machineId') + '</h4><div class="machine-id-row">' +
-                '<input type="text" id="machineIdInput" value="' + (a.machineId || '') + '" placeholder="UUID">' +
+                '<input type="text" id="machineIdInput" value="' + escapeHTML(a.machineId || '') + '" placeholder="UUID">' +
                 '<button class="btn btn-sm btn-secondary" onclick="generateMachineId()">' + t('detail.generate') + '</button>' +
                 '<button class="btn btn-sm btn-primary" onclick="saveMachineId(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div></div>' +
@@ -2808,16 +2808,16 @@
                 '</div>' +
                 AWS_OVERAGE_SECTION_PLACEHOLDER +
                 '<div class="detail-section"><h4>' + t('detail.proxyURL') + '</h4><div class="machine-id-row">' +
-                '<input type="text" id="proxyURLInput" value="' + (a.proxyURL || '') + '" placeholder="socks5://host:port" style="flex:1">' +
+                '<input type="text" id="proxyURLInput" value="' + escapeHTML(a.proxyURL || '') + '" placeholder="socks5://host:port" style="flex:1">' +
                 '<button class="btn btn-sm btn-primary" onclick="saveProxyURL(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div><p style="color:#64748b;font-size:12px;margin-top:4px">' + t('detail.proxyHint') + '</p></div>' +
                 '<div class="detail-section"><h4>' + t('detail.subscription') + '</h4><div class="detail-grid">' +
-                '<div class="detail-item"><div class="detail-label">' + t('detail.subscriptionType') + '</div><div class="detail-value">' + (a.subscriptionTitle || a.subscriptionType || '-') + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.subscriptionType') + '</div><div class="detail-value">' + escapeHTML(a.subscriptionTitle || a.subscriptionType || '-') + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.tokenExpiry') + '</div><div class="detail-value">' + (a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.mainQuota') + '</div><div class="detail-value">' + (a.usageCurrent?.toFixed(1) || 0) + ' / ' + (a.usageLimit?.toFixed(0) || 0) + '</div></div>' +
-                '<div class="detail-item"><div class="detail-label">' + t('detail.resetDate') + '</div><div class="detail-value">' + (a.nextResetDate || '-') + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('detail.resetDate') + '</div><div class="detail-value">' + escapeHTML(a.nextResetDate || '-') + '</div></div>' +
                 (a.trialUsageLimit > 0 ? '<div class="detail-item"><div class="detail-label">' + t('detail.trialQuota') + '</div><div class="detail-value">' + (a.trialUsageCurrent?.toFixed(1) || 0) + ' / ' + (a.trialUsageLimit?.toFixed(0) || 0) + '</div></div>' +
-                    '<div class="detail-item"><div class="detail-label">' + t('detail.trialStatus') + '</div><div class="detail-value">' + (a.trialStatus || '-') + '</div></div>' +
+                    '<div class="detail-item"><div class="detail-label">' + t('detail.trialStatus') + '</div><div class="detail-value">' + escapeHTML(a.trialStatus || '-') + '</div></div>' +
                     '<div class="detail-item"><div class="detail-label">' + t('detail.trialExpiry') + '</div><div class="detail-value">' + (a.trialExpiresAt ? new Date(a.trialExpiresAt * 1000).toLocaleString() : '-') + '</div></div>' : '') +
                 '</div></div>' +
                 '<div class="detail-section"><h4>' + t('detail.statistics') + '</h4><div class="detail-grid">' +
@@ -2846,13 +2846,13 @@
                     container.innerHTML = sortedModels.map(m => {
                         const creditRatio = m.rateMultiplier || 1;
                         return '<div class="model-item">' +
-                            '<div class="model-name">' + m.modelId + '</div>' +
-                            '<div class="model-credit"><span class="credit-ratio">' + creditRatio + 'x credit</span></div>' +
-                            '<div class="model-info">' + (m.description || '') + '</div>' +
+                            '<div class="model-name">' + escapeHTML(m.modelId) + '</div>' +
+                            '<div class="model-credit"><span class="credit-ratio">' + escapeHTML(String(creditRatio)) + 'x credit</span></div>' +
+                            '<div class="model-info">' + escapeHTML(m.description || '') + '</div>' +
                             '</div>';
                     }).join('') || '<p style="color:#64748b">' + t('detail.noModels') + '</p>';
                 } else {
-                    container.innerHTML = '<p style="color:#ef4444">' + t('detail.loadFailed') + ': ' + (d.error || '') + '</p>';
+                    container.innerHTML = '<p style="color:#ef4444">' + t('detail.loadFailed') + ': ' + escapeHTML(d.error || '') + '</p>';
                 }
             } catch (e) { container.innerHTML = '<p style="color:#ef4444">' + t('detail.loadFailed') + '</p>'; }
         }
@@ -2941,7 +2941,7 @@
             if (testLogs.length > 100) testLogs.shift();
             getTestLogPanel();
             const logDiv = document.getElementById('testLogContent');
-            logDiv.innerHTML += '<div style="color:' + color + ';margin-bottom:2px;">[' + time + '] ' + msg + '</div>';
+            logDiv.innerHTML += '<div style="color:' + color + ';margin-bottom:2px;">[' + time + '] ' + escapeHTML(msg) + '</div>';
             logDiv.scrollTop = logDiv.scrollHeight;
         }
         
@@ -3158,7 +3158,10 @@
         function buildApiKeyForm(prefix, k) {
             // prefix is "new" or "ed". k is undefined for create, the existing key for edit.
             const v = (path, def) => (k && k[path] != null ? k[path] : def);
-            const escape = s => String(s == null ? '' : s).replace(/"/g, '&quot;');
+            // Full HTML-entity escape (shared helper), not quote-only — closes the
+            // attribute-breakout XSS where a key name like x"><img onerror=…> would
+            // otherwise inject markup through the value="" interpolations below.
+            const escape = s => escapeHTML(s);
             const tzList = ['UTC', 'Asia/Singapore', 'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Jakarta',
                 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'America/New_York', 'America/Los_Angeles',
                 'Australia/Sydney'];
@@ -3562,11 +3565,6 @@
                 if (wsKey) wsKey.value = '';
                 onWebSearchProviderChange();
             }
-            const cbFilter = document.getElementById('codeBuddyFilterEnabled');
-            if (cbFilter) {
-                // Default on: treat a missing field as enabled.
-                cbFilter.checked = d.codeBuddyFilterEnabled !== false;
-            }
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
@@ -3598,18 +3596,6 @@
                 loadSettings();
             } else {
                 alert('Failed to save web search settings');
-            }
-        }
-        async function saveCodeBuddyConfig() {
-            const res = await fetch('/admin/api/settings', {
-                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ codeBuddyFilterEnabled: document.getElementById('codeBuddyFilterEnabled').checked })
-            });
-            if (res.ok) {
-                alert('CodeBuddy settings saved');
-                loadSettings();
-            } else {
-                alert('Failed to save CodeBuddy settings');
             }
         }
         async function loadThinkingConfig() {
@@ -3748,6 +3734,8 @@
             document.getElementById('filterClaudeCode').checked = !!d.filterClaudeCode;
             document.getElementById('filterEnvNoise').checked = !!d.filterEnvNoise;
             document.getElementById('filterStripBoundaries').checked = !!d.filterStripBoundaries;
+            // CodeBuddy filter is now owned by this same endpoint (default on).
+            document.getElementById('codeBuddyFilterEnabled').checked = d.codeBuddyFilterEnabled !== false;
             promptRules = d.rules || [];
             renderPromptRules();
         }
@@ -3758,6 +3746,7 @@
                     filterClaudeCode: document.getElementById('filterClaudeCode').checked,
                     filterEnvNoise: document.getElementById('filterEnvNoise').checked,
                     filterStripBoundaries: document.getElementById('filterStripBoundaries').checked,
+                    codeBuddyFilterEnabled: document.getElementById('codeBuddyFilterEnabled').checked,
                     rules: promptRules
                 })
             });
@@ -3771,17 +3760,17 @@
                 const typeLabel = r.type === 'lines-containing' ? t('promptFilter.typeContains') : t('promptFilter.typeRegex');
                 const replacePlaceholder = r.type === 'lines-containing' ? '' : t('promptFilter.emptyRemove');
                 const replaceRow = r.type !== 'lines-containing'
-                    ? '<div style="margin-top:4px"><b>' + t('promptFilter.replace') + ':</b> <input value="' + (r.replace||'').replace(/"/g,'&quot;') + '" onchange="updateRule(' + i + ',\'replace\',this.value)" style="width:70%;padding:2px 6px;border:1px solid #d1d5db;border-radius:3px;font-size:12px;font-family:monospace" placeholder="' + replacePlaceholder + '"></div>'
+                    ? '<div style="margin-top:4px"><b>' + t('promptFilter.replace') + ':</b> <input value="' + escapeHTML(r.replace||'') + '" onchange="updateRule(' + i + ',\'replace\',this.value)" style="width:70%;padding:2px 6px;border:1px solid #d1d5db;border-radius:3px;font-size:12px;font-family:monospace" placeholder="' + replacePlaceholder + '"></div>'
                     : '';
                 return '<div style="border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;margin-bottom:6px;background:' + (r.enabled?'#f0fdf4':'#fef2f2') + '">' +
                     '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
                     '<label class="switch" style="transform:scale(0.8)"><input type="checkbox" ' + (r.enabled?'checked':'') + ' onchange="toggleRule(' + i + ')"><span class="slider"></span></label>' +
-                    '<input value="' + (r.name||'').replace(/"/g,'&quot;') + '" onchange="updateRule(' + i + ',\'name\',this.value)" style="font-size:13px;font-weight:600;border:none;border-bottom:1px dashed #cbd5e1;background:transparent;outline:none;flex:1" placeholder="' + t('promptFilter.unnamed') + '">' +
+                    '<input value="' + escapeHTML(r.name||'') + '" onchange="updateRule(' + i + ',\'name\',this.value)" style="font-size:13px;font-weight:600;border:none;border-bottom:1px dashed #cbd5e1;background:transparent;outline:none;flex:1" placeholder="' + t('promptFilter.unnamed') + '">' +
                     '<span style="font-size:11px;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:3px;white-space:nowrap">' + typeLabel + '</span>' +
                     '<button onclick="removeRule(' + i + ')" style="margin-left:4px;background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px;line-height:1">&times;</button>' +
                     '</div>' +
                     '<div style="font-size:12px;color:#475569">' +
-                    '<div><b>' + t('promptFilter.match') + ':</b> <input value="' + (r.match||'').replace(/"/g,'&quot;') + '" onchange="updateRule(' + i + ',\'match\',this.value)" style="width:70%;padding:2px 6px;border:1px solid #d1d5db;border-radius:3px;font-size:12px;font-family:monospace"></div>' +
+                    '<div><b>' + t('promptFilter.match') + ':</b> <input value="' + escapeHTML(r.match||'') + '" onchange="updateRule(' + i + ',\'match\',this.value)" style="width:70%;padding:2px 6px;border:1px solid #d1d5db;border-radius:3px;font-size:12px;font-family:monospace"></div>' +
                     replaceRow +
                     '</div>' +
                     '</div>';
@@ -5351,6 +5340,10 @@
 
         function showUpdateModal(version, url, changelog) {
             const body = document.getElementById('updateBody');
+            // url comes from GitHub release JSON; only honor an https link, else
+            // drop to '#' so a hostile/compromised release can't inject a
+            // javascript: or data: href. version is escaped before interpolation.
+            const safeUrl = (typeof url === 'string' && /^https:\/\//i.test(url)) ? url : '#';
             body.innerHTML =
                 '<div style="text-align:center;margin-bottom:20px">' +
                 '<div style="font-size:48px;margin-bottom:12px">🎉</div>' +
@@ -5358,10 +5351,10 @@
                 '</div>' +
                 '<div class="detail-grid" style="margin-bottom:16px">' +
                 '<div class="detail-item"><div class="detail-label">' + t('update.current') + '</div><div class="detail-value">v' + currentVersion + '</div></div>' +
-                '<div class="detail-item"><div class="detail-label">' + t('update.latest') + '</div><div class="detail-value" style="color:#16a34a">v' + version + '</div></div>' +
+                '<div class="detail-item"><div class="detail-label">' + t('update.latest') + '</div><div class="detail-value" style="color:#16a34a">v' + escapeHTML(version) + '</div></div>' +
                 '</div>' +
                 (changelog ? '<div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;margin-bottom:8px">' + t('update.changelog') + '</div><div style="background:#f8fafc;padding:12px;border-radius:8px;font-size:12px;max-height:200px;overflow-y:auto;white-space:pre-wrap;line-height:1.6">' + escapeHtml(changelog) + '</div></div>' : '') +
-                '<div style="text-align:center"><a href="' + url + '" target="_blank" class="btn btn-primary" style="text-decoration:none;display:inline-block">' + t('update.goDownload') + '</a></div>';
+                '<div style="text-align:center"><a href="' + escapeHTML(safeUrl) + '" target="_blank" class="btn btn-primary" style="text-decoration:none;display:inline-block">' + t('update.goDownload') + '</a></div>';
             document.getElementById('updateModal').classList.add('active');
         }
 

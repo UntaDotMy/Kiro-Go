@@ -17,8 +17,9 @@ func enableClaudeCodeFilter(t *testing.T) {
 	if err := config.Init(cfgPath); err != nil {
 		t.Fatalf("config init: %v", err)
 	}
-	// FilterClaudeCode ON, FilterEnvNoise OFF, FilterStripBoundaries OFF.
-	if err := config.UpdatePromptFilterConfig(true, false, false, nil); err != nil {
+	// FilterClaudeCode ON, FilterEnvNoise OFF, FilterStripBoundaries OFF,
+	// CodeBuddy filter ON (default).
+	if err := config.UpdatePromptFilterConfig(true, false, false, true, nil); err != nil {
 		t.Fatalf("enable filter: %v", err)
 	}
 }
@@ -70,9 +71,13 @@ func TestApplySystemPromptFiltersPreservesClaudeMd(t *testing.T) {
 	}
 }
 
-// TestApplySystemPromptFiltersDropsHarnessWithoutMemory verifies the original
-// behavior is preserved when there is NO user memory: a pure Claude Code harness
-// prompt (no CLAUDE.md reminder) is still dropped entirely.
+// TestApplySystemPromptFiltersDropsHarnessWithoutMemory verifies that a pure
+// Claude Code harness prompt with NO embedded CLAUDE.md / AGENTS.md memory
+// yields an empty result — meaning "add no preamble". We deliberately do NOT
+// fabricate an identity line here: Kiro has no system-message slot, so anything
+// returned is prepended to the user's turn as plain text, where a synthetic
+// "You are Kiro…" sentence reads as user-typed text and derails the model into
+// injection-detection. Empty = no preamble; the user's own message is untouched.
 func TestApplySystemPromptFiltersDropsHarnessWithoutMemory(t *testing.T) {
 	enableClaudeCodeFilter(t)
 	pure := `You are Claude Code, Anthropic's official CLI for Claude.
@@ -91,7 +96,26 @@ Use the tools provided.`
 	}
 	out := applySystemPromptFilters(pure)
 	if out != "" {
-		t.Errorf("pure harness prompt (no memory) should be dropped, got:\n%s", out)
+		t.Errorf("pure harness prompt (no memory) should yield empty preamble, got:\n%s", out)
+	}
+}
+
+// TestApplySystemPromptFiltersRewritesBrandTokens verifies that residual brand
+// tokens inside preserved CLAUDE.md memory are rewritten (Claude→Kiro,
+// Anthropic→Amazon), and that no fabricated identity line is prepended.
+func TestApplySystemPromptFiltersRewritesBrandTokens(t *testing.T) {
+	enableClaudeCodeFilter(t)
+	out := applySystemPromptFilters(realisticClaudeCodeSystemPrompt)
+
+	if out == "" {
+		t.Fatal("CLAUDE.md memory was dropped entirely")
+	}
+	if strings.Contains(strings.ToLower(out), "anthropic") {
+		t.Errorf("Anthropic token survived rewrite:\n%s", out)
+	}
+	// The kept content is the user's memory, not a synthetic identity sentence.
+	if strings.Contains(out, "You are Kiro, an AI-powered agentic IDE") {
+		t.Errorf("a fabricated identity line was prepended to the user stream:\n%s", out)
 	}
 }
 

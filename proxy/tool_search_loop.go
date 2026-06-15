@@ -62,7 +62,7 @@ func requestHasToolSearch(tools []ClaudeTool) bool {
 // handleClaudeToolSearch orchestrates the tool-search agentic loop and writes
 // the final response. Precondition: requestHasToolSearch(req.Tools) is true and
 // the feature is enabled (verified by the caller).
-func (h *Handler) handleClaudeToolSearch(w http.ResponseWriter, req *ClaudeRequest, model, apiKeyID string, thinking bool) {
+func (h *Handler) handleClaudeToolSearch(w http.ResponseWriter, req *ClaudeRequest, model, apiKeyID string, thinking bool, allow1M bool) {
 	eager, deferred, mode := partitionToolSearchTools(req.Tools)
 
 	// Pre-expand any deferred tool already discovered earlier in the conversation
@@ -126,7 +126,7 @@ func (h *Handler) handleClaudeToolSearch(w http.ResponseWriter, req *ClaudeReque
 		// isn't silently dropped on tool-search requests.
 		h.applyReasoningEffort(payload, claudeRequestEffort(req))
 
-		res, err := h.runKiroCollect(model, apiKeyID, payload)
+		res, err := h.runKiroCollect(model, apiKeyID, payload, allow1M)
 		if err != nil {
 			if roundsRun == 0 {
 				// runKiroCollect suppresses the global failure count (this loop
@@ -203,7 +203,7 @@ func (h *Handler) handleClaudeToolSearch(w http.ResponseWriter, req *ClaudeReque
 	// web-search loop (runKiroCollect deliberately skips global counters + per-key
 	// debit so a single client request isn't inflated N×).
 	if roundsRun > 0 {
-		h.recordSuccess(model, apiKeyID, "", totalInput, totalOutput, totalCredits)
+		h.recordSuccess(model, apiKeyID, "", totalInput, totalOutput, totalCredits, h.contextWindowForClaudeClient(model, allow1M))
 		if apiKeyID != "" {
 			_, _ = config.ConsumeAPIKey(apiKeyID, totalInput+totalOutput, totalCredits, model)
 		}

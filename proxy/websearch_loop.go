@@ -67,7 +67,7 @@ type kiroRoundResult struct {
 // + SQLite) or ConsumeAPIKey (per-key quota debit) — those would over-count a
 // single client request by up to N×. The caller aggregates across rounds and
 // debits exactly once.
-func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (*kiroRoundResult, error) {
+func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload, allow1M bool) (*kiroRoundResult, error) {
 	out := &kiroRoundResult{}
 	var realInputTokens int
 
@@ -90,7 +90,7 @@ func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (
 			OnComplete: func(inTok, outTok int) { out.inputTokens = inTok; out.outputTokens = outTok },
 			OnCredits:  func(c float64) { out.credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+				realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForClaudeClient(model, allow1M)) / 100.0)
 			},
 			OnStopReason: func(r string) { out.stopReason = r },
 		}
@@ -142,17 +142,18 @@ func (h *Handler) runKiroCollect(model, apiKeyID string, payload *KiroPayload) (
 //
 // Accounting matches runKiroCollect: per-account pool stats only; the caller
 // owns the once-per-request global + per-key accounting.
-func (h *Handler) runProviderCollect(backend, poolModel, model, upstreamModel, apiKeyID string, roundReq *ClaudeRequest, payload *KiroPayload, thinking bool, effort string) (*kiroRoundResult, error) {
+func (h *Handler) runProviderCollect(backend, poolModel, model, upstreamModel, apiKeyID string, roundReq *ClaudeRequest, payload *KiroPayload, thinking bool, effort string, allow1M bool) (*kiroRoundResult, error) {
 	out := &kiroRoundResult{}
 	var realInputTokens int
 
 	baseNR := &NormalizedRequest{
-		Model:         upstreamModel,
-		ClientDialect: DialectClaude,
-		Claude:        roundReq,
-		Thinking:      thinking,
-		Stream:        false,
-		Effort:        effort,
+		Model:          upstreamModel,
+		ClientDialect:  DialectClaude,
+		Claude:         roundReq,
+		Thinking:       thinking,
+		Stream:         false,
+		Effort:         effort,
+		Allow1MContext: allow1M,
 	}
 
 	worker := func(account *config.Account) (bool, error) {
@@ -174,7 +175,7 @@ func (h *Handler) runProviderCollect(backend, poolModel, model, upstreamModel, a
 			OnComplete: func(inTok, outTok int) { out.inputTokens = inTok; out.outputTokens = outTok },
 			OnCredits:  func(c float64) { out.credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+				realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForClaudeClient(model, allow1M)) / 100.0)
 			},
 			OnStopReason: func(r string) { out.stopReason = r },
 		}
@@ -217,7 +218,7 @@ func (h *Handler) runProviderCollect(backend, poolModel, model, upstreamModel, a
 //	model         — public model id as requested (echoed back to the client)
 //	upstreamModel — de-prefixed id sent upstream (== model for a Kiro request)
 //	backend       — resolved provider id ("kiro" or e.g. "groq")
-func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeRequest, model, upstreamModel, backend, apiKeyID string, thinking bool) {
+func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeRequest, model, upstreamModel, backend, apiKeyID string, thinking bool, allow1M bool) {
 	// poolModel is the id the pool's per-account filter matches against: the
 	// de-prefixed upstream id for a non-Kiro backend, the request model for Kiro.
 	poolModel := model
@@ -261,7 +262,7 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 		payload := ClaudeToKiro(&roundReq, thinking)
 		h.applyReasoningEffort(payload, effort)
 
-		res, err := h.runProviderCollect(backend, poolModel, model, upstreamModel, apiKeyID, &roundReq, payload, thinking, effort)
+		res, err := h.runProviderCollect(backend, poolModel, model, upstreamModel, apiKeyID, &roundReq, payload, thinking, effort, allow1M)
 		if err != nil {
 			// If at least one round already succeeded, surface what we have
 			// rather than discarding it; the partial usage is still debited
@@ -354,7 +355,7 @@ func (h *Handler) handleClaudeWebSearch(w http.ResponseWriter, req *ClaudeReques
 		// no graded reasoning effort (effort is expressed via thinking, not a
 		// level), so the effort bucket is empty — matching the non-web-search
 		// Claude path in handleClaudeStream.
-		h.recordSuccess(model, apiKeyID, "", totalInput, totalOutput, totalCredits)
+		h.recordSuccess(model, apiKeyID, "", totalInput, totalOutput, totalCredits, h.contextWindowForClaudeClient(model, allow1M))
 		if apiKeyID != "" {
 			_, _ = config.ConsumeAPIKey(apiKeyID, totalInput+totalOutput, totalCredits, model)
 		}
