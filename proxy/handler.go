@@ -354,9 +354,18 @@ func NewHandler() *Handler {
 	// refresh (backgroundRefresh -> refreshModelsCache) overwrites this
 	// with fresh data within ~10s of boot.
 	if known := config.GetKnownModels(); len(known) > 0 {
+		// Rehydrate each model's effort-level support so graded reasoning effort
+		// (output_config.effort) works during the ~10s window before the first
+		// live refresh; without this the seed carried no schema and effort was
+		// silently dropped for every request until the background fetch landed.
+		effortMap := config.GetKnownModelEffort()
 		seeded := make([]ModelInfo, 0, len(known))
 		for _, id := range known {
-			seeded = append(seeded, ModelInfo{ModelId: id})
+			mi := ModelInfo{ModelId: id}
+			if levels := effortMap[strings.ToLower(strings.TrimSpace(id))]; len(levels) > 0 {
+				mi.AdditionalModelRequestFieldsSchema = buildEffortSchema(levels)
+			}
+			seeded = append(seeded, mi)
 		}
 		h.cachedModels = seeded
 		h.modelsCacheTime = time.Now().Unix()
@@ -1557,11 +1566,20 @@ func (h *Handler) refreshModelsCache() {
 		// model ids immediately instead of the hardcoded bootstrap list.
 		// Best-effort: a write failure is logged but doesn't affect serving.
 		ids := make([]string, 0, len(aggregated))
+		effortMap := make(map[string][]string)
 		for _, m := range aggregated {
 			ids = append(ids, m.ModelId)
+			// Persist effort support too, so a restart rehydrates the schema and
+			// graded effort works before the first live refresh (no ~10s gap).
+			if levels := modelEffortLevels(m.AdditionalModelRequestFieldsSchema); len(levels) > 0 {
+				effortMap[strings.ToLower(strings.TrimSpace(m.ModelId))] = levels
+			}
 		}
 		if err := config.SetKnownModels(ids); err != nil {
 			logger.Warnf("[ModelsCache] Failed to persist known models: %v", err)
+		}
+		if err := config.SetKnownModelEffort(effortMap); err != nil {
+			logger.Warnf("[ModelsCache] Failed to persist model effort levels: %v", err)
 		}
 	}
 }
@@ -1792,6 +1810,44 @@ func (h *Handler) contextWindowForModel(model string) int {
 	return getContextWindowSize(model)
 }
 
+// contextWindowForClaudeClient resolves the window used to back-convert Kiro's
+// contextUsagePercentage into an input-token count ON THE CLAUDE MESSAGE PATH.
+// It must equal the window Claude Code uses as its own meter denominator, NOT
+// the model's raw capacity.
+//
+// Field-verified behavior (overriding the "1M is GA without header" docs): the
+// installed Claude Code build meters a plain model id (e.g. claude-opus-4-8) at
+// the 200K default and only switches to 1M for the [1M] model variant, which is
+// exactly what makes it send the context-1m beta header. So when the client did
+// NOT opt into 1M (allow1M=false) we cap the window at defaultContextWindow:
+// otherwise a 1M-scaled token count read against the client's 200K assumption
+// overshoots ~5x and pegs the gauge at 100% with no auto-compaction. When the
+// client opted in (allow1M=true) the full resolved window (live tokenLimits or
+// version parse) is honored so a genuine 1M session compacts at the right point.
+func (h *Handler) contextWindowForClaudeClient(model string, allow1M bool) int {
+	w := h.contextWindowForModel(model)
+	if !allow1M && w > defaultContextWindow {
+		return defaultContextWindow
+	}
+	return w
+}
+
+// requestEnables1MContext reports whether the inbound request opted into the 1M
+// context window via the context-1m anthropic-beta header. Claude Code sends
+// this token only when its [1M] model variant is active; absent it, the client
+// meters against the default 200K window. Substring match is resilient to the
+// dated beta suffix changing across revisions.
+func requestEnables1MContext(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	beta := r.Header.Get("anthropic-beta")
+	if beta == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(beta), "context-1m")
+}
+
 // applyReasoningEffort forwards a graded reasoning-effort value to the Kiro
 // upstream NATIVELY when the resolved model supports it, by populating
 // payload.AdditionalModelRequestFields with {"output_config":{"effort":LEVEL}}.
@@ -1808,10 +1864,35 @@ func (h *Handler) applyReasoningEffort(payload *KiroPayload, rawEffort string) s
 		return ""
 	}
 	modelID := payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
+
+	// Distinguish "client asked for graded effort" from "unset/minimal" so we can
+	// surface — at Warn level — the cases where a real request silently does NOT
+	// reach the upstream as asked. unset/"minimal" are intentional (handled by the
+	// thinking on/off path) and stay quiet.
+	norm := normalizeReasoningEffort(rawEffort)
+	clientWantedGraded := norm != effortUnset && norm != effortMinimal
+
 	levels := h.effortLevelsForModel(modelID)
 	level, ok := resolveModelEffort(rawEffort, levels)
 	if !ok {
+		if clientWantedGraded {
+			// The client asked for a graded level but none was forwarded. Make it
+			// visible: either the model advertises no effort schema (often the
+			// transient post-restart window before the first models refresh) or it
+			// supports effort but not even a lower tier than requested.
+			if len(levels) == 0 {
+				logger.Warnf("[Effort] Requested %q for model %q but it advertises no effort support (or the model cache has not been populated yet) — sending WITHOUT graded effort, falling back to thinking on/off", rawEffort, modelID)
+			} else {
+				logger.Warnf("[Effort] Requested %q for model %q but it could not be mapped to any supported level %v — sending WITHOUT graded effort", rawEffort, modelID, levels)
+			}
+		}
 		return ""
+	}
+	// Surface a clamp-down: the client asked for one level but the model only
+	// supports a lower one, so we send the lower tier. The request still gets
+	// graded effort, just not the exact level asked for — worth a visible note.
+	if clientWantedGraded && level != norm {
+		logger.Warnf("[Effort] Requested %q for model %q is unsupported; clamped DOWN to %q (supported: %v)", norm, modelID, level, levels)
 	}
 	fields := buildEffortRequestFields(level)
 	if fields == nil {
@@ -1981,7 +2062,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	//     We do NOT re-route its search through a Kiro account. NEVER a 404.
 	if config.GetWebSearchEnabled() {
 		if _, ok := findClaudeWebSearchTool(req.Tools); ok && h.shouldEmulateWebSearch(reqBackend) {
-			h.handleClaudeWebSearch(w, &req, req.Model, upstreamModel, reqBackend, matchedKeyID, thinking)
+			h.handleClaudeWebSearch(w, &req, req.Model, upstreamModel, reqBackend, matchedKeyID, thinking, requestEnables1MContext(r))
 			return
 		}
 	}
@@ -1998,7 +2079,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// the token-saving withhold/search optimization is Kiro-specific.
 	if isKiroBackend && config.GetToolSearchEnabled() {
 		if requestHasToolSearch(req.Tools) {
-			h.handleClaudeToolSearch(w, &req, req.Model, matchedKeyID, thinking)
+			h.handleClaudeToolSearch(w, &req, req.Model, matchedKeyID, thinking, requestEnables1MContext(r))
 			return
 		}
 	}
@@ -2044,12 +2125,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// translate for a non-Kiro account. nr.Kiro is filled in per-attempt by
 	// callProviderForKiro. For a Kiro account this context value is harmless.
 	baseNR := &NormalizedRequest{
-		Model:         upstreamModel,
-		ClientDialect: DialectClaude,
-		Claude:        &req,
-		Thinking:      thinking,
-		Stream:        req.Stream,
-		Effort:        claudeEffort,
+		Model:          upstreamModel,
+		ClientDialect:  DialectClaude,
+		Claude:         &req,
+		Thinking:       thinking,
+		Stream:         req.Stream,
+		Effort:         claudeEffort,
+		Allow1MContext: requestEnables1MContext(r),
 	}
 	reqCtx := withNormalizedRequest(r.Context(), baseNR)
 
@@ -2398,7 +2480,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			credits = c
 		},
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForClaudeClient(model, allow1MContextFromCtx(ctx))) / 100.0)
 		},
 		OnCacheUsage: func(read, creation int) {
 			realCacheRead = read
@@ -2479,7 +2561,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits, h.contextWindowForClaudeClient(model, allow1MContextFromCtx(ctx)))
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -2672,7 +2754,7 @@ func (h *Handler) addCredits(credits float64) {
 // global tick. accountID is optional (passed by the success-path callers
 // that have it). Also records to the persistent SQLite stats so per-day
 // rollups survive restarts.
-func (h *Handler) recordSuccess(model, apiKeyID, effort string, inputTokens, outputTokens int, credits float64) {
+func (h *Handler) recordSuccess(model, apiKeyID, effort string, inputTokens, outputTokens int, credits float64, window int) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
@@ -2685,10 +2767,31 @@ func (h *Handler) recordSuccess(model, apiKeyID, effort string, inputTokens, out
 	// so the hot path skips the getCredits() RLock + arg formatting when the
 	// operator runs above INFO.
 	if logger.GetLevel() <= logger.LevelInfo {
-		logger.Infof("[Stats] model=%s key=%s in=%d out=%d credits=%.4f total_req=%d total_tok=%d total_cred=%.2f",
+		// Context-window fields (window mode + % used) are folded into this single
+		// per-request line so operators see token accounting and the Claude-Code
+		// context meter together. window is the EFFECTIVE window the client meters
+		// against — for the Claude path the caller passes the gated value
+		// (contextWindowForClaudeClient: 200K unless the client opted into 1M via
+		// the context-1m beta), so this line matches Claude Code's own "% context"
+		// gauge. window<=0 means the caller had no Claude-meter context (non-Claude
+		// paths); fall back to the model's raw window for an informational figure.
+		if window <= 0 {
+			window = h.contextWindowForModel(model)
+		}
+		windowMode := "200k"
+		if window >= 1_000_000 {
+			windowMode = "1m"
+		}
+		ctxUsed := 0.0
+		if window > 0 {
+			ctxUsed = float64(inputTokens) / float64(window) * 100.0
+		}
+		logger.Infof("[Stats] model=%s key=%s effort=%s in=%d out=%d credits=%.4f window=%s ctx_used=%.1f%% total_req=%d total_tok=%d total_cred=%.2f",
 			model,
 			apiKeyIDForLog(apiKeyID),
+			effortForLog(effort),
 			inputTokens, outputTokens, credits,
+			windowMode, ctxUsed,
 			atomic.LoadInt64(&h.totalRequests),
 			atomic.LoadInt64(&h.totalTokens),
 			h.getCredits(),
@@ -2706,6 +2809,19 @@ func apiKeyIDForLog(id string) string {
 		return "-"
 	}
 	return id
+}
+
+// effortForLog renders the reasoning-effort level actually forwarded upstream
+// for the per-request [Stats] line. An empty string means no graded effort was
+// sent — either the client requested none (Claude/auto/minimal) or it was
+// dropped/clamped (the WHY is logged separately at Warn by applyReasoningEffort:
+// clamp-down, unsupported model, or unpopulated cache). Rendered as "none" so
+// the field is always present and greppable in docker logs.
+func effortForLog(effort string) string {
+	if strings.TrimSpace(effort) == "" {
+		return "none"
+	}
+	return effort
 }
 
 func (h *Handler) recordFailure(model, apiKeyID, effort string) {
@@ -2768,7 +2884,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			credits = c
 		},
 		OnContextUsage: func(pct float64) {
-			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForModel(model)) / 100.0)
+			realInputTokens = int(clampPercent(pct) * float64(h.contextWindowForClaudeClient(model, allow1MContextFromCtx(ctx))) / 100.0)
 		},
 		OnCacheUsage: func(read, creation int) {
 			realCacheRead = read
@@ -2816,7 +2932,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits, h.contextWindowForClaudeClient(model, allow1MContextFromCtx(ctx)))
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -3298,7 +3414,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits, 0)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -3392,7 +3508,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 	// numbers would lag one request behind the pushed snapshot.
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits)
+	h.recordSuccess(model, apiKeyID, payload.ResolvedEffort, inputTokens, outputTokens, credits, 0)
 	h.triggerAccountRefresh(account.ID)
 	if apiKeyID != "" {
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
@@ -3482,6 +3598,17 @@ type normalizedRequestCtxKey struct{}
 // and pass the enriched context into the per-account worker.
 func withNormalizedRequest(ctx context.Context, nr *NormalizedRequest) context.Context {
 	return context.WithValue(ctx, normalizedRequestCtxKey{}, nr)
+}
+
+// allow1MContextFromCtx reports whether the request stashed on ctx opted into
+// the 1M context window (context-1m beta). False when no NormalizedRequest is
+// present (admin test path / agentic loops), which keeps those on the safe
+// default window.
+func allow1MContextFromCtx(ctx context.Context) bool {
+	if v, ok := ctx.Value(normalizedRequestCtxKey{}).(*NormalizedRequest); ok && v != nil {
+		return v.Allow1MContext
+	}
+	return false
 }
 
 // callProviderForKiro dispatches the request through the account's provider. For
@@ -4723,7 +4850,6 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"webSearchProvider":        config.GetWebSearchProvider(),
 		"webSearchApiKeySet":       config.GetWebSearchAPIKey() != "",
 		"toolSearchEnabled":        config.GetToolSearchEnabled(),
-		"codeBuddyFilterEnabled":   config.GetCodeBuddyFilterEnabled(),
 		"globalRateLimitPerMinute": config.GetGlobalRateLimitPerMinute(),
 	})
 }
@@ -4817,10 +4943,11 @@ func (h *Handler) apiGetPromptFilter(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FilterClaudeCode      *bool                      `json:"filterClaudeCode,omitempty"`
-		FilterEnvNoise        *bool                      `json:"filterEnvNoise,omitempty"`
-		FilterStripBoundaries *bool                      `json:"filterStripBoundaries,omitempty"`
-		Rules                 *[]config.PromptFilterRule `json:"rules,omitempty"`
+		FilterClaudeCode       *bool                      `json:"filterClaudeCode,omitempty"`
+		FilterEnvNoise         *bool                      `json:"filterEnvNoise,omitempty"`
+		FilterStripBoundaries  *bool                      `json:"filterStripBoundaries,omitempty"`
+		CodeBuddyFilterEnabled *bool                      `json:"codeBuddyFilterEnabled,omitempty"`
+		Rules                  *[]config.PromptFilterRule `json:"rules,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4833,6 +4960,7 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	fcc := current.FilterClaudeCode
 	fen := current.FilterEnvNoise
 	fsb := current.FilterStripBoundaries
+	cbf := current.CodeBuddyFilterEnabled
 	rules := current.Rules
 	if req.FilterClaudeCode != nil {
 		fcc = *req.FilterClaudeCode
@@ -4843,10 +4971,13 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	if req.FilterStripBoundaries != nil {
 		fsb = *req.FilterStripBoundaries
 	}
+	if req.CodeBuddyFilterEnabled != nil {
+		cbf = *req.CodeBuddyFilterEnabled
+	}
 	if req.Rules != nil {
 		rules = *req.Rules
 	}
-	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
+	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, cbf, rules); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -4869,7 +5000,6 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchProvider        *string `json:"webSearchProvider,omitempty"`
 		WebSearchApiKey          *string `json:"webSearchApiKey,omitempty"`
 		ToolSearchEnabled        *bool   `json:"toolSearchEnabled,omitempty"`
-		CodeBuddyFilterEnabled   *bool   `json:"codeBuddyFilterEnabled,omitempty"`
 		GlobalRateLimitPerMinute *int    `json:"globalRateLimitPerMinute,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4907,15 +5037,6 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// Web-search emulation toggle (opt-in; default off).
 	if req.WebSearchEnabled != nil {
 		if err := config.UpdateWebSearchEnabled(*req.WebSearchEnabled); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-	}
-
-	// CodeBuddy outbound-request sanitization toggle (default on).
-	if req.CodeBuddyFilterEnabled != nil {
-		if err := config.UpdateCodeBuddyFilterEnabled(*req.CodeBuddyFilterEnabled); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

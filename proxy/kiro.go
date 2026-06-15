@@ -1146,13 +1146,14 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 }
 
 // defaultContextWindow is the context window assumed for a Claude model when we
-// have no authoritative figure from Kiro's ListAvailableModels. Every current
-// Claude model (Opus/Sonnet/Haiku 4.x) ships a 200K-token window by default;
-// the 1M window is a beta opt-in (context-1m header) that the upstream does NOT
-// advertise per model, so we must NOT assume it from a version number. The
-// authoritative non-default window (e.g. the beta 1M) is honored only when
-// Kiro's own tokenLimits.maxInputTokens reports it — see
-// Handler.contextWindowForModel — never as a guess derived from the model id.
+// have no authoritative figure from Kiro's ListAvailableModels AND the model id
+// does not version-parse to a known 1M family. Pre-4.6 Claude models ship a
+// 200K-token window; Opus/Sonnet 4.6+ have 1M generally available (Anthropic,
+// 2026-03 — no beta header required, and the context-1m header is ignored), so
+// getContextWindowSize returns 1M for those by version parse. The authoritative
+// window still comes from Kiro's tokenLimits.maxInputTokens first (see
+// Handler.contextWindowForModel); this default is only the floor for ids that
+// neither the cache nor the version parse classifies.
 const defaultContextWindow = 200_000
 
 // getContextWindowSize returns the FALLBACK context window (in tokens) for a

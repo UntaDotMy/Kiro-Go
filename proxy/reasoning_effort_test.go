@@ -132,6 +132,39 @@ func TestModelEffortLevels(t *testing.T) {
 	}
 }
 
+// TestBuildEffortSchemaRoundTrip verifies buildEffortSchema is the inverse of
+// modelEffortLevels — the boot-seed rehydration path persists a level list and
+// must reconstruct a schema that modelEffortLevels reads back identically.
+func TestBuildEffortSchemaRoundTrip(t *testing.T) {
+	for _, levels := range [][]string{
+		{"low", "medium", "high", "xhigh", "max"},
+		{"low", "medium", "high", "max"},
+		{"low"},
+	} {
+		schema := buildEffortSchema(levels)
+		got := modelEffortLevels(schema)
+		if len(got) != len(levels) {
+			t.Fatalf("round-trip %v -> %v, length mismatch", levels, got)
+		}
+		for i := range levels {
+			if got[i] != levels[i] {
+				t.Fatalf("round-trip %v -> %v, mismatch at %d", levels, got, i)
+			}
+		}
+	}
+
+	// Empty / nil input -> no schema (model has no effort support).
+	if buildEffortSchema(nil) != nil {
+		t.Fatal("buildEffortSchema(nil) should return nil")
+	}
+	if buildEffortSchema([]string{}) != nil {
+		t.Fatal("buildEffortSchema([]) should return nil")
+	}
+	if buildEffortSchema([]string{"", "  "}) != nil {
+		t.Fatal("buildEffortSchema of blank-only levels should return nil")
+	}
+}
+
 // TestResolveModelEffort pins the gating + clamp-down contract.
 func TestResolveModelEffort(t *testing.T) {
 	opus := []string{"low", "medium", "high", "xhigh", "max"}

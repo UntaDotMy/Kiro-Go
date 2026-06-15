@@ -573,6 +573,17 @@ type Config struct {
 	// Code aliases from them. Empty only on a truly fresh install that has
 	// never reached upstream.
 	KnownModels []string `json:"knownModels,omitempty"`
+
+	// KnownModelEffort persists each model's supported reasoning-effort levels
+	// (the enum from its upstream AdditionalModelRequestFieldsSchema), keyed by
+	// the same raw (dotted) upstream model id used in KnownModels. It lets the
+	// boot seed rehydrate effort support immediately after a restart so graded
+	// reasoning effort (output_config.effort) works in the ~10s window before the
+	// first live ListAvailableModels refresh — without it, effort was silently
+	// dropped for every request until the background refresh landed. A model with
+	// no effort support is simply absent from the map. Refreshed automatically on
+	// every successful live fetch (see proxy.refreshModelsCache).
+	KnownModelEffort map[string][]string `json:"knownModelEffort,omitempty"`
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -682,7 +693,7 @@ func Load() error {
 				Accounts:              []Account{},
 				FilterClaudeCode:      true,
 				FilterEnvNoise:        false,
-				FilterStripBoundaries: true,
+				FilterStripBoundaries: false,
 				FilterDefaultsApplied: true,
 			}
 			return Save()
@@ -799,22 +810,24 @@ func writeConfigBytes(data []byte) error {
 
 // migrateFilterDefaults applies the default prompt-filter flags for any
 // pre-existing config that was loaded before the FilterDefaultsApplied
-// migration marker existed: FilterClaudeCode and FilterStripBoundaries ON,
-// FilterEnvNoise OFF. FilterEnvNoise defaults OFF because it strips whole
+// migration marker existed: FilterClaudeCode ON, FilterEnvNoise OFF,
+// FilterStripBoundaries OFF. FilterEnvNoise defaults OFF because it strips whole
 // <system-reminder> blocks, and Claude Code delivers CLAUDE.md / AGENTS.md
 // inside those blocks — leaving it on would silently drop the user's project
-// memory files before they reach the model. Caller must hold cfgLock for
-// write — Load() satisfies that. The migration runs at most once per install:
-// once FilterDefaultsApplied is true (either from this migration or from the
-// fresh-install bootstrap), we never re-apply, so explicit operator toggles
-// are preserved.
+// memory files before they reach the model. FilterStripBoundaries defaults OFF
+// because the proxy no longer emits --- SYSTEM PROMPT --- markers itself, so the
+// filter only matters for the rare client that sends them — opt-in, not default.
+// Caller must hold cfgLock for write — Load() satisfies that. The migration runs
+// at most once per install: once FilterDefaultsApplied is true (either from this
+// migration or from the fresh-install bootstrap), we never re-apply, so explicit
+// operator toggles are preserved.
 func migrateFilterDefaults() {
 	if cfg == nil || cfg.FilterDefaultsApplied {
 		return
 	}
 	cfg.FilterClaudeCode = true
 	cfg.FilterEnvNoise = false
-	cfg.FilterStripBoundaries = true
+	cfg.FilterStripBoundaries = false
 	cfg.FilterDefaultsApplied = true
 	// Persist immediately so a subsequent restart sees the marker even if
 	// no other state changes between now and the next save.
@@ -1469,7 +1482,11 @@ type PromptFilterConfig struct {
 	FilterClaudeCode      bool               `json:"filterClaudeCode"`
 	FilterEnvNoise        bool               `json:"filterEnvNoise"`
 	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
-	Rules                 []PromptFilterRule `json:"rules"`
+	// CodeBuddyFilterEnabled mirrors GetCodeBuddyFilterEnabled (default true) so
+	// the prompt-filter endpoint owns every built-in filter toggle in one place
+	// instead of the CodeBuddy switch living behind a separate /settings field.
+	CodeBuddyFilterEnabled bool               `json:"codeBuddyFilterEnabled"`
+	Rules                  []PromptFilterRule `json:"rules"`
 }
 
 // GetPromptFilterConfig returns all prompt filter settings.
@@ -1477,25 +1494,30 @@ func GetPromptFilterConfig() PromptFilterConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg == nil {
-		return PromptFilterConfig{Rules: []PromptFilterRule{}}
+		return PromptFilterConfig{CodeBuddyFilterEnabled: true, Rules: []PromptFilterRule{}}
 	}
 	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
 	copy(rules, cfg.PromptFilterRules)
+	// CodeBuddy default-true: nil pointer means "use default" (on).
+	codeBuddy := cfg.CodeBuddyFilterEnabled == nil || *cfg.CodeBuddyFilterEnabled
 	return PromptFilterConfig{
-		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
-		FilterEnvNoise:        cfg.FilterEnvNoise,
-		FilterStripBoundaries: cfg.FilterStripBoundaries,
-		Rules:                 rules,
+		FilterClaudeCode:       cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
+		FilterEnvNoise:         cfg.FilterEnvNoise,
+		FilterStripBoundaries:  cfg.FilterStripBoundaries,
+		CodeBuddyFilterEnabled: codeBuddy,
+		Rules:                  rules,
 	}
 }
 
 // UpdatePromptFilterConfig saves all prompt filter settings atomically.
-func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
+func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries, codeBuddyFilterEnabled bool, rules []PromptFilterRule) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.FilterClaudeCode = filterClaudeCode
 	cfg.FilterEnvNoise = filterEnvNoise
 	cfg.FilterStripBoundaries = filterStripBoundaries
+	cbf := codeBuddyFilterEnabled
+	cfg.CodeBuddyFilterEnabled = &cbf
 	// Clear legacy flag to avoid double-applying after first save
 	cfg.SanitizeClaudeCodePrompt = false
 	if rules != nil {
@@ -1911,14 +1933,6 @@ func GetCodeBuddyFilterEnabled() bool {
 	return *cfg.CodeBuddyFilterEnabled
 }
 
-// UpdateCodeBuddyFilterEnabled persists the CodeBuddy sanitization toggle.
-func UpdateCodeBuddyFilterEnabled(enabled bool) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.CodeBuddyFilterEnabled = &enabled
-	return Save()
-}
-
 // GetWebSearchProvider reports the configured external web-search backend
 // ("tavily", "brave", ...), or "kiro" (the default) when none/empty is set.
 func GetWebSearchProvider() string {
@@ -2085,6 +2099,72 @@ func SetKnownModels(models []string) error {
 	}
 	cfg.KnownModels = dedup
 	return Save()
+}
+
+// GetKnownModelEffort returns the persisted per-model effort-level map (raw
+// upstream model id -> supported effort levels). Returns a deep copy so callers
+// can't mutate config state. Empty when no model advertises effort or on a
+// fresh install that has never reached upstream.
+func GetKnownModelEffort() map[string][]string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || len(cfg.KnownModelEffort) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(cfg.KnownModelEffort))
+	for k, v := range cfg.KnownModelEffort {
+		levels := make([]string, len(v))
+		copy(levels, v)
+		out[k] = levels
+	}
+	return out
+}
+
+// SetKnownModelEffort persists the per-model effort-level map so a restart can
+// rehydrate effort support before the first live fetch completes. Skipped (no
+// disk churn) when the incoming map is identical to what's already stored —
+// refreshModelsCache calls this on every successful fetch and most fetches
+// return the same support set. An empty map is stored as-is (clears stale data).
+func SetKnownModelEffort(effort map[string][]string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return nil
+	}
+	if sameModelEffort(cfg.KnownModelEffort, effort) {
+		return nil
+	}
+	cfg.KnownModelEffort = effort
+	return Save()
+}
+
+// sameModelEffort reports whether two model->levels maps are equal: same keys,
+// and the same SET of levels per key. The comparison is order-insensitive
+// because the level order carries no meaning — resolveModelEffort ranks via
+// effortRank, not list position — so an upstream schema that returns the same
+// enum in a different order must NOT count as a change (a positional compare
+// would trigger a spurious config.json rewrite + fsync on every model refresh).
+func sameModelEffort(a, b map[string][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		seen := make(map[string]int, len(av))
+		for _, lvl := range av {
+			seen[lvl]++
+		}
+		for _, lvl := range bv {
+			if seen[lvl] == 0 {
+				return false
+			}
+			seen[lvl]--
+		}
+	}
+	return true
 }
 
 // sameStringSet reports whether a and b contain the same set of values

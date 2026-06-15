@@ -45,6 +45,17 @@ type NormalizedRequest struct {
 	Stream        bool
 	Effort        string // resolved reasoning effort
 
+	// Allow1MContext is true when the inbound Claude request opted into the 1M
+	// context window — signaled by the context-1m-2025-08-07 anthropic-beta
+	// header, which Claude Code sends only when the [1M] model variant is active
+	// (the plain model id meters against the default 200K window). It gates the
+	// window used to back-convert Kiro's contextUsagePercentage into an
+	// input-token count: the proxy MUST report tokens against the same window the
+	// client meters against, or the client's "% context used" gauge desyncs — a
+	// 1M-scaled count read against a 200K assumption pegs at 100% and suppresses
+	// auto-compaction (observed in the field). Set only on the Claude path.
+	Allow1MContext bool
+
 	// Kiro is the prebuilt CodeWhisperer payload for the kiro provider. Non-nil
 	// only on the Kiro path; kiroProvider.Call uses it verbatim so Phase 2 is a
 	// pure pass-through with zero behavior change.
