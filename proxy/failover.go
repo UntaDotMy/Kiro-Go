@@ -121,10 +121,40 @@ func (h *Handler) runWithFailoverCounted(model, apiKeyID, effort string, worker 
 // "" means "no constraint" (legacy behavior — every account is eligible). All
 // account selection goes through the backend-scoped reserving picker.
 func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort string, worker streamWorker, countGlobalFailure bool) (committed bool, retryAfter time.Duration, err error) {
+	// Pool-wide adaptive shedding (Google SRE). When the whole backend pool is
+	// being throttled upstream, shed this request LOCALLY before dialing so we
+	// don't add a wasted round-trip to the upstream's rejection load. A no-op
+	// under healthy load by construction (p_reject clamps to 0 when accepts keep
+	// up with requests). The client gets a 429 + short Retry-After to back off
+	// coherently, exactly as the saturation-shed path does.
+	if h.throttle != nil && h.throttle.shouldShed(backend) {
+		if countGlobalFailure {
+			h.recordFailure(model, apiKeyID, effort)
+		}
+		return false, saturationPollHint, errAdaptiveThrottleShed
+	}
+
 	budget := h.failoverBudget(backend, model)
 	tried := make(map[string]bool, budget)
 	var lastErr error
 	var lastRetryAfter time.Duration
+
+	// Feed the adaptive throttle exactly one outcome per dispatch, but ONLY when
+	// the request actually reached the backend (attempted). A request shed at
+	// local concurrency saturation, dropped because no account was eligible, or
+	// failed only on token refresh never contacted the upstream — recording those
+	// as rejects would inflate p_reject from local backpressure (already handled
+	// by the admission-wait) and make the throttle over-shed. accepted defaults
+	// true (served / non-throttle terminal); only a real upstream throttle flips
+	// it false. The shed-gate request above already recorded its own increment, so
+	// it is intentionally excluded here.
+	attempted := false
+	accepted := true
+	defer func() {
+		if h.throttle != nil && attempted {
+			h.throttle.recordOutcome(backend, accepted)
+		}
+	}()
 
 	// recordTerminal bumps the single global failed-request counter once, for
 	// the request as a whole, when we're about to give up without committing.
@@ -168,13 +198,15 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 		}()
 
 		if committedThisAttempt {
-			// Bytes are on the wire — the worker fully owns the outcome.
+			// Bytes are on the wire — the worker fully owns the outcome. The
+			// backend was contacted and served this request.
+			attempted = true
 			return true, 0, workErr
 		}
 		if workErr == nil {
-			// Either a token-refresh failover signal (handled below) or a
-			// non-committing success. runOneAttempt returns a sentinel for the
-			// token case; a genuine nil here means done.
+			// Non-committing success (the worker ran and returned nil). The
+			// backend was contacted and did not throttle us.
+			attempted = true
 			return false, 0, nil
 		}
 		lastErr = workErr
@@ -186,16 +218,26 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 			lastRetryAfter = ra
 		}
 		if isTokenRefreshFailure(workErr) {
-			// Token refresh is a pre-commit step; a peer account may have a
-			// valid token. Already logged in runOneAttempt; just rotate.
+			// Token refresh is a pre-commit step; the backend was NEVER contacted,
+			// so this attempt must not feed the adaptive throttle. A peer account
+			// may have a valid token — just rotate.
 			continue
 		}
 		if !isRetryableUpstreamError(workErr) {
-			// Terminal for this request (auth/payment/client-cancel). Don't
-			// burn more accounts on a failure a peer can't fix.
+			// Terminal for this request (auth/payment/client-cancel). The worker
+			// reached the backend and got a real, non-throttle response, so it
+			// counts as attempted+accepted — shedding wouldn't have helped.
+			attempted = true
 			recordTerminal()
 			return false, lastRetryAfter, workErr
 		}
+		// Retryable upstream error (429/5xx/connection reset): the backend WAS
+		// contacted and threw a throttle/transient failure. This is exactly the
+		// signal the adaptive throttle keys on — record attempted with accepted
+		// false. A later successful attempt in this same dispatch flips accepted
+		// back to true (the backend did serve us after rotation).
+		attempted = true
+		accepted = false
 		logger.Infof("[Failover] Account %s failed with retryable error (attempt %d/%d), rotating: %v",
 			redactForLog(account.Email), attempt+1, budget, workErr)
 	}
