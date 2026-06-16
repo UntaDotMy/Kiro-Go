@@ -8,12 +8,18 @@ services:
     container_name: kiro-go-patch
     pull_policy: always
     ports:
-      # Host 8989 -> container 8080. Run side-by-side with the original
-      # (which uses 8080 on the host); flip back to "8080:8080" once you
-      # decommission the upstream container.
-      - "8989:8080"
+      # Host 8989 -> container 8080. Bound to LOOPBACK so the cleartext-HTTP Go
+      # process is never directly reachable from the network — a TLS-terminating
+      # reverse proxy (see DEPLOYMENT.md) is expected to front it on 443. Widen to
+      # "8989:8080" deliberately only if you are running without a front proxy.
+      - "127.0.0.1:8989:8080"
     volumes:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
     restart: unless-stopped
+    # The binary runs a 30s graceful drain on SIGTERM (main.go) to let in-flight
+    # streams finish. Docker's default stop grace is only 10s, which would SIGKILL
+    # a stream still draining between 10s and 30s. Give the drain its full budget
+    # plus a small margin.
+    stop_grace_period: 35s
