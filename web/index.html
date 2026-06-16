@@ -688,6 +688,8 @@
             width: 100%; max-width: 600px; margin-bottom: 20px;
             box-shadow: var(--shadow-lg);
             animation: modalIn 0.16s ease;
+            max-height: calc(100vh - 10vh - 40px);
+            overflow-y: auto;
         }
         @keyframes modalIn { from { opacity: 0; transform: translateY(8px) scale(0.99); } to { opacity: 1; transform: none; } }
         .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
@@ -1239,13 +1241,6 @@
                             </label>
                             <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterStripBoundariesHint"></small>
                         </div>
-                        <div>
-                            <label style="display:flex;align-items:center;gap:10px">
-                                <label class="switch"><input type="checkbox" id="codeBuddyFilterEnabled"><span class="slider"></span></label>
-                                <span data-i18n="settings.filterCodeBuddy"></span>
-                            </label>
-                            <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterCodeBuddyHint"></small>
-                        </div>
                     </div>
                 </div>
                 <div class="form-group" style="margin-top:16px">
@@ -1394,6 +1389,9 @@
                 'providers.fWeight': '权重（负载均衡）',
                 'providers.fApiKey': 'API 密钥',
                 'providers.fApiKeyHint': '留空则保持不变',
+                'providers.bulkAddTitle': '批量追加密钥（{0}）',
+                'providers.bulkAddHint': '每行一个密钥；为该后端新增账号',
+                'providers.bulkAddBtn': '追加这些密钥',
                 'providers.fKeptIfBlank': '留空保持不变',
                 'providers.fBaseURL': 'Base URL',
                 'providers.fModels': '模型列表',
@@ -1539,14 +1537,12 @@
                 'settings.proxySaved': '代理设置已保存',
                 'settings.promptFilter': 'System Prompt 过滤',
                 'settings.builtinFilters': '内置过滤器',
-                'settings.filterClaudeCode': 'Kiro 内容过滤',
-                'settings.filterClaudeCodeHint': '仅作用于 Kiro/CodeWhisperer 账号，针对请求的 SYSTEM 字段。检测到 Claude Code 内置系统提示时，移除脚手架样板并保留你真正的 CLAUDE.md / AGENTS.md 记忆，同时改写残留的品牌词（Claude→Kiro，Anthropic→Amazon）。不添加任何合成内容：Kiro 没有独立的 system 消息槽，此处保留的内容会被前置到你的第一条用户消息中——若伪造一行身份说明，会被模型当作用户输入的文字并对其评论，因此不添加。没有内嵌记忆时结果为空（不加前缀），你自己的消息绝不会被改动。目的：避免上游模型把脚手架提示词识别为伪造注入，同时不丢失你的指令。建议：开启。',
+        'settings.filterClaudeCode': '脚手架中和器',
+        'settings.filterClaudeCodeHint': '作用于所有非 Anthropic 后端（Kiro、CodeBuddy、Qoder 及任何新增的 provider），针对请求的 SYSTEM 字段。检测到 Claude Code 内置系统提示时，完整保留整个脚手架（语气、工具使用规则、输出格式、Agent 行为），让模型保持能力——只移除指纹：保留的 x-anthropic-billing-header 行（该头到达 CodeWhisperer/Bedrock 会返回 HTTP 400）、噪音 <system-reminder> 块（你的 CLAUDE.md / AGENTS.md 记忆会被保留），并按后端改写品牌/身份词（Claude→Kiro/CodeBuddy/Qoder，Anthropic→Amazon/Tencent）。不添加任何合成内容：在 Kiro 这类没有独立 system 槽的后端，保留的文本会被前置到你的第一条用户消息中，伪造一行身份说明会被模型当作用户输入并跑偏——因此不添加。目的：避免上游对脚手架做指纹识别，同时保持模型聪明、你的指令完整。建议：开启。',
                 'settings.filterEnvNoise': '过滤环境噪音行',
                 'settings.filterEnvNoiseHint': '仅作用于 Kiro/CodeWhisperer 账号。从系统提示和用户消息中移除注入的噪音：环境变量、Git 状态、最近提交、以及保留的 x-anthropic-billing-header 行（该头若到达 CodeWhisperer/Bedrock 会返回 HTTP 400）。同时丢弃整个 <system-reminder>…</system-reminder> 块，但携带 CLAUDE.md / AGENTS.md 记忆的块会被保留。默认关闭：除非遇到计费头 400 或想精简环境/Git 噪音，否则保持关闭即可——开启无害，但正常使用并不需要。',
                 'settings.filterStripBoundaries': '清理边界标记',
                 'settings.filterStripBoundariesHint': '仅作用于 Kiro/CodeWhisperer 账号。从客户端提交的提示中清除 --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- 等边界标记行。代理本身已不再发出这类标记，因此仅对极少数会发送它们的客户端有意义。纯属外观清理，不影响 CLAUDE.md 或工具行为。默认关闭：仅当你的客户端会注入这些标记时才开启。',
-                'settings.filterCodeBuddy': 'CodeBuddy 内容过滤',
-                'settings.filterCodeBuddyHint': '仅作用于 CodeBuddy 账号。CodeBuddy 的服务端审核会拒绝提及竞品品牌（"Claude"/"Anthropic"）的请求，而这些词填满了 Claude Code 系统提示——你会看到"系统检测到您当前输入的信息存在敏感内容"/ 用量策略错误。开启时（默认），代理在转发前把系统提示替换为中性提示（"You are CodeBuddy Code."）并改写品牌词，使请求通过审核。CodeBuddy 保留真正的 system 消息槽，因此该中性行在其中是不可见的。关闭则原样发送。建议：开启。',
                 'settings.savePromptFilter': '保存过滤设置',
                 'settings.promptFilterSaved': '过滤设置已保存',
                 'settings.customRules': '自定义过滤规则',
@@ -1859,6 +1855,9 @@
                 'providers.fWeight': 'Weight (load balancing)',
                 'providers.fApiKey': 'API Key',
                 'providers.fApiKeyHint': 'leave blank to keep current',
+                'providers.bulkAddTitle': 'Bulk append keys ({0})',
+                'providers.bulkAddHint': 'one key per line; adds new accounts for this backend',
+                'providers.bulkAddBtn': 'Append these keys',
                 'providers.fKeptIfBlank': 'kept if blank',
                 'providers.fBaseURL': 'Base URL',
                 'providers.fModels': 'Models',
@@ -2004,14 +2003,12 @@
                 'settings.proxySaved': 'Proxy settings saved',
                 'settings.promptFilter': 'System Prompt Filter',
                 'settings.builtinFilters': 'Built-in Filters',
-                'settings.filterClaudeCode': 'Kiro content filter',
-                'settings.filterClaudeCodeHint': 'Kiro/CodeWhisperer accounts only. Targets the request SYSTEM field. When the Claude Code CLI built-in system prompt is detected, the harness scaffolding is removed and your genuine CLAUDE.md / AGENTS.md memory is preserved, with residual brand tokens rewritten (Claude→Kiro, Anthropic→Amazon). Nothing synthetic is added: Kiro has no system-message slot, so anything kept here is prepended to your first user turn — a fabricated identity line would read as user-typed text and make the model comment on it, so we add none. When there is no embedded memory the result is empty (no preamble); your own messages are never touched. Purpose: stop the upstream model from fingerprinting the harness prompt as a fake injection, without losing your instructions. Recommended: ON.',
+        'settings.filterClaudeCode': 'Harness neutralizer',
+        'settings.filterClaudeCodeHint': 'All non-Anthropic backends (Kiro, CodeBuddy, Qoder, and any added provider). Targets the request SYSTEM field. When the Claude Code CLI built-in system prompt is detected, the FULL harness is KEPT (tone, tool-use rules, output format, agent behavior) so the model stays capable — only the fingerprints are removed: the reserved x-anthropic-billing-header line (CodeWhisperer/Bedrock returns HTTP 400 if it reaches them), noise <system-reminder> blocks (your CLAUDE.md / AGENTS.md memory is preserved), and brand/identity tokens are rewritten per backend (Claude→Kiro/CodeBuddy/Qoder, Anthropic→Amazon/Tencent). Nothing synthetic is added: on slot-less backends like Kiro the kept text is prepended to your first user turn, so a fabricated identity line would read as user-typed text and derail the model — we add none. Purpose: stop the upstream from fingerprinting the harness while keeping the model smart and your instructions intact. Recommended: ON.',
                 'settings.filterEnvNoise': 'Strip environment noise lines',
                 'settings.filterEnvNoiseHint': 'Kiro/CodeWhisperer accounts only. Removes injected noise from the system prompt and user messages: environment variables, git status, recent commits, and the reserved x-anthropic-billing-header line (CodeWhisperer/Bedrock returns HTTP 400 if that header reaches it). It also drops whole <system-reminder>…</system-reminder> blocks EXCEPT those carrying CLAUDE.md / AGENTS.md memory, which are preserved. Default OFF: leave it off unless you hit a billing-header 400 or want the env/git noise trimmed — turning it on costs nothing but is not required for normal use.',
                 'settings.filterStripBoundaries': 'Clean boundary markers',
                 'settings.filterStripBoundariesHint': 'Kiro/CodeWhisperer accounts only. Strips --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- marker lines from client-supplied prompts. The proxy itself no longer emits these markers, so this only matters for the rare client that sends them. Purely cosmetic, no effect on CLAUDE.md or tool behavior. Default OFF: turn on only if your client injects these markers.',
-                'settings.filterCodeBuddy': 'CodeBuddy content filter',
-                'settings.filterCodeBuddyHint': 'CodeBuddy accounts only. CodeBuddy\'s server-side moderation rejects requests that mention competitor brands ("Claude"/"Anthropic"), which fill the Claude Code system prompt — you\'d see "系统检测到您当前输入的信息存在敏感内容" / a Usage Policy error. When ON (default), the proxy replaces the system prompt with a neutral one ("You are CodeBuddy Code.") and rewrites brand tokens before forwarding, so requests clear the filter. CodeBuddy keeps a real system-message slot, so the neutral line is invisible there. Turn OFF to send requests unmodified. Recommended: ON.',
                 'settings.savePromptFilter': 'Save Filter Settings',
                 'settings.promptFilterSaved': 'Filter settings saved',
                 'settings.customRules': 'Custom Filter Rules',
@@ -3734,8 +3731,6 @@
             document.getElementById('filterClaudeCode').checked = !!d.filterClaudeCode;
             document.getElementById('filterEnvNoise').checked = !!d.filterEnvNoise;
             document.getElementById('filterStripBoundaries').checked = !!d.filterStripBoundaries;
-            // CodeBuddy filter is now owned by this same endpoint (default on).
-            document.getElementById('codeBuddyFilterEnabled').checked = d.codeBuddyFilterEnabled !== false;
             promptRules = d.rules || [];
             renderPromptRules();
         }
@@ -3746,7 +3741,6 @@
                     filterClaudeCode: document.getElementById('filterClaudeCode').checked,
                     filterEnvNoise: document.getElementById('filterEnvNoise').checked,
                     filterStripBoundaries: document.getElementById('filterStripBoundaries').checked,
-                    codeBuddyFilterEnabled: document.getElementById('codeBuddyFilterEnabled').checked,
                     rules: promptRules
                 })
             });
@@ -4561,6 +4555,15 @@
                 '<div class="form-group"><label>' + t('providers.fName') + '</label><input type="text" id="edpName" value="' + esc(a.nickname || a.email || '') + '"></div>' +
                 '<div class="form-group"><label>' + t('providers.fWeight') + '</label><input type="number" id="edpWeight" min="0" value="' + (a.weight || 0) + '"></div>' +
                 '<div class="form-group"><label>' + t('providers.fApiKey') + ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + t('providers.fApiKeyHint') + ')</span></label><input type="password" id="edpApiKey" placeholder="' + (a.hasApiKey ? '•••••• ' + t('providers.fKeptIfBlank') : 'sk-...') + '"></div>' +
+                (backend && backend !== 'custom' ?
+                    '<div class="form-group" style="border-top:1px solid var(--border);padding-top:14px;margin-top:4px">' +
+                    '<label>' + t('providers.bulkAddTitle', esc(backend)) + ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + t('providers.bulkAddHint') + ')</span></label>' +
+                    '<textarea id="edpBulkKeys" rows="5" oninput="updateEdpBulkCount()" placeholder="sk-key-one&#10;sk-key-two&#10;sk-key-three" style="width:100%;font-family:monospace;font-size:12px"></textarea>' +
+                    '<div id="edpBulkCount" style="font-size:12px;color:var(--muted);margin-top:4px;min-height:16px"></div>' +
+                    '<button class="btn btn-secondary btn-sm" id="edpBulkBtn" onclick="submitEditBulkKeys(\'' + esc(backend) + '\')">' + t('providers.bulkAddBtn') + '</button>' +
+                    '<div id="edpBulkStatus" style="font-size:13px;color:var(--muted);margin-top:6px;min-height:18px"></div>' +
+                    '</div>'
+                    : '') +
                 (isCustom || a.baseURLOverride ?
                     '<div class="form-group"><label>' + t('providers.fBaseURL') + (isCustom ? ' <span style="font-weight:normal;color:var(--muted);font-size:12px">(' + esc(a.customDialect) + ')</span>' : '') + '</label><input type="text" id="edpBaseURL" value="' + esc(a.baseURLOverride || '') + '" placeholder="https://api.example.com/v1"></div>'
                     : '<input type="hidden" id="edpBaseURL" value="">') +
@@ -4606,7 +4609,53 @@
                 if (statusEl) statusEl.textContent = t('common.failed');
             }
         }
-        let codexPollTimer = null;
+        function updateEdpBulkCount() {
+            const ta = document.getElementById('edpBulkKeys');
+            const out = document.getElementById('edpBulkCount');
+            if (!ta || !out) return;
+            const seen = {};
+            let n = 0;
+            ta.value.split(/\r?\n/).forEach(line => {
+                const k = line.trim();
+                if (k && !seen[k]) { seen[k] = true; n++; }
+            });
+            out.textContent = n === 0 ? '' : (n + ' unique key' + (n === 1 ? '' : 's') + ' will be added');
+        }
+        async function submitEditBulkKeys(backend) {
+            const ta = document.getElementById('edpBulkKeys');
+            const statusEl = document.getElementById('edpBulkStatus');
+            const btn = document.getElementById('edpBulkBtn');
+            if (!ta) return;
+            const seen = {};
+            const apiKeys = [];
+            ta.value.split(/\r?\n/).forEach(line => {
+                const k = line.trim();
+                if (k && !seen[k]) { seen[k] = true; apiKeys.push(k); }
+            });
+            if (apiKeys.length === 0) { if (statusEl) statusEl.textContent = 'Paste at least one API key (one per line)'; return; }
+            if (btn) { btn.disabled = true; btn.textContent = t('import.running'); }
+            if (statusEl) statusEl.textContent = 'Adding ' + apiKeys.length + ' accounts…';
+            try {
+                const res = await fetch('/admin/api/providers/account/bulk', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ backend: backend, apiKeys: apiKeys })
+                });
+                const d = await res.json();
+                if (d.success) {
+                    closeModal();
+                    await loadAccounts();
+                    if (activeDashboardTab() === 'providers') renderProviders();
+                    loadStats();
+                } else {
+                    if (btn) { btn.disabled = false; btn.textContent = t('providers.bulkAddBtn'); }
+                    if (statusEl) statusEl.textContent = d.error || t('common.failed');
+                }
+            } catch (e) {
+                if (btn) { btn.disabled = false; btn.textContent = t('providers.bulkAddBtn'); }
+                if (statusEl) statusEl.textContent = t('common.failed');
+            }
+        }
         let codexSessionId = '';
         async function startCodexLogin() {
             const res = await fetch('/admin/api/auth/codex/start', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }, body: '{}' });

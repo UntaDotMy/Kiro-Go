@@ -244,8 +244,18 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		// destination host every request, so keep-alive reuse never
 		// happened and each call paid a fresh handshake. Pinning fixed
 		// that. The Go default of 2 would reintroduce the churn.
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost: 100,
+		// Keep pooled keep-alive connections warm across interactive reading
+		// pauses. The upstream inference host (runtime.us-east-1.kiro.dev) is
+		// us-east-1 only, so from a distant client every cold dial repays a full
+		// TCP+TLS handshake (~4x RTT). An interactive Claude Code user routinely
+		// pauses >90s between turns; at the old 90s the warm connection was
+		// evicted client-side and the next turn paid that handshake before the
+		// first token. 240s stays comfortably under AWS NLB's ~350s idle reaper
+		// (so the server still honors the connection) while surviving normal
+		// think/read gaps. Dead connections are still caught fast by the h2 PING
+		// health-check (h2ReadIdleTimeout/h2PingTimeout), independent of this.
+		IdleConnTimeout:       240 * time.Second,
 		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: responseHeaderTimeout,
@@ -259,7 +269,7 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		// middlebox. 10s matches Go's own default — far above any healthy AWS handshake
 		// (tens of ms) while fast-failing a half-open connection. Precedes the body
 		// entirely, so no interaction with the h2 ping budget or streamIdleTimeout.
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
 		// OS-level TCP keep-alive on the dialer. This is the floor of
 		// dead-connection detection and, crucially, the ONLY active probing on
 		// the proxied path where HTTP/2 PINGs are unavailable (h2 is disabled
@@ -448,10 +458,46 @@ type InferenceConfig struct {
 
 // ==================== Stream Callbacks ====================
 
+// UpstreamUsage is the WIDE carrier for REAL token counts a non-Kiro provider
+// reports in its own usage payload. It is populated strictly inside the four
+// non-Kiro SSE parsers (translate_openai/anthropic/gemini/ollama) and fired via
+// OnUsage; the Kiro path NEVER sets it (Kiro's upstream reports no real token
+// integers — only contextUsagePercentage + credits — so Kiro must estimate).
+//
+// CONTRACT: OutputTokens ALWAYS includes ReasoningTokens. Reasoning is a SUBSET
+// of output, never additive. Each PRODUCER (parser) normalizes its provider's
+// shape to this invariant before firing OnUsage, so the emitter never has to.
+//   - OpenAI: completion_tokens already includes reasoning → pass verbatim.
+//   - Gemini: candidatesTokenCount EXCLUDES thoughts → Output = candidates +
+//     thoughts; Reasoning = thoughts.
+//   - Anthropic / Ollama: no reasoning split.
+//
+// HasRealCounts is true ONLY when a usage payload was actually parsed. A stray
+// true on the Kiro path would suppress the local estimate, so it is set strictly
+// inside the non-Kiro parsers.
+type UpstreamUsage struct {
+	InputTokens         int
+	OutputTokens        int
+	TotalTokens         int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	ReasoningTokens     int
+	HasRealCounts       bool
+}
+
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
-	OnText         func(text string, isThinking bool)
-	OnToolUse      func(toolUse KiroToolUse)
+	OnText    func(text string, isThinking bool)
+	OnToolUse func(toolUse KiroToolUse)
+	// OnUsage surfaces the WIDE real upstream usage (input/output/total + cache
+	// read/creation + reasoning) parsed from a non-Kiro provider's own usage
+	// payload. It is the single carrier the finalize paths capture and feed to
+	// resolveUsage. OnComplete + OnCacheUsage are kept as narrow back-compat
+	// shims (provider_codex.go / provider_qoder.go / handler.go define or use
+	// them); a parser that fires OnUsage SHOULD also fire the shims so existing
+	// consumers keep working. Last value wins. Optional; the Kiro path never
+	// sets it.
+	OnUsage        func(usage UpstreamUsage)
 	OnComplete     func(inputTokens, outputTokens int)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
@@ -482,6 +528,24 @@ type KiroStreamCallback struct {
 	// ContentLengthExceededException. Optional; callers that don't supply this
 	// fall back to a heuristic in the response builder (tool_use vs end_turn).
 	OnStopReason func(reason string)
+}
+
+// fireUpstreamUsage delivers a parsed real-usage payload to cb.OnUsage and also
+// fans it out to the narrow back-compat shims (OnComplete, OnCacheUsage) so
+// callers wired only to the old two-int callbacks keep working unchanged.
+func fireUpstreamUsage(cb *KiroStreamCallback, usage UpstreamUsage) {
+	if cb == nil {
+		return
+	}
+	if cb.OnUsage != nil {
+		cb.OnUsage(usage)
+	}
+	if cb.OnComplete != nil && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
+		cb.OnComplete(usage.InputTokens, usage.OutputTokens)
+	}
+	if cb.OnCacheUsage != nil && (usage.CacheReadTokens > 0 || usage.CacheCreationTokens > 0) {
+		cb.OnCacheUsage(usage.CacheReadTokens, usage.CacheCreationTokens)
+	}
 }
 
 // ==================== API Call ====================

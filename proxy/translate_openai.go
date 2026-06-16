@@ -318,14 +318,20 @@ type openAIStreamChunk struct {
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
 		// Real upstream prompt-cache hit count. OpenAI / DashScope-compatible
 		// report it under prompt_tokens_details.cached_tokens; DeepSeek uses the
 		// flat prompt_cache_hit_tokens. Either is the genuine cached prefix — we
-		// pass it through verbatim (never a local estimate) via OnCacheUsage.
+		// pass it through verbatim (never a local estimate) via OnUsage.
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+		// completion_tokens already INCLUDES reasoning; reasoning_tokens is the
+		// subset spent on hidden reasoning, surfaced verbatim (never additive).
+		CompletionTokensDetails *struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }
 
@@ -408,13 +414,9 @@ func parseOpenAISSE(r io.Reader, cb *KiroStreamCallback) error {
 				stopReason = mapOpenAIFinishReason(ch.FinishReason)
 			}
 		}
-		if chunk.Usage != nil && cb.OnComplete != nil {
-			cb.OnComplete(chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens)
-		}
-		if chunk.Usage != nil && cb.OnCacheUsage != nil {
-			// Pass through the REAL upstream cached-prefix count (never estimated).
-			// prompt_tokens_details.cached_tokens is the OpenAI/DashScope-compatible
-			// field; prompt_cache_hit_tokens is DeepSeek's flat equivalent.
+		if chunk.Usage != nil {
+			// completion_tokens ALREADY includes reasoning, so OutputTokens passes
+			// through verbatim and ReasoningTokens reads the details subset.
 			cached := 0
 			if d := chunk.Usage.PromptTokensDetails; d != nil {
 				cached = d.CachedTokens
@@ -422,9 +424,18 @@ func parseOpenAISSE(r io.Reader, cb *KiroStreamCallback) error {
 			if cached == 0 && chunk.Usage.PromptCacheHitTokens > 0 {
 				cached = chunk.Usage.PromptCacheHitTokens
 			}
-			if cached > 0 {
-				cb.OnCacheUsage(cached, 0) // read-only providers report no cache-creation
+			reasoning := 0
+			if d := chunk.Usage.CompletionTokensDetails; d != nil {
+				reasoning = d.ReasoningTokens
 			}
+			fireUpstreamUsage(cb, UpstreamUsage{
+				InputTokens:     chunk.Usage.PromptTokens,
+				OutputTokens:    chunk.Usage.CompletionTokens,
+				TotalTokens:     chunk.Usage.TotalTokens,
+				CacheReadTokens: cached,
+				ReasoningTokens: reasoning,
+				HasRealCounts:   true,
+			})
 		}
 	}
 	if err := scanner.Err(); err != nil {

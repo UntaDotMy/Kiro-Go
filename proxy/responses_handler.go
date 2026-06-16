@@ -155,6 +155,7 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 	var content, reasoning string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
+	var up UpstreamUsage
 	var credits float64
 	var realInputTokens int
 	var upstreamStopReason string
@@ -168,6 +169,7 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 			}
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+		OnUsage:    func(u UpstreamUsage) { up = u },
 		OnComplete: func(in, out int) { inputTokens, outputTokens = in, out },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
@@ -190,12 +192,10 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 		reasoning = ""
 	}
 
-	if realInputTokens > 0 {
-		inputTokens = realInputTokens
-	} else if inputTokens <= 0 {
-		inputTokens = estimatedInputTokens
-	}
-	outputTokens = estimateClaudeOutputTokens(finalContent, reasoning, toolUses)
+	estimatedOutput := estimateClaudeOutputTokens(finalContent, reasoning, toolUses)
+	resolved := resolveUsage(false, up, promptCacheUsage{}, false, realInputTokens, estimatedInputTokens, estimatedOutput)
+	inputTokens = resolved.InputTokens
+	outputTokens = resolved.OutputTokens
 
 	// Pool counters before recordSuccess so the realtime dashboard push
 	// reflects this request's per-account credits/tokens (see handler.go).
@@ -207,7 +207,12 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 		_, _ = config.ConsumeAPIKey(apiKeyID, inputTokens+outputTokens, credits, model)
 	}
 
-	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, 0, reasoningCfg, upstreamStopReason)
+	resp := BuildResponsesNonStream(model, finalContent, reasoning, toolUses, inputTokens, outputTokens, includeReasoning, resolved.CacheReadTokens, reasoningCfg, upstreamStopReason)
+	// Surface the REAL upstream reasoning subset when the provider reported one,
+	// overriding the text estimate BuildResponsesNonStream falls back to.
+	if resolved.ReasoningTokens > 0 {
+		resp.Usage.OutputTokensDetails = &ResponsesOutputDetails{ReasoningTokens: resolved.ReasoningTokens}
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(resp)
@@ -289,6 +294,7 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 		toolCalls        = map[string]*fnCallState{}
 		toolOrder        []string
 
+		up                        UpstreamUsage
 		inputTokens, outputTokens int
 		credits                   float64
 		realInputTokens           int
@@ -600,12 +606,10 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 	}
 
 	// Final usage + completion.
-	if realInputTokens > 0 {
-		inputTokens = realInputTokens
-	} else if inputTokens <= 0 {
-		inputTokens = estimatedInputTokens
-	}
-	outputTokens = estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
+	estimatedOutput := estimateClaudeOutputTokens(messageBuf.String(), reasoningBuf.String(), nil)
+	resolved := resolveUsage(false, up, promptCacheUsage{}, false, realInputTokens, estimatedInputTokens, estimatedOutput)
+	inputTokens = resolved.InputTokens
+	outputTokens = resolved.OutputTokens
 
 	// Pool counters before recordSuccess so the realtime dashboard push
 	// reflects this request's per-account credits/tokens (see handler.go).
@@ -654,11 +658,22 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 	usage := map[string]interface{}{
 		"input_tokens":  inputTokens,
 		"output_tokens": outputTokens,
-		"total_tokens":  inputTokens + outputTokens,
+		"total_tokens":  resolved.TotalTokens,
 	}
-	if reasoningStarted {
+	// Prefer the REAL upstream reasoning subset; fall back to the text estimate
+	// only when the provider reported none but reasoning content was emitted.
+	if resolved.ReasoningTokens > 0 {
+		usage["output_tokens_details"] = map[string]interface{}{
+			"reasoning_tokens": resolved.ReasoningTokens,
+		}
+	} else if reasoningStarted {
 		usage["output_tokens_details"] = map[string]interface{}{
 			"reasoning_tokens": estimateApproxTokens(reasoningBuf.String()),
+		}
+	}
+	if resolved.CacheReadTokens > 0 {
+		usage["input_tokens_details"] = map[string]interface{}{
+			"cached_tokens": resolved.CacheReadTokens,
 		}
 	}
 

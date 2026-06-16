@@ -574,6 +574,24 @@ func resolveResponseCache(isKiro bool, estimated promptCacheUsage, estimatedProf
 	return promptCacheUsage{}, false
 }
 
+// claudeCacheFromResolved rebuilds the promptCacheUsage the Claude emitter needs
+// from a ResolvedUsage. ResolvedUsage carries the canonical read/creation totals
+// already decided by resolveUsage (the single real-vs-estimated source); the
+// 5m/1h creation TTL breakdown is a Kiro local-estimate sub-detail that
+// ResolvedUsage intentionally omits, so it is pulled from the estimate only on
+// the Kiro path (a non-Kiro provider never reports a TTL split).
+func claudeCacheFromResolved(isKiro bool, r ResolvedUsage, estimated promptCacheUsage) promptCacheUsage {
+	usage := promptCacheUsage{
+		CacheReadInputTokens:     r.CacheReadTokens,
+		CacheCreationInputTokens: r.CacheCreationTokens,
+	}
+	if isKiro && r.CachePresent {
+		usage.CacheCreation5mInputTokens = estimated.CacheCreation5mInputTokens
+		usage.CacheCreation1hInputTokens = estimated.CacheCreation1hInputTokens
+	}
+	return usage
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	if includeCache {
 		usage = reconcileCacheUsage(inputTokens, usage)

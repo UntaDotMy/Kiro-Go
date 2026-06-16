@@ -2198,6 +2198,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 	msgID := "msg_" + uuid.New().String()
 	var inputTokens, outputTokens int
+	var up UpstreamUsage
 	var credits float64
 	var realInputTokens int
 	var toolUses []KiroToolUse
@@ -2478,6 +2479,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				"index": idx,
 			})
 		},
+		OnUsage: func(u UpstreamUsage) {
+			up = u
+		},
 		OnComplete: func(inTok, outTok int) {
 			inputTokens = inTok
 			outputTokens = outTok
@@ -2548,7 +2552,6 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// the event stream wins; if upstream sent none, fall back to the model's
 	// own contextUsagePercentage × window (coarse, rounded to a percentage);
 	// only estimate locally as a last resort.
-	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	thinkingOutput := rawThinkingBuilder.String()
 	if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -2557,9 +2560,23 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	if !thinking {
 		thinkingOutput = ""
 	}
-	if outputTokens <= 0 {
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+	estimatedOutput := outputTokens
+	if estimatedOutput <= 0 {
+		estimatedOutput = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 	}
+	// Bridge the legacy OnContextUsage / OnCacheUsage shims (still the only
+	// signal on the Kiro and codex/qoder paths) into the wide carrier before the
+	// single resolveUsage call. The non-Kiro SSE parsers already set up via
+	// OnUsage; these only fill gaps the parser left zero.
+	if up.CacheReadTokens == 0 {
+		up.CacheReadTokens = realCacheRead
+	}
+	if up.CacheCreationTokens == 0 {
+		up.CacheCreationTokens = realCacheCreation
+	}
+	resolved := resolveUsage(isKiro, up, cacheUsage, cacheProfile != nil, realInputTokens, estimatedInputTokens, estimatedOutput)
+	inputTokens = resolved.InputTokens
+	outputTokens = resolved.OutputTokens
 
 	// Update per-account pool counters BEFORE recordSuccess so the realtime
 	// dashboard broadcast (fired inside recordSuccess) already reflects this
@@ -2601,10 +2618,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// 发送 message_delta
 	stopReason := resolveAnthropicStopReason(upstreamStopReason, len(toolUses) > 0)
 
-	// Backend-aware cache: Kiro uses the local estimate; non-Kiro passes through
-	// the provider's REAL reported cache (or emits none). Never a Kiro estimate
-	// on a non-Kiro response.
-	respCacheUsage, includeRespCache := resolveResponseCache(isKiro, cacheUsage, cacheProfile != nil, realCacheRead, realCacheCreation)
+	respCacheUsage := claudeCacheFromResolved(isKiro, resolved, cacheUsage)
+	includeRespCache := resolved.CachePresent
 
 	emit("message_delta", map[string]interface{}{
 		"type": "message_delta",
@@ -2858,6 +2873,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	var thinkingContent string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
+	var up UpstreamUsage
 	var credits float64
 	var realInputTokens int
 	var upstreamStopReason string
@@ -2881,6 +2897,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		},
 		OnToolUse: func(tu KiroToolUse) {
 			toolUses = append(toolUses, tu)
+		},
+		OnUsage: func(u UpstreamUsage) {
+			up = u
 		},
 		OnComplete: func(inTok, outTok int) {
 			inputTokens = inTok
@@ -2923,14 +2942,23 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		rawThinkingContent = ""
 	}
 
-	// Token precedence (most → least accurate): the exact upstream count from
-	// the event stream wins; if upstream sent none, fall back to the model's
-	// own contextUsagePercentage × window (coarse, rounded to a percentage);
-	// only estimate locally as a last resort.
-	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
-	if outputTokens <= 0 {
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+	estimatedOutput := outputTokens
+	if estimatedOutput <= 0 {
+		estimatedOutput = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 	}
+	// Bridge the legacy OnContextUsage / OnCacheUsage shims (the only signal on
+	// the Kiro and codex/qoder paths) into the wide carrier before the single
+	// resolveUsage call. The non-Kiro SSE parsers already set up via OnUsage;
+	// these only fill gaps the parser left zero.
+	if up.CacheReadTokens == 0 {
+		up.CacheReadTokens = realCacheRead
+	}
+	if up.CacheCreationTokens == 0 {
+		up.CacheCreationTokens = realCacheCreation
+	}
+	resolved := resolveUsage(isKiro, up, cacheUsage, cacheProfile != nil, realInputTokens, estimatedInputTokens, estimatedOutput)
+	inputTokens = resolved.InputTokens
+	outputTokens = resolved.OutputTokens
 
 	// Update per-account pool counters BEFORE recordSuccess so the realtime
 	// dashboard broadcast (fired inside recordSuccess) already reflects this
@@ -3149,6 +3177,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	var toolCalls []ToolCall
 	var toolCallIndex int
 	var inputTokens, outputTokens int
+	var up UpstreamUsage
 	var credits float64
 	var realInputTokens int
 	var rawContentBuilder strings.Builder
@@ -3358,6 +3387,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			data, _ := json.Marshal(chunk)
 			emit(data)
 		},
+		OnUsage: func(u UpstreamUsage) {
+			up = u
+		},
 		OnComplete: func(inTok, outTok int) {
 			inputTokens = inTok
 			outputTokens = outTok
@@ -3397,7 +3429,6 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	// the event stream wins; if upstream sent none, fall back to the model's
 	// own contextUsagePercentage × window (coarse, rounded to a percentage);
 	// only estimate locally as a last resort.
-	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
 	outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 	reasoningOutput := rawReasoningBuilder.String()
 	if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -3406,13 +3437,17 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	if !thinking {
 		reasoningOutput = ""
 	}
-	if outputTokens <= 0 {
-		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+	estimatedOutput := outputTokens
+	if estimatedOutput <= 0 {
+		estimatedOutput = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
 		for _, tc := range toolCalls {
-			outputTokens += estimateApproxTokens(tc.Function.Name)
-			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+			estimatedOutput += estimateApproxTokens(tc.Function.Name)
+			estimatedOutput += estimateApproxTokens(tc.Function.Arguments)
 		}
 	}
+	resolved := resolveUsage(false, up, promptCacheUsage{}, false, realInputTokens, estimatedInputTokens, estimatedOutput)
+	inputTokens = resolved.InputTokens
+	outputTokens = resolved.OutputTokens
 
 	// Update per-account pool counters BEFORE recordSuccess so the realtime
 	// dashboard broadcast (fired inside recordSuccess) already reflects this
@@ -3462,6 +3497,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 	var reasoningContent string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
+	var up UpstreamUsage
 	var credits float64
 	var realInputTokens int
 	var upstreamStopReason string
@@ -3475,6 +3511,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			}
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+		OnUsage:    func(u UpstreamUsage) { up = u },
 		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
@@ -3499,14 +3536,13 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		reasoningContent = ""
 	}
 
-	// Token precedence (most → least accurate): the exact upstream count from
-	// the event stream wins; if upstream sent none, fall back to the model's
-	// own contextUsagePercentage × window (coarse, rounded to a percentage);
-	// only estimate locally as a last resort.
-	inputTokens = resolveInputTokens(inputTokens, realInputTokens, estimatedInputTokens)
-	if outputTokens <= 0 {
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+	estimatedOutput := outputTokens
+	if estimatedOutput <= 0 {
+		estimatedOutput = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 	}
+	resolved := resolveUsage(false, up, promptCacheUsage{}, false, realInputTokens, estimatedInputTokens, estimatedOutput)
+	inputTokens = resolved.InputTokens
+	outputTokens = resolved.OutputTokens
 
 	// Update per-account pool counters BEFORE recordSuccess so the realtime
 	// dashboard broadcast (fired inside recordSuccess) already reflects this
@@ -4949,11 +4985,10 @@ func (h *Handler) apiGetPromptFilter(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		FilterClaudeCode       *bool                      `json:"filterClaudeCode,omitempty"`
-		FilterEnvNoise         *bool                      `json:"filterEnvNoise,omitempty"`
-		FilterStripBoundaries  *bool                      `json:"filterStripBoundaries,omitempty"`
-		CodeBuddyFilterEnabled *bool                      `json:"codeBuddyFilterEnabled,omitempty"`
-		Rules                  *[]config.PromptFilterRule `json:"rules,omitempty"`
+		FilterClaudeCode      *bool                      `json:"filterClaudeCode,omitempty"`
+		FilterEnvNoise        *bool                      `json:"filterEnvNoise,omitempty"`
+		FilterStripBoundaries *bool                      `json:"filterStripBoundaries,omitempty"`
+		Rules                 *[]config.PromptFilterRule `json:"rules,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4966,7 +5001,6 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	fcc := current.FilterClaudeCode
 	fen := current.FilterEnvNoise
 	fsb := current.FilterStripBoundaries
-	cbf := current.CodeBuddyFilterEnabled
 	rules := current.Rules
 	if req.FilterClaudeCode != nil {
 		fcc = *req.FilterClaudeCode
@@ -4977,13 +5011,10 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 	if req.FilterStripBoundaries != nil {
 		fsb = *req.FilterStripBoundaries
 	}
-	if req.CodeBuddyFilterEnabled != nil {
-		cbf = *req.CodeBuddyFilterEnabled
-	}
 	if req.Rules != nil {
 		rules = *req.Rules
 	}
-	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, cbf, rules); err != nil {
+	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

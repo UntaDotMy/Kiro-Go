@@ -297,12 +297,15 @@ func parseAnthropicSSE(r io.Reader, cb *KiroStreamCallback) error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	if cb.OnComplete != nil && (inputTokens > 0 || outputTokens > 0) {
-		cb.OnComplete(inputTokens, outputTokens)
-	}
-	// Pass through real upstream cache counts when the host reported any.
-	if (cacheRead > 0 || cacheCreation > 0) && cb.OnCacheUsage != nil {
-		cb.OnCacheUsage(cacheRead, cacheCreation)
+	if inputTokens > 0 || outputTokens > 0 || cacheRead > 0 || cacheCreation > 0 {
+		// Anthropic reports no reasoning split; output_tokens stands alone.
+		fireUpstreamUsage(cb, UpstreamUsage{
+			InputTokens:         inputTokens,
+			OutputTokens:        outputTokens,
+			CacheReadTokens:     cacheRead,
+			CacheCreationTokens: cacheCreation,
+			HasRealCounts:       true,
+		})
 	}
 	return nil
 }

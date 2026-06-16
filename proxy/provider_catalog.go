@@ -100,6 +100,12 @@ var builtinProviders = []builtinProvider{
 		// as an advisory (display-only) list. Source: docs.perplexity.ai model cards.
 		Models: []string{"sonar", "sonar-pro", "sonar-reasoning-pro", "sonar-deep-research"}},
 	{ID: "xai", Alias: "xai", Name: "xAI (Grok)", Dialect: DialectOpenAI, BaseURL: "https://api.x.ai/v1/chat/completions"},
+	{ID: "zai", Alias: "zai", Name: "Z.AI (Zhipu GLM)", Dialect: DialectOpenAI, BaseURL: "https://api.z.ai/api/paas/v4/chat/completions",
+		// z.ai exposes GET /api/paas/v4/models, but it is plan-gated and omits
+		// models the key can actually call, so the live fetch alone undercounts.
+		// Ship the current GLM lineup as an advisory fallback. Source: z.ai pricing
+		// docs (docs.z.ai/guides/overview/pricing). A missing id is never shed.
+		Models: []string{"glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.7-flashx", "glm-4.7-flash", "glm-4.6", "glm-4.5", "glm-4.5-x", "glm-4.5-air", "glm-4.5-airx", "glm-4.5-flash"}},
 	{ID: "nvidia", Alias: "nvidia", Name: "NVIDIA NIM", Dialect: DialectOpenAI, BaseURL: "https://integrate.api.nvidia.com/v1/chat/completions"},
 	{ID: "chutes", Alias: "ch", Name: "Chutes AI", Dialect: DialectOpenAI, BaseURL: "https://llm.chutes.ai/v1/chat/completions"},
 	{ID: "deepinfra", Alias: "deepinfra", Name: "DeepInfra", Dialect: DialectOpenAI, BaseURL: "https://api.deepinfra.com/v1/openai/chat/completions"},

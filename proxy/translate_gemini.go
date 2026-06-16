@@ -297,7 +297,7 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
-	var inputTokens, outputTokens, cachedTokens int
+	var inputTokens, outputTokens, cachedTokens, thoughtTokens int
 	var stopReason string
 	toolSeq := 0
 	// Native grounding (web search) accumulators. groundingMetadata is documented
@@ -345,6 +345,7 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 				PromptTokenCount        int `json:"promptTokenCount"`
 				CandidatesTokenCount    int `json:"candidatesTokenCount"`
 				CachedContentTokenCount int `json:"cachedContentTokenCount"`
+				ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
 			} `json:"usageMetadata"`
 		}
 		if err := json.Unmarshal([]byte(data), &resp); err != nil {
@@ -400,6 +401,7 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 		if resp.UsageMetadata != nil {
 			inputTokens = resp.UsageMetadata.PromptTokenCount
 			outputTokens = resp.UsageMetadata.CandidatesTokenCount
+			thoughtTokens = resp.UsageMetadata.ThoughtsTokenCount
 			if resp.UsageMetadata.CachedContentTokenCount > 0 {
 				cachedTokens = resp.UsageMetadata.CachedContentTokenCount
 			}
@@ -408,12 +410,17 @@ func parseGeminiSSE(r io.Reader, cb *KiroStreamCallback) error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	if cb.OnComplete != nil && (inputTokens > 0 || outputTokens > 0) {
-		cb.OnComplete(inputTokens, outputTokens)
-	}
-	// Pass through the REAL Gemini context-cache hit count (never estimated).
-	if cachedTokens > 0 && cb.OnCacheUsage != nil {
-		cb.OnCacheUsage(cachedTokens, 0)
+	if inputTokens > 0 || outputTokens > 0 || cachedTokens > 0 || thoughtTokens > 0 {
+		// candidatesTokenCount EXCLUDES thoughts, so fold thoughts into Output to
+		// honor the contract (Output includes reasoning) and surface thoughts as
+		// the reasoning subset. cachedContentTokenCount is the real cache hit.
+		fireUpstreamUsage(cb, UpstreamUsage{
+			InputTokens:     inputTokens,
+			OutputTokens:    outputTokens + thoughtTokens,
+			CacheReadTokens: cachedTokens,
+			ReasoningTokens: thoughtTokens,
+			HasRealCounts:   true,
+		})
 	}
 	if len(groundingResults) > 0 && cb.OnWebSearchResults != nil {
 		cb.OnWebSearchResults(groundingQuery, groundingResults)

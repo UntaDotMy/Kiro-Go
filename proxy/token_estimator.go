@@ -29,6 +29,65 @@ func resolveInputTokens(upstream, contextDerived, estimated int) int {
 	return 0
 }
 
+// ResolvedUsage is the final, format-neutral token usage every client emitter
+// renders from. It is produced by resolveUsage — the SINGLE place that decides
+// real-vs-estimated — and consumed verbatim by all three client formats
+// (Claude, OpenAI chat, Responses) on both the stream and non-stream paths.
+//
+// OutputTokens includes ReasoningTokens (the UpstreamUsage contract is carried
+// through). TotalTokens is never InputTokens+OutputTokens+ReasoningTokens — that
+// would double-count reasoning, which already lives inside OutputTokens.
+type ResolvedUsage struct {
+	InputTokens         int
+	OutputTokens        int
+	TotalTokens         int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	ReasoningTokens     int
+	CachePresent        bool
+}
+
+// resolveUsage is the one source of truth for turning captured upstream usage
+// plus local fallbacks into the ResolvedUsage every emitter renders. It mirrors
+// resolveResponseCache (format-neutral resolver + dumb emitters):
+//
+//   - InputTokens via resolveInputTokens (upstream → contextDerived → estimated).
+//   - OutputTokens: the REAL upstream output when present (which already includes
+//     reasoning), else the local estimate.
+//   - ReasoningTokens passed through from upstream (0 when not reported).
+//   - TotalTokens: the real upstream total when present, else InputTokens +
+//     OutputTokens — NEVER + ReasoningTokens (reasoning is inside output).
+//   - cache via resolveResponseCache: Kiro uses the local estimate, non-Kiro
+//     passes through the provider's real read/creation or emits none.
+//
+// estimatedProfilePresent + estimated carry the Kiro local prompt-cache estimate;
+// non-Kiro ignores them and uses up.CacheReadTokens / up.CacheCreationTokens.
+func resolveUsage(isKiro bool, up UpstreamUsage, estimated promptCacheUsage, estimatedProfilePresent bool, contextDerivedInput, estimatedInput, estimatedOutput int) ResolvedUsage {
+	input := resolveInputTokens(up.InputTokens, contextDerivedInput, estimatedInput)
+
+	output := estimatedOutput
+	if up.HasRealCounts && up.OutputTokens > 0 {
+		output = up.OutputTokens
+	}
+
+	total := input + output
+	if up.TotalTokens > 0 {
+		total = up.TotalTokens
+	}
+
+	cache, cachePresent := resolveResponseCache(isKiro, estimated, estimatedProfilePresent, up.CacheReadTokens, up.CacheCreationTokens)
+
+	return ResolvedUsage{
+		InputTokens:         input,
+		OutputTokens:        output,
+		TotalTokens:         total,
+		CacheReadTokens:     cache.CacheReadInputTokens,
+		CacheCreationTokens: cache.CacheCreationInputTokens,
+		ReasoningTokens:     up.ReasoningTokens,
+		CachePresent:        cachePresent,
+	}
+}
+
 // claudeCountTokensCorrection inflates our local char-heuristic estimate to
 // better match Anthropic's real tokenizer for the /v1/messages/count_tokens
 // endpoint that Claude Code calls to PRE-measure context before sending.

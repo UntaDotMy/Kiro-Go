@@ -131,9 +131,11 @@ func parseOllamaStream(r io.Reader, cb *KiroStreamCallback) error {
 			if stopReason == "" {
 				stopReason = mapOllamaDoneReason(chunk.DoneReason)
 			}
-			if cb.OnComplete != nil {
-				cb.OnComplete(chunk.PromptEvalCount, chunk.EvalCount)
-			}
+			fireUpstreamUsage(cb, UpstreamUsage{
+				InputTokens:   chunk.PromptEvalCount,
+				OutputTokens:  chunk.EvalCount,
+				HasRealCounts: true,
+			})
 		}
 	}
 	if err := scanner.Err(); err != nil {
