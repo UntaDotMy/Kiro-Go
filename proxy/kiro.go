@@ -249,6 +249,17 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		DisableCompression:    false,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: responseHeaderTimeout,
+		// Bound the TLS handshake. A hand-built http.Transport does NOT inherit
+		// http.DefaultTransport's 10s TLSHandshakeTimeout default — it stays 0
+		// (unbounded). DialContext.Timeout (30s) covers only the TCP connect; the
+		// TLS handshake that follows is otherwise uncapped, and ResponseHeaderTimeout
+		// begins only after the request is written. On the background-context callers
+		// (CallKiroAPI -> context.Background(): admin warmup/probe, buffered agentic
+		// rounds) there is no ctx deadline to rescue a handshake stalled behind a dead
+		// middlebox. 10s matches Go's own default — far above any healthy AWS handshake
+		// (tens of ms) while fast-failing a half-open connection. Precedes the body
+		// entirely, so no interaction with the h2 ping budget or streamIdleTimeout.
+		TLSHandshakeTimeout:   10 * time.Second,
 		// OS-level TCP keep-alive on the dialer. This is the floor of
 		// dead-connection detection and, crucially, the ONLY active probing on
 		// the proxied path where HTTP/2 PINGs are unavailable (h2 is disabled

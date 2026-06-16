@@ -70,6 +70,16 @@ ports:
 ### Or with nginx
 
 ```nginx
+# Keep warm keep-alive connections to the Go process. Without this block (and the
+# proxy_http_version 1.1 + Connection "" in `location /` below) nginx proxies as
+# HTTP/1.0 with `Connection: close`, opening and tearing down a fresh TCP+TLS
+# connection to Go on EVERY request — which defeats the server's own keep-alive
+# reuse (IdleTimeout) and adds per-request setup latency under load.
+upstream kiro {
+    server 127.0.0.1:8989;
+    keepalive 64;
+}
+
 server {
     listen 443 ssl http2;
     server_name api.example.com;
@@ -89,7 +99,9 @@ server {
     }
 
     location / {
-        proxy_pass http://127.0.0.1:8989;
+        proxy_pass http://kiro;
+        proxy_http_version 1.1;     # required for upstream keep-alive reuse
+        proxy_set_header Connection "";   # clear "close" so connections are pooled
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

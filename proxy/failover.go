@@ -178,7 +178,11 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 			return false, 0, nil
 		}
 		lastErr = workErr
-		if ra := retryAfterFromErr(workErr); ra > 0 {
+		// Track the SOONEST upstream Retry-After across attempts (the doc contract
+		// at the top of this function), not the last one seen. Last-write would tell
+		// the client to back off for attempt N's hint even when an earlier attempt
+		// could recover sooner — overstating the cooldown and wasting capacity.
+		if ra := retryAfterFromErr(workErr); ra > 0 && (lastRetryAfter == 0 || ra < lastRetryAfter) {
 			lastRetryAfter = ra
 		}
 		if isTokenRefreshFailure(workErr) {

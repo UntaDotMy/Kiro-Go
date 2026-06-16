@@ -67,6 +67,27 @@ func TestProxiedTransportSkipsHTTP2(t *testing.T) {
 	}
 }
 
+// TestTransportBoundsTLSHandshake guards the fix for an unbounded TLS handshake.
+// A hand-built http.Transport does NOT inherit http.DefaultTransport's 10s
+// TLSHandshakeTimeout, so leaving it unset means a handshake stalled behind a
+// dead middlebox hangs forever on the background-context callers (admin
+// warmup/probe, buffered agentic rounds) that have no request ctx deadline.
+// DialContext.Timeout covers only the preceding TCP connect, not the handshake.
+// Both the direct and proxied transports must carry a positive, bounded value.
+func TestTransportBoundsTLSHandshake(t *testing.T) {
+	for _, proxyURL := range []string{"", "http://127.0.0.1:9"} {
+		tr := buildKiroTransport(proxyURL)
+		if tr.TLSHandshakeTimeout <= 0 {
+			t.Fatalf("proxyURL=%q: TLSHandshakeTimeout = %v, must be positive (an unset 0 means unbounded)", proxyURL, tr.TLSHandshakeTimeout)
+		}
+		// Must stay below the dial timeout's sibling budgets so a stalled
+		// handshake fails fast rather than approaching the multi-minute windows.
+		if tr.TLSHandshakeTimeout > responseHeaderTimeout {
+			t.Fatalf("proxyURL=%q: TLSHandshakeTimeout %v should be well under responseHeaderTimeout %v", proxyURL, tr.TLSHandshakeTimeout, responseHeaderTimeout)
+		}
+	}
+}
+
 func keysOf[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
