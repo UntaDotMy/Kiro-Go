@@ -1479,14 +1479,14 @@ func GetFilterStripBoundaries() bool {
 
 // PromptFilterConfig holds all prompt filter settings for API responses.
 type PromptFilterConfig struct {
+	// FilterClaudeCode is the single master toggle for the provider-agnostic
+	// harness neutralizer (Kiro, CodeBuddy, Qoder, and any added provider). It
+	// also governs the CodeBuddy whole-body moderation pass — there is no longer
+	// a separate CodeBuddy switch.
 	FilterClaudeCode      bool               `json:"filterClaudeCode"`
 	FilterEnvNoise        bool               `json:"filterEnvNoise"`
 	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
-	// CodeBuddyFilterEnabled mirrors GetCodeBuddyFilterEnabled (default true) so
-	// the prompt-filter endpoint owns every built-in filter toggle in one place
-	// instead of the CodeBuddy switch living behind a separate /settings field.
-	CodeBuddyFilterEnabled bool               `json:"codeBuddyFilterEnabled"`
-	Rules                  []PromptFilterRule `json:"rules"`
+	Rules                 []PromptFilterRule `json:"rules"`
 }
 
 // GetPromptFilterConfig returns all prompt filter settings.
@@ -1494,30 +1494,25 @@ func GetPromptFilterConfig() PromptFilterConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg == nil {
-		return PromptFilterConfig{CodeBuddyFilterEnabled: true, Rules: []PromptFilterRule{}}
+		return PromptFilterConfig{Rules: []PromptFilterRule{}}
 	}
 	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
 	copy(rules, cfg.PromptFilterRules)
-	// CodeBuddy default-true: nil pointer means "use default" (on).
-	codeBuddy := cfg.CodeBuddyFilterEnabled == nil || *cfg.CodeBuddyFilterEnabled
 	return PromptFilterConfig{
-		FilterClaudeCode:       cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
-		FilterEnvNoise:         cfg.FilterEnvNoise,
-		FilterStripBoundaries:  cfg.FilterStripBoundaries,
-		CodeBuddyFilterEnabled: codeBuddy,
-		Rules:                  rules,
+		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
+		FilterEnvNoise:        cfg.FilterEnvNoise,
+		FilterStripBoundaries: cfg.FilterStripBoundaries,
+		Rules:                 rules,
 	}
 }
 
 // UpdatePromptFilterConfig saves all prompt filter settings atomically.
-func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries, codeBuddyFilterEnabled bool, rules []PromptFilterRule) error {
+func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.FilterClaudeCode = filterClaudeCode
 	cfg.FilterEnvNoise = filterEnvNoise
 	cfg.FilterStripBoundaries = filterStripBoundaries
-	cbf := codeBuddyFilterEnabled
-	cfg.CodeBuddyFilterEnabled = &cbf
 	// Clear legacy flag to avoid double-applying after first save
 	cfg.SanitizeClaudeCodePrompt = false
 	if rules != nil {
@@ -1918,19 +1913,6 @@ func UpdateWebSearchEnabled(enabled bool) error {
 	defer cfgLock.Unlock()
 	cfg.WebSearchEnabled = &enabled
 	return Save()
-}
-
-// GetCodeBuddyFilterEnabled reports whether outbound CodeBuddy request
-// sanitization is on. Default TRUE: a nil pointer (fresh install or a config that
-// predates this field) means "use the default", which is on. Only an explicit
-// false opts out.
-func GetCodeBuddyFilterEnabled() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.CodeBuddyFilterEnabled == nil {
-		return true
-	}
-	return *cfg.CodeBuddyFilterEnabled
 }
 
 // GetWebSearchProvider reports the configured external web-search backend

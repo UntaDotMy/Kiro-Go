@@ -384,13 +384,15 @@ func (g *genericProvider) Call(ctx context.Context, acct *config.Account, nr *No
 		return err
 	}
 
-	// CodeBuddy runs server-side content moderation that rejects competitor brand
-	// tokens ("Claude"/"Anthropic") — which saturate the Claude Code system prompt —
-	// with a canned Chinese refusal surfaced to the client as a policy violation.
-	// Neutralize the outbound body (model id preserved) so the request clears the
-	// filter. Gated on the global toggle (default on); no-op for other backends.
-	if isCodeBuddyBackend(ps.id) && config.GetCodeBuddyFilterEnabled() {
-		body = sanitizeCodeBuddyBody(body)
+	// Non-Anthropic upstreams must not receive a recognizable Claude Code harness.
+	// Neutralize the outbound body for any non-Kiro generic backend: the full
+	// harness is kept and de-branded per the provider's profile, and CodeBuddy
+	// (which runs server-side content moderation that rejects competitor brand
+	// tokens with a canned Chinese refusal) additionally gets brand tokens
+	// rewritten across all content. Model id preserved. Gated on the global
+	// toggle (default on); a Kiro account never reaches this generic path.
+	if config.GetFilterClaudeCode() {
+		body = neutralizeProviderBody(body, ps.id)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))

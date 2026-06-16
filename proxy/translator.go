@@ -501,21 +501,6 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 	return applySystemPromptFilters(systemPrompt)
 }
 
-// kiroKeywordReplacer rewrites residual competitor brand tokens in the kept
-// content so no fingerprintable Anthropic/Claude token reaches the Kiro upstream.
-// Modeled on codeBuddyKeywordReplacer. Order matters: strings.Replacer matches
-// argument order at each position, so multi-word phrases precede single-word
-// fallbacks.
-var kiroKeywordReplacer = strings.NewReplacer(
-	"Anthropic's official CLI for Claude", "Amazon's official CLI for Kiro",
-	"Claude Code", "Kiro",
-	"claude code", "kiro",
-	"Claude", "Kiro",
-	"claude", "kiro",
-	"Anthropic", "Amazon",
-	"anthropic", "amazon",
-)
-
 // applySystemPromptFilters runs the full filter chain on a system prompt.
 //
 // CRITICAL — why we do NOT fabricate a replacement identity line:
@@ -552,19 +537,13 @@ func applySystemPromptFilters(prompt string) string {
 	cfg := config.GetPromptFilterConfig()
 
 	if cfg.FilterClaudeCode && isClaudeCodeSystemPrompt(prompt) {
-		// Keep genuine CLAUDE.md / AGENTS.md memory; fabricate no identity line.
-		// Run the shared noise filters over the preserved memory so a stray
-		// billing-header line riding alongside it can't trip upstream moderation,
-		// then rewrite residual brand tokens (Claude→Kiro, Anthropic→Amazon).
-		memory := extractUserMemoryReminders(prompt)
-		if memory == "" {
-			return ""
-		}
-		cleaned := applySharedFiltersWithConfig(memory, cfg)
-		if cleaned == "" {
-			return ""
-		}
-		return kiroKeywordReplacer.Replace(cleaned)
+		// NEUTRALIZE — keep the full harness, de-fingerprint it. The whole
+		// behavioral contract is preserved (dropping it left the model on raw
+		// defaults: the "dumb model / tool errors / narrate-then-stop"
+		// regression); only the brand/identity tokens and the Bedrock-reserved
+		// billing header are removed. Delegated to the provider-agnostic
+		// neutralizer so Kiro and every other backend share one implementation.
+		return neutralizeHarness(prompt, "kiro")
 	}
 
 	return applySharedFiltersWithConfig(prompt, cfg)
@@ -599,14 +578,14 @@ func reminderCarriesUserMemory(block string) bool {
 		// Localized framings of the Claude Code memory header that we have seen
 		// in the wild (zh / es / fr / de / ja / pt). These mirror the English
 		// "Codebase and user instructions are shown below" / "user instructions".
-		"用户指令",       // zh: user instructions
-		"用户记忆",       // zh: user memory
-		"项目指令",       // zh: project instructions
-		"instrucciones del usuario", // es
+		"用户指令",                          // zh: user instructions
+		"用户记忆",                          // zh: user memory
+		"项目指令",                          // zh: project instructions
+		"instrucciones del usuario",     // es
 		"instructions de l'utilisateur", // fr
-		"benutzeranweisungen",       // de
-		"ユーザーの指示",  // ja: user instructions
-		"instruções do usuário",     // pt
+		"benutzeranweisungen",           // de
+		"ユーザーの指示",                       // ja: user instructions
+		"instruções do usuário",         // pt
 	}
 	for _, m := range strong {
 		if strings.Contains(lower, m) {

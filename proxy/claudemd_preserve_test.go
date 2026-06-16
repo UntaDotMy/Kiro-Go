@@ -19,7 +19,7 @@ func enableClaudeCodeFilter(t *testing.T) {
 	}
 	// FilterClaudeCode ON, FilterEnvNoise OFF, FilterStripBoundaries OFF,
 	// CodeBuddy filter ON (default).
-	if err := config.UpdatePromptFilterConfig(true, false, false, true, nil); err != nil {
+	if err := config.UpdatePromptFilterConfig(true, false, false, nil); err != nil {
 		t.Fatalf("enable filter: %v", err)
 	}
 }
@@ -49,9 +49,9 @@ Contents of /home/user/project/CLAUDE.md (project instructions):
 
 // TestApplySystemPromptFiltersPreservesClaudeMd is the regression test for the
 // reported bug: "i have claude.md, when i use this repo proxy, it like not
-// following it". The old behavior dropped the ENTIRE system prompt (including
-// the embedded CLAUDE.md) the moment Claude Code was detected. The fix keeps the
-// user-memory <system-reminder> while dropping the harness boilerplate.
+// following it". The neutralize path keeps the full harness AND the embedded
+// CLAUDE.md memory; only fingerprints (brand tokens, billing header, noise
+// reminders) are stripped.
 func TestApplySystemPromptFiltersPreservesClaudeMd(t *testing.T) {
 	enableClaudeCodeFilter(t)
 	out := applySystemPromptFilters(realisticClaudeCodeSystemPrompt)
@@ -65,20 +65,22 @@ func TestApplySystemPromptFiltersPreservesClaudeMd(t *testing.T) {
 	if !strings.Contains(out, "Never edit files under generated/") {
 		t.Errorf("CLAUDE.md rule missing from filtered prompt:\n%s", out)
 	}
-	// The harness boilerplate SHOULD be gone (that's the point of the filter).
+	// The harness behavioral instructions MUST survive (neutralize, not drop) so
+	// the model stays capable — only the brand identity is rewritten.
+	if !strings.Contains(strings.ToLower(out), "software engineering tasks") {
+		t.Errorf("harness instructions were dropped — model loses its operating contract:\n%s", out)
+	}
+	// Identity fingerprint must be de-branded, not leaked.
 	if strings.Contains(strings.ToLower(out), "anthropic's official cli") {
-		t.Errorf("harness boilerplate leaked through:\n%s", out)
+		t.Errorf("brand identity leaked through un-neutralized:\n%s", out)
 	}
 }
 
-// TestApplySystemPromptFiltersDropsHarnessWithoutMemory verifies that a pure
-// Claude Code harness prompt with NO embedded CLAUDE.md / AGENTS.md memory
-// yields an empty result — meaning "add no preamble". We deliberately do NOT
-// fabricate an identity line here: Kiro has no system-message slot, so anything
-// returned is prepended to the user's turn as plain text, where a synthetic
-// "You are Kiro…" sentence reads as user-typed text and derails the model into
-// injection-detection. Empty = no preamble; the user's own message is untouched.
-func TestApplySystemPromptFiltersDropsHarnessWithoutMemory(t *testing.T) {
+// TestApplySystemPromptFiltersNeutralizesHarnessWithoutMemory verifies that a
+// pure Claude Code harness prompt with NO embedded memory is KEPT in full and
+// neutralized (de-branded), not dropped. Dropping it stripped the model's
+// operating contract and caused the "dumb model / tool errors" regression.
+func TestApplySystemPromptFiltersNeutralizesHarnessWithoutMemory(t *testing.T) {
 	enableClaudeCodeFilter(t)
 	pure := `You are Claude Code, Anthropic's official CLI for Claude.
 
@@ -95,25 +97,34 @@ Use the tools provided.`
 		t.Skip("sample not detected as Claude Code; threshold changed")
 	}
 	out := applySystemPromptFilters(pure)
-	if out != "" {
-		t.Errorf("pure harness prompt (no memory) should yield empty preamble, got:\n%s", out)
+	if out == "" {
+		t.Fatal("harness prompt was dropped — model loses its operating contract (the regression)")
+	}
+	if !strings.Contains(out, "Do software engineering tasks.") {
+		t.Errorf("harness task instructions missing after neutralize:\n%s", out)
+	}
+	if !strings.Contains(out, "Use the tools provided.") {
+		t.Errorf("harness tool instructions missing after neutralize:\n%s", out)
+	}
+	if strings.Contains(strings.ToLower(out), "claude") || strings.Contains(strings.ToLower(out), "anthropic") {
+		t.Errorf("brand token survived neutralize — still fingerprintable as Claude Code:\n%s", out)
 	}
 }
 
-// TestApplySystemPromptFiltersRewritesBrandTokens verifies that residual brand
-// tokens inside preserved CLAUDE.md memory are rewritten (Claude→Kiro,
-// Anthropic→Amazon), and that no fabricated identity line is prepended.
+// TestApplySystemPromptFiltersRewritesBrandTokens verifies that brand tokens are
+// rewritten (Claude→Kiro, Anthropic→Amazon) across the kept harness, and that no
+// fabricated identity line is prepended.
 func TestApplySystemPromptFiltersRewritesBrandTokens(t *testing.T) {
 	enableClaudeCodeFilter(t)
 	out := applySystemPromptFilters(realisticClaudeCodeSystemPrompt)
 
 	if out == "" {
-		t.Fatal("CLAUDE.md memory was dropped entirely")
+		t.Fatal("harness + CLAUDE.md memory was dropped entirely")
 	}
 	if strings.Contains(strings.ToLower(out), "anthropic") {
 		t.Errorf("Anthropic token survived rewrite:\n%s", out)
 	}
-	// The kept content is the user's memory, not a synthetic identity sentence.
+	// The kept content is the real harness + memory, not a synthetic identity line.
 	if strings.Contains(out, "You are Kiro, an AI-powered agentic IDE") {
 		t.Errorf("a fabricated identity line was prepended to the user stream:\n%s", out)
 	}

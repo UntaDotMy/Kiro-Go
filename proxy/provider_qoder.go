@@ -140,6 +140,12 @@ func (qoderProvider) Call(ctx context.Context, acct *config.Account, nr *Normali
 // the last user turn, and a business block with stable ids.
 func buildQoderPayload(nr *NormalizedRequest, qoderKey string, acct *config.Account) map[string]interface{} {
 	system, messages := qoderMessagesFromRequest(nr)
+	// Neutralize the harness for Qoder: keep the full contract, de-brand it so
+	// the upstream can't fingerprint the Claude Code harness. Same toggle and
+	// detection as the other backends; a non-harness system prompt is untouched.
+	if config.GetFilterClaudeCode() && isClaudeCodeSystemPrompt(system) {
+		system = neutralizeHarness(system, "qoder")
+	}
 	maxTokens := 32768
 	if nr.OpenAI != nil && nr.OpenAI.MaxTokens > 0 {
 		maxTokens = nr.OpenAI.MaxTokens
