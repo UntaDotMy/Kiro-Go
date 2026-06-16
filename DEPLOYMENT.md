@@ -42,18 +42,63 @@ covers TLS; keep the admin panel off the public internet if you can (see §4).
 The server refuses to start with the bundled default password unless
 `KIRO_ALLOW_DEFAULT_PASSWORD=1` is set — **never set that in production.**
 
-## 3. TLS termination with Caddy (simplest)
+## 3. TLS termination with Caddy (recommended)
 
-Caddy gets you automatic Let's Encrypt certificates with near-zero config.
+Caddy is the best fit for this proxy: automatic Let's Encrypt certificates with
+near-zero config, native WebSocket upgrades, HTTP/2 (and optional HTTP/3) to the
+client, and — importantly — it does **not** impose a default read/write timeout
+that would sever a multi-minute streaming response (unlike nginx, whose
+`proxy_read_timeout` defaults to 60s). It adds only sub-millisecond overhead; it
+will not speed up or slow down generation (that is upstream-bound) and it does
+**not** affect upstream 429s (those are handled entirely in the Go account pool).
 
 `/etc/caddy/Caddyfile`:
 
 ```caddy
 api.example.com {
-    encode zstd gzip
+    # Compress only NON-streaming responses. Compressing text/event-stream adds
+    # CPU + latency for no gain and can trip some SSE intermediaries, so exclude
+    # the streaming API paths and compress everything else (admin UI, JSON, static).
+    @nostream {
+        not path /v1/messages /v1/chat/completions /v1/responses
+    }
+    encode @nostream zstd gzip
+
     reverse_proxy 127.0.0.1:8989 {
+        # Low-latency mode: disable response buffering so SSE/streamed chunks are
+        # flushed to the client immediately. Caddy already auto-flushes when the
+        # upstream sets Content-Type: text/event-stream (which this proxy does),
+        # but -1 also covers non-SSE chunked output (e.g. batch JSON) — belt and
+        # suspenders for a streaming workload.
+        flush_interval -1
+
+        # The Go server speaks plain HTTP/1.1 (no TLS / no h2c on its listener),
+        # so pin the hop to 1.1. Do NOT use h2c:// here. keepalive is on by
+        # default (2m); connections to the Go process are reused between turns.
+        transport http {
+            versions 1.1
+        }
+
         header_up X-Forwarded-Proto https
         header_up X-Real-IP {remote_host}
+    }
+}
+```
+
+WebSocket endpoints (`/v1/responses` WS transport, the `/admin/ws/` dashboard
+socket) need no special directives — Caddy v2 upgrades WebSocket connections
+transparently.
+
+**Optional — enable HTTP/3 (QUIC) to the client.** Helps on lossy/mobile
+networks (no head-of-line blocking, 1-RTT handshakes); marginal on stable wired
+links, and clients that don't support it fall back to HTTP/2 automatically.
+Requires UDP/443 open in your firewall. Add a global options block at the top of
+the Caddyfile:
+
+```caddy
+{
+    servers {
+        protocols h1 h2 h3
     }
 }
 ```
@@ -66,6 +111,12 @@ reachable from the internet:
 ports:
   - "127.0.0.1:8989:8080"
 ```
+
+> **Why not let Caddy time out long streams?** Caddy has no default
+> write/read timeout, so an active multi-minute generation is never cut. Its
+> idle default (5m) applies only to *idle* keep-alive connections, not active
+> streams. This complements the Go server's own 30-minute write ceiling and the
+> 2-minute rolling write deadline on the streaming handlers.
 
 ### Or with nginx
 

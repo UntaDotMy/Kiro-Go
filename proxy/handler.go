@@ -106,6 +106,11 @@ type Handler struct {
 	// config.GlobalRateLimitPerMinute > 0). Backstops the per-key limits with a
 	// single proxy-wide request cap. See proxy/global_ratelimit.go.
 	globalRL globalRateLimiter
+
+	// throttle is the Google SRE client-side adaptive throttle. It sheds a
+	// request locally (before dialing upstream) only when the WHOLE backend pool
+	// is being throttled — a no-op under healthy load. See adaptive_throttle.go.
+	throttle *adaptiveThrottle
 }
 
 type thinkingStreamSource int
@@ -345,6 +350,7 @@ func NewHandler() *Handler {
 		stopDashboardPusher: make(chan struct{}),
 		promptCache:         newPromptCacheTracker(defaultPromptCacheTTL),
 		dashboardHub:        newDashboardHub(),
+		throttle:            newAdaptiveThrottle(),
 	}
 	// Configure the opt-in global rate limiter from persisted config (0 = off).
 	h.globalRL.Configure(config.GetGlobalRateLimitPerMinute())

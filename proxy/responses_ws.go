@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -9,10 +10,26 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
+
+// wsWriteDeadlineWindow bounds a single downstream WebSocket write on the Codex
+// responses path. A healthy client drains a small frame in milliseconds; this
+// window is generous enough never to fail a live-but-slow client yet finite so a
+// stalled/dead client write fails fast (and triggers cancellation) instead of
+// pinning the goroutine + the account's AIMD slot. It is reset before every
+// write, so it bounds each frame, not the whole stream.
+const wsWriteDeadlineWindow = 60 * time.Second
+
+// wsReadIdleWindow is how long the read pump waits for any client frame (or a
+// pong) before treating the connection as dead. Refreshed by the pong handler,
+// so a client answering the keepalive ping (every streamHeartbeatInterval=15s)
+// keeps it alive comfortably; a silent dead peer is reaped within the window.
+const wsReadIdleWindow = 90 * time.Second
 
 // responsesWsUpgrader accepts WebSocket upgrades on /v1/responses for Codex
 // CLI's experimental "responses_websockets" / "responses_websockets_v2"
@@ -213,9 +230,95 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	// mirror of handleResponsesStream so future changes there don't have to
 	// be replicated here field-for-field.
 	respID := "resp_" + uuid.New().String()
-	send := func(event string, data interface{}) {
-		_ = conn.WriteJSON(map[string]interface{}{"event": event, "data": data})
+
+	// Connection lifecycle hardening (this path has no failover by design, so a
+	// single connection's health governs the whole request):
+	//
+	//   1. Cancelable context — wsCtx derives from a context we cancel on client
+	//      disconnect or a failed write, so the upstream call aborts promptly and
+	//      frees the AIMD slot + stops burning credits, instead of running to
+	//      completion against a dead client (or hanging until the 5m idle reader).
+	//   2. Write mutex + bounded write deadline — gorilla forbids concurrent
+	//      writers, and the keepalive goroutine + the upstream callback both write.
+	//      Every write takes wsWriteMu and sets a rolling deadline so a stalled
+	//      client write fails fast (and cancels) rather than pinning the goroutine.
+	//   3. Read pump — a hijacked WS conn means r.Context() never cancels on its
+	//      own; we loop on ReadMessage purely to detect client close and cancel.
+	//   4. Keepalive ping — the upstream can be silent for minutes (thinking); a
+	//      periodic protocol ping keeps the client's idle timer alive (mirrors the
+	//      SSE heartbeat) and surfaces a dead peer as a write error -> cancel.
+	wsCtx, cancelWS := context.WithCancel(r.Context())
+	defer cancelWS()
+	var wsWriteMu sync.Mutex
+	writeWS := func(v interface{}) error {
+		wsWriteMu.Lock()
+		defer wsWriteMu.Unlock()
+		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadlineWindow))
+		return conn.WriteJSON(v)
 	}
+	send := func(event string, data interface{}) {
+		if err := writeWS(map[string]interface{}{"event": event, "data": data}); err != nil {
+			// A failed downstream write means the client is gone or stalled.
+			// Cancel so the upstream call stops immediately rather than
+			// streaming into a dead socket and holding the account slot.
+			cancelWS()
+		}
+	}
+
+	// Read pump: detect client-side close/error and cancel. Discards payloads
+	// (the protocol is one request frame then server->client streaming). Mirrors
+	// dashboard_ws.go's reaper.
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Errorf("[ResponsesWS] read pump panic recovered: %v", rec)
+			}
+			cancelWS()
+		}()
+		conn.SetReadDeadline(time.Now().Add(wsReadIdleWindow))
+		conn.SetPongHandler(func(string) error {
+			conn.SetReadDeadline(time.Now().Add(wsReadIdleWindow))
+			return nil
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Keepalive: periodic protocol ping while the upstream is quiet. Serialized
+	// with content writes via wsWriteMu. Stops when the handler returns (wsCtx
+	// done) so a ping can never land after the terminal frame.
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Errorf("[ResponsesWS] keepalive panic recovered: %v", rec)
+			}
+		}()
+		ticker := time.NewTicker(streamHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-wsCtx.Done():
+				return
+			case <-ticker.C:
+				wsWriteMu.Lock()
+				_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadlineWindow))
+				err := conn.WriteMessage(websocket.PingMessage, nil)
+				wsWriteMu.Unlock()
+				if err != nil {
+					cancelWS()
+					return
+				}
+			}
+		}
+	}()
+
 	send("response.created", map[string]interface{}{
 		"type": "response.created",
 		"response": map[string]interface{}{
@@ -279,7 +382,15 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	// Thread the originating request onto the context so a non-Kiro account
 	// selected for this model is translated correctly (a Kiro account ignores it
 	// and uses the prebuilt kiroPayload). ClientDialect is "responses" since the
-	// inbound request funnels through ResponsesToClaudeRequest.
+	// inbound request funnels through ResponsesToClaudeRequest. Derive from wsCtx
+	// (the cancelable context) so a client disconnect / failed write aborts the
+	// upstream call promptly.
+	// Thread the originating request onto the context so a non-Kiro account
+	// selected for this model is translated correctly (a Kiro account ignores it
+	// and uses the prebuilt kiroPayload). ClientDialect is "responses" since the
+	// inbound request funnels through ResponsesToClaudeRequest. Derive from wsCtx
+	// (the cancelable context) so a client disconnect / failed write aborts the
+	// upstream call promptly.
 	baseNR := &NormalizedRequest{
 		Model:         upstreamModel,
 		ClientDialect: DialectResponses,
@@ -288,9 +399,9 @@ func (h *Handler) handleResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 		Stream:        true,
 		Effort:        effort,
 	}
-	wsCtx := withNormalizedRequest(r.Context(), baseNR)
+	upstreamCtx := withNormalizedRequest(wsCtx, baseNR)
 
-	if err := h.callProviderForKiro(wsCtx, account, kiroPayload, mappedModel, thinking, callback); err != nil {
+	if err := h.callProviderForKiro(upstreamCtx, account, kiroPayload, mappedModel, thinking, callback); err != nil {
 		processor.Finalize()
 		h.handleUpstreamError(err, account.ID, req.Model, apiKeyID, kiroPayload.ResolvedEffort)
 		send("response.failed", map[string]interface{}{
