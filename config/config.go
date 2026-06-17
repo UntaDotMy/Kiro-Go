@@ -1320,6 +1320,28 @@ func saveLocked() error {
 	return writeConfigBytes(data)
 }
 
+// SnapshotBytes returns the entire config.json (including secrets: tokens,
+// provider keys, bcrypt admin hash) as indented JSON under a read lock.
+func SnapshotBytes() ([]byte, error) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// RestoreFromBytes validates data as a full Config, atomically replaces
+// config.json, and reloads in-memory config. Errors without mutating state on
+// invalid JSON. Caller must reload derived runtime state (e.g. the pool).
+func RestoreFromBytes(data []byte) error {
+	var probe Config
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	if err := writeConfigBytes(data); err != nil {
+		return err
+	}
+	return Load()
+}
+
 // IsQuotaExhausted reports whether either the paid or the trial quota has
 // been fully consumed. A zero limit means "no limit declared by upstream"
 // and is treated as not-exhausted (we never auto-disable accounts whose

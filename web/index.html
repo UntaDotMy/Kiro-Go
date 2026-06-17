@@ -1680,6 +1680,12 @@
                 'export.noSelection': '请至少选择一个账号',
                 'export.ninerouter': '导出为 9router',
                 'export.ninerouterHint': '导出为 9router 备份格式（可导入 9router）',
+                'backup.title': '完整备份与恢复',
+                'backup.hint': '完整配置备份：所有账号、提供商、API 密钥与设置（含密钥、令牌、管理员密码哈希）。请妥善保管，等同于 config.json。',
+                'backup.download': '下载完整备份',
+                'backup.restore': '从备份恢复',
+                'backup.restoreConfirm': '从备份恢复将覆盖当前全部配置（账号、提供商、密钥、设置）。确定继续？',
+                'backup.restored': '已恢复，共 {0} 个账号',
                 'import.title': '导入账号',
                 'import.pickFile': '选择 JSON 文件',
                 'import.orPaste': '或粘贴 JSON',
@@ -4335,7 +4341,18 @@
 
             const html = Object.keys(groups).sort().map(backend => {
                 const accts = groups[backend];
-                const label = PROVIDER_LABELS[backend] || backend;
+                // Card title: a built-in provider uses its catalog label; a custom
+                // (bring-your-own) provider uses the operator-set display name
+                // (account nickname), NOT the generated routing id — otherwise the
+                // header reads the slug/"custom-xxxx" id twice. The routing id still
+                // shows in the parenthetical below where it's actually useful.
+                let label = PROVIDER_LABELS[backend] || backend;
+                const firstAcct = accts[0] || {};
+                const isCustomGroup = !PROVIDER_LABELS[backend] && (firstAcct.customDialect || '').trim() !== '';
+                if (isCustomGroup) {
+                    const nick = (firstAcct.nickname || '').replace(/\s*#\d+\s*$/, '').trim();
+                    if (nick) label = nick;
+                }
                 // Distinct-model count: 100 keys sharing the same 145 models should read
                 // as 145 (the provider's actual catalog), not 14,500. We union the per-key
                 // model ids; keys with no cached list contribute nothing (and fall back to
@@ -5452,6 +5469,16 @@
                 '<button class="btn btn-secondary" onclick="exportCopyJson()">' + t('export.copyJson') + '</button>' +
                 '<button class="btn btn-secondary" onclick="exportDownloadNineRouter()" title="' + t('export.ninerouterHint') + '">' + t('export.ninerouter') + '</button>' +
                 '<button class="btn btn-primary" onclick="exportDownloadJson()">' + t('export.downloadJson') + '</button>' +
+                '</div>' +
+                '<div style="border-top:1px solid var(--border);margin-top:16px;padding-top:14px">' +
+                '<div style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">' + t('backup.title') + '</div>' +
+                '<div style="font-size:12px;color:var(--muted);margin-bottom:10px">' + t('backup.hint') + '</div>' +
+                '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+                '<button class="btn btn-secondary" onclick="downloadFullBackup()">' + t('backup.download') + '</button>' +
+                '<button class="btn btn-secondary" onclick="document.getElementById(\'restoreFileInput\').click()">' + t('backup.restore') + '</button>' +
+                '<input type="file" id="restoreFileInput" accept="application/json,.json" style="display:none" onchange="restoreFromBackup(this)">' +
+                '</div>' +
+                '<div id="backupStatus" style="font-size:13px;color:var(--muted);margin-top:8px;min-height:18px"></div>' +
                 '</div>';
         }
 
@@ -5537,6 +5564,52 @@
             a.download = '9router-backup-' + new Date().toISOString().slice(0, 10) + '.json';
             a.click();
             URL.revokeObjectURL(url);
+        }
+
+        async function downloadFullBackup() {
+            const statusEl = document.getElementById('backupStatus');
+            if (statusEl) statusEl.textContent = '';
+            const res = await fetch('/admin/api/backup', { headers: { 'X-Admin-Password': password } });
+            if (!res.ok) {
+                if (statusEl) statusEl.textContent = t('common.failed');
+                return;
+            }
+            const text = await res.text();
+            const blob = new Blob([text], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'kiro-go-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        async function restoreFromBackup(input) {
+            const file = input.files && input.files[0];
+            input.value = '';
+            if (!file) return;
+            if (!confirm(t('backup.restoreConfirm'))) return;
+            const statusEl = document.getElementById('backupStatus');
+            if (statusEl) statusEl.textContent = t('import.running');
+            try {
+                const text = await file.text();
+                const res = await fetch('/admin/api/restore', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: text
+                });
+                const d = await res.json();
+                if (!res.ok || d.error) {
+                    if (statusEl) statusEl.textContent = (d.error || t('common.failed'));
+                    return;
+                }
+                if (statusEl) statusEl.textContent = t('backup.restored', d.accounts);
+                await loadAccounts();
+                if (activeDashboardTab() === 'providers') renderProviders();
+                loadStats();
+            } catch (e) {
+                if (statusEl) statusEl.textContent = t('common.failed');
+            }
         }
 
         // ==================== 导入功能 ====================
