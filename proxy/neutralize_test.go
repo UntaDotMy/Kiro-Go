@@ -34,13 +34,14 @@ func TestNeutralizeHarnessKeepsContractPerBackend(t *testing.T) {
 	enableFiltersForNeutralize(t)
 
 	cases := []struct {
-		backend   string
-		wantBrand string
+		backend       string
+		wantBrand     string
+		stripIdentity bool
 	}{
-		{"kiro", "Kiro"},
-		{"codebuddy", "CodeBuddy"},
-		{"qoder", "Qoder"},
-		{"groq", "the assistant"},
+		{"kiro", "", true},
+		{"codebuddy", "CodeBuddy", false},
+		{"qoder", "Qoder", false},
+		{"groq", "the assistant", false},
 	}
 	for _, c := range cases {
 		out := neutralizeHarness(neutralizeHarnessSample, c.backend)
@@ -55,6 +56,12 @@ func TestNeutralizeHarnessKeepsContractPerBackend(t *testing.T) {
 		}
 		if strings.Contains(out, "x-anthropic-billing-header") {
 			t.Errorf("%s: billing header survived (Bedrock 400 risk):\n%s", c.backend, out)
+		}
+		if c.stripIdentity {
+			if strings.Contains(out, "You are ") {
+				t.Errorf("%s: identity line should be stripped, not rebranded:\n%s", c.backend, out)
+			}
+			continue
 		}
 		if !strings.Contains(out, c.wantBrand) {
 			t.Errorf("%s: expected rebrand to %q:\n%s", c.backend, c.wantBrand, out)

@@ -32,8 +32,8 @@ type ResponsesRequest struct {
 	Tools              []ResponsesTool   `json:"tools,omitempty"`
 	ToolChoice         interface{}       `json:"tool_choice,omitempty"`
 	Stream             bool              `json:"stream,omitempty"`
-	Temperature        float64           `json:"temperature,omitempty"`
-	TopP               float64           `json:"top_p,omitempty"`
+	Temperature        *float64          `json:"temperature,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
 	MaxOutputTokens    int               `json:"max_output_tokens,omitempty"`
 	Reasoning          *ResponsesReason  `json:"reasoning,omitempty"`
 	PreviousResponseID string            `json:"previous_response_id,omitempty"`

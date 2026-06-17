@@ -29,11 +29,37 @@ type openAIChatBody struct {
 	Model       string                   `json:"model"`
 	Messages    []map[string]interface{} `json:"messages"`
 	MaxTokens   int                      `json:"max_tokens,omitempty"`
-	Temperature float64                  `json:"temperature,omitempty"`
-	TopP        float64                  `json:"top_p,omitempty"`
+	Temperature *float64                 `json:"temperature,omitempty"`
+	TopP        *float64                 `json:"top_p,omitempty"`
+	Stop        interface{}              `json:"stop,omitempty"`
 	Stream      bool                     `json:"stream"`
 	Tools       []map[string]interface{} `json:"tools,omitempty"`
 	ToolChoice  interface{}              `json:"tool_choice,omitempty"`
+}
+
+// normalizeStopToSlice coerces an OpenAI-style "stop" value (string | []string
+// | []interface{} from a JSON decode) into a []string suitable for Anthropic's
+// stop_sequences and Gemini's stopSequences. Empty entries are dropped; an empty
+// result means "no stop sequences". Shared by the Anthropic and Gemini builders.
+func normalizeStopToSlice(v interface{}) []string {
+	switch t := v.(type) {
+	case string:
+		if t == "" {
+			return nil
+		}
+		return []string{t}
+	case []string:
+		return t
+	case []interface{}:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // buildOpenAIChatBody converts a NormalizedRequest into an OpenAI chat
@@ -49,6 +75,7 @@ func buildOpenAIChatBody(nr *NormalizedRequest, upstreamModel string, stream boo
 		body.MaxTokens = req.MaxTokens
 		body.Temperature = req.Temperature
 		body.TopP = req.TopP
+		body.Stop = req.Stop
 		body.Messages = openAIMessagesToMaps(req.Messages)
 		body.Tools = openAIToolsToMaps(req.Tools)
 		// Carry the tool-selection intent through unchanged (it's already an
@@ -63,6 +90,9 @@ func buildOpenAIChatBody(nr *NormalizedRequest, upstreamModel string, stream boo
 		body.MaxTokens = req.MaxTokens
 		body.Temperature = req.Temperature
 		body.TopP = req.TopP
+		if len(req.StopSequences) > 0 {
+			body.Stop = req.StopSequences
+		}
 		body.Messages = claudeToOpenAIMessages(req)
 		body.Tools = claudeToolsToOpenAIMaps(req.Tools)
 		if len(body.Tools) > 0 {

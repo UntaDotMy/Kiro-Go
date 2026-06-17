@@ -24,15 +24,15 @@ func buildGeminiBody(nr *NormalizedRequest, upstreamModel string) ([]byte, error
 	body := map[string]interface{}{}
 	genCfg := map[string]interface{}{}
 
-	addGen := func(maxTokens int, temp, topP float64) {
+	addGen := func(maxTokens int, temp, topP *float64) {
 		if maxTokens > 0 {
 			genCfg["maxOutputTokens"] = maxTokens
 		}
-		if temp != 0 {
-			genCfg["temperature"] = temp
+		if temp != nil {
+			genCfg["temperature"] = *temp
 		}
-		if topP != 0 {
-			genCfg["topP"] = topP
+		if topP != nil {
+			genCfg["topP"] = *topP
 		}
 	}
 
@@ -40,6 +40,9 @@ func buildGeminiBody(nr *NormalizedRequest, upstreamModel string) ([]byte, error
 	case nr.OpenAI != nil:
 		req := nr.OpenAI
 		addGen(req.MaxTokens, req.Temperature, req.TopP)
+		if stops := normalizeStopToSlice(req.Stop); len(stops) > 0 {
+			genCfg["stopSequences"] = stops
+		}
 		sys, contents := openAIToGeminiContents(req.Messages)
 		if sys != "" {
 			body["systemInstruction"] = map[string]interface{}{"parts": []map[string]interface{}{{"text": sys}}}
@@ -56,6 +59,12 @@ func buildGeminiBody(nr *NormalizedRequest, upstreamModel string) ([]byte, error
 	case nr.Claude != nil:
 		req := nr.Claude
 		addGen(req.MaxTokens, req.Temperature, req.TopP)
+		if req.TopK != nil {
+			genCfg["topK"] = *req.TopK
+		}
+		if len(req.StopSequences) > 0 {
+			genCfg["stopSequences"] = req.StopSequences
+		}
 		if sys := extractClaudeSystemString(req.System); sys != "" {
 			body["systemInstruction"] = map[string]interface{}{"parts": []map[string]interface{}{{"text": sys}}}
 		}

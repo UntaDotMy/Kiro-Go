@@ -30,27 +30,36 @@ func buildOllamaChatBody(nr *NormalizedRequest, upstreamModel string) ([]byte, e
 		req := nr.OpenAI
 		messages = openAIMessagesToMaps(req.Messages)
 		tools = openAIToolsToMaps(req.Tools)
-		if req.Temperature != 0 {
-			options["temperature"] = req.Temperature
+		if req.Temperature != nil {
+			options["temperature"] = *req.Temperature
 		}
-		if req.TopP != 0 {
-			options["top_p"] = req.TopP
+		if req.TopP != nil {
+			options["top_p"] = *req.TopP
 		}
 		if req.MaxTokens != 0 {
 			options["num_predict"] = req.MaxTokens
+		}
+		if stops := normalizeStopToSlice(req.Stop); len(stops) > 0 {
+			options["stop"] = stops
 		}
 	case nr.Claude != nil:
 		req := nr.Claude
 		messages = claudeToOpenAIMessages(req)
 		tools = claudeToolsToOpenAIMaps(req.Tools)
-		if req.Temperature != 0 {
-			options["temperature"] = req.Temperature
+		if req.Temperature != nil {
+			options["temperature"] = *req.Temperature
 		}
-		if req.TopP != 0 {
-			options["top_p"] = req.TopP
+		if req.TopP != nil {
+			options["top_p"] = *req.TopP
 		}
 		if req.MaxTokens != 0 {
 			options["num_predict"] = req.MaxTokens
+		}
+		if req.TopK != nil {
+			options["top_k"] = *req.TopK
+		}
+		if len(req.StopSequences) > 0 {
+			options["stop"] = req.StopSequences
 		}
 	}
 
