@@ -136,6 +136,8 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	respCtx := withNormalizedRequest(r.Context(), baseNR)
 
+	parallelToolCalls := req.ParallelToolCalls == nil || *req.ParallelToolCalls
+
 	// The Responses path keeps its original single-account behavior for
 	// account selection above (token refresh, skeleton emission). Failover
 	// across accounts is handled by the Claude/OpenAI chat endpoints, which
@@ -143,15 +145,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// path emits a response.created skeleton up front, so a mid-flight
 	// switch would require replaying that handshake. We keep it simple here.
 	if req.Stream {
-		h.handleResponsesStream(respCtx, w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
+		h.handleResponsesStream(respCtx, w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID, parallelToolCalls)
 	} else {
-		h.handleResponsesNonStream(respCtx, w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID)
+		h.handleResponsesNonStream(respCtx, w, account, kiroPayload, req.Model, thinking, includeReasoning, estimatedInputTokens, req.Reasoning, apiKeyID, parallelToolCalls)
 	}
 }
 
 // handleResponsesNonStream blocks until upstream is done, then returns one
 // JSON Responses payload.
-func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
+func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string, parallelToolCalls bool) {
 	var content, reasoning string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
@@ -235,7 +237,7 @@ func (h *Handler) handleResponsesNonStream(ctx context.Context, w http.ResponseW
 // Reasoning, when present, is emitted as a separate output_item BEFORE the
 // message item, with reasoning_summary_text deltas. Function calls are emitted
 // as their own output_items with function_call_arguments deltas.
-func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string) {
+func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking, includeReasoning bool, estimatedInputTokens int, reasoningCfg *ResponsesReason, apiKeyID string, parallelToolCalls bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -257,7 +259,7 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 		"status":              "in_progress",
 		"model":               canonicalAnthropicModelID(model),
 		"output":              []interface{}{},
-		"parallel_tool_calls": true,
+		"parallel_tool_calls": parallelToolCalls,
 		"reasoning":           reasoningCfg,
 		"tools":               []interface{}{},
 	}
@@ -686,7 +688,7 @@ func (h *Handler) handleResponsesStream(ctx context.Context, w http.ResponseWrit
 		"model":               canonicalAnthropicModelID(model),
 		"output":              finalOutputs,
 		"usage":               usage,
-		"parallel_tool_calls": true,
+		"parallel_tool_calls": parallelToolCalls,
 		"reasoning":           reasoningCfg,
 	}
 	if upstreamStopReason == "max_tokens" {

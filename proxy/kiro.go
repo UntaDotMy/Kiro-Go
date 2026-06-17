@@ -451,9 +451,11 @@ type KiroToolUse struct {
 }
 
 type InferenceConfig struct {
-	MaxTokens   int     `json:"maxTokens,omitempty"`
-	Temperature float64 `json:"temperature,omitempty"`
-	TopP        float64 `json:"topP,omitempty"`
+	MaxTokens int `json:"maxTokens,omitempty"`
+	// Pointers so an explicit 0 survives marshaling: a bare float64 with
+	// omitempty would silently drop temperature:0 (deterministic decoding).
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"topP,omitempty"`
 }
 
 // ==================== Stream Callbacks ====================

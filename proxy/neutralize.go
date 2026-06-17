@@ -33,6 +33,13 @@ import (
 type brandProfile struct {
 	replacer        *strings.Replacer
 	moderateContent bool
+	// stripIdentityLine removes the "You are Claude Code…" self-identification
+	// sentence entirely instead of rebranding it. Set for slot-less backends
+	// (Kiro) where the neutralized prompt is prepended to the user turn: a
+	// rebranded "You are Kiro…" sentence there reads as user-typed text and
+	// derails the model into injection-detection. Backends with a real
+	// role:system slot leave this false (rebrand is invisible as identity).
+	stripIdentityLine bool
 }
 
 func tencentReplacer() *strings.Replacer {
@@ -53,7 +60,7 @@ var brandProfiles = map[string]*brandProfile{
 	"kiro": {replacer: strings.NewReplacer(
 		"Anthropic's official CLI for Claude", "Amazon's official CLI for Kiro",
 		"Claude Code", "Kiro",
-	)},
+	), stripIdentityLine: true},
 	"codebuddy":    {replacer: tencentReplacer(), moderateContent: true},
 	"codebuddy-ai": {replacer: tencentReplacer(), moderateContent: true},
 	"qoder": {replacer: strings.NewReplacer(
@@ -114,7 +121,11 @@ func neutralizeHarness(prompt, backend string) string {
 	})
 
 	prompt = applySharedFiltersWithConfig(prompt, cfg)
-	prompt = brandProfileFor(backend).replacer.Replace(prompt)
+	profile := brandProfileFor(backend)
+	if profile.stripIdentityLine {
+		prompt = harnessIdentityLineRe.ReplaceAllString(prompt, "")
+	}
+	prompt = profile.replacer.Replace(prompt)
 
 	return strings.TrimSpace(collapseBlankLines(prompt))
 }

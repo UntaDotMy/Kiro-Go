@@ -30,11 +30,17 @@ func buildAnthropicBody(nr *NormalizedRequest, upstreamModel string, stream bool
 			maxTokens = 4096
 		}
 		body["max_tokens"] = maxTokens
-		if req.Temperature != 0 {
-			body["temperature"] = req.Temperature
+		if req.Temperature != nil {
+			body["temperature"] = *req.Temperature
 		}
-		if req.TopP != 0 {
-			body["top_p"] = req.TopP
+		if req.TopP != nil {
+			body["top_p"] = *req.TopP
+		}
+		if req.TopK != nil {
+			body["top_k"] = *req.TopK
+		}
+		if len(req.StopSequences) > 0 {
+			body["stop_sequences"] = req.StopSequences
 		}
 		if sys := extractClaudeSystemString(req.System); sys != "" {
 			body["system"] = sys
@@ -54,8 +60,14 @@ func buildAnthropicBody(nr *NormalizedRequest, upstreamModel string, stream bool
 			maxTokens = 4096
 		}
 		body["max_tokens"] = maxTokens
-		if req.Temperature != 0 {
-			body["temperature"] = req.Temperature
+		if req.Temperature != nil {
+			body["temperature"] = *req.Temperature
+		}
+		if req.TopP != nil {
+			body["top_p"] = *req.TopP
+		}
+		if stops := normalizeStopToSlice(req.Stop); len(stops) > 0 {
+			body["stop_sequences"] = stops
 		}
 		sys, msgs := openAIToAnthropicMessages(req.Messages)
 		if sys != "" {

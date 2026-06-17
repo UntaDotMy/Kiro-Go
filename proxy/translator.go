@@ -246,16 +246,25 @@ func openAIResponseEchoModel(backend, requestedModel, servedModel string) string
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Model     string          `json:"model"`
+	Messages  []ClaudeMessage `json:"messages"`
+	MaxTokens int             `json:"max_tokens"`
+	// Temperature / TopP are pointers so the proxy can tell "client explicitly
+	// asked for 0" (deterministic / greedy decoding) apart from "client sent
+	// nothing". A bare float64 with omitempty silently dropped an explicit 0,
+	// which nerfed callers that wanted deterministic output.
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+	// TopK and StopSequences are first-class Anthropic Messages sampling knobs
+	// the harness may send; previously they were parsed-then-dropped, silently
+	// changing model behavior. Forwarded to every upstream that supports them.
+	TopK          *int                  `json:"top_k,omitempty"`
+	StopSequences []string              `json:"stop_sequences,omitempty"`
+	Stream        bool                  `json:"stream,omitempty"`
+	System        interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking      *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Tools         []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice    interface{}           `json:"tool_choice,omitempty"`
 
 	// OutputConfig carries Anthropic's native, graded reasoning-effort knob
 	// ("output_config": {"effort": "low|medium|high|xhigh|max"}). It is a
@@ -480,7 +489,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		payload.ConversationState.History = history
 	}
 
-	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
+	if req.MaxTokens > 0 || req.Temperature != nil || req.TopP != nil {
 		capped, _ := capInferenceMaxTokensForModel(req.MaxTokens, modelID)
 		payload.InferenceConfig = &InferenceConfig{
 			MaxTokens:   capped,
@@ -779,6 +788,14 @@ var systemReminderBlockRe = regexp.MustCompile(`(?is)<system-reminder>.*?</syste
 // 400 "x-anthropic-billing-header is a reserved keyword and may not be used in
 // the system prompt", so it must be removed wherever it appears.
 var billingHeaderLineRe = regexp.MustCompile(`(?im)^[ \t>"']*x-anthropic-billing-header:[^\n]*\n?`)
+
+// harnessIdentityLineRe matches the Claude Code self-identification tagline
+// ("You are Claude Code, Anthropic's official CLI for Claude."). On a slot-less
+// backend (Kiro) the neutralized prompt is PREPENDED to the user turn, where a
+// rebranded "You are Kiro…" sentence reads as user-typed text and derails the
+// model into injection-detection. Stripping the sentence (vs rebranding it)
+// keeps the harness contract while removing the fabricated identity assertion.
+var harnessIdentityLineRe = regexp.MustCompile(`(?im)^[ \t>"']*You are Claude Code,[^\n]*\r?\n?`)
 var billingHeaderInlineRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^\n]*`)
 
 // claudeCodeNoisySectionPrefixes lists heading lines whose entire section
@@ -1543,13 +1560,18 @@ func resolveOpenAIFinishReason(upstream string, hasToolCalls bool) string {
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Model     string          `json:"model"`
+	Messages  []OpenAIMessage `json:"messages"`
+	MaxTokens int             `json:"max_tokens,omitempty"`
+	// Temperature / TopP are pointers so an explicit 0 (deterministic decoding)
+	// survives instead of being dropped by omitempty. See ClaudeRequest.
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
+	// Stop is the OpenAI stop-sequence knob (string or []string). Previously
+	// dropped; now forwarded so callers keep their stop-token control.
+	Stop   interface{}  `json:"stop,omitempty"`
+	Stream bool         `json:"stream,omitempty"`
+	Tools  []OpenAITool `json:"tools,omitempty"`
 	// ToolChoice is the OpenAI tool-selection knob: "auto" | "none" | "required"
 	// | {"type":"function","function":{"name":"..."}}. The Kiro path ignores it
 	// (CodeWhisperer has no equivalent), but the generic-provider translation
@@ -1786,7 +1808,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		payload.ConversationState.History = history
 	}
 
-	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
+	if req.MaxTokens > 0 || req.Temperature != nil || req.TopP != nil {
 		capped, _ := capInferenceMaxTokensForModel(req.MaxTokens, modelID)
 		payload.InferenceConfig = &InferenceConfig{
 			MaxTokens:   capped,
