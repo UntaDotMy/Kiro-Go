@@ -1455,31 +1455,56 @@ func modelCreatedUnix(id string) int64 {
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
 //
-// Per-account upstream calls run concurrently with a small worker pool.
-// Each goroutine writes its own per-account result into a slice indexed by
-// account position; the merge into the global aggregate happens once on
-// the main goroutine after all workers finish, so we don't need a mutex
-// around mergeUniqueModels (which is not concurrency-safe).
+// Fetches the model catalog ONCE per non-Kiro backend (all api keys on one
+// provider share the same endpoint and catalog), then seeds the result onto
+// every sibling account in that backend group. Kiro stays per-account: it is
+// the source of the shared /v1/models catalog. Units run concurrently with a
+// small worker pool; the merge into the global aggregate happens once on the
+// main goroutine after all workers finish, so mergeUniqueModels needs no mutex.
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
 	if len(accounts) == 0 {
 		return
 	}
 
-	type accountResult struct {
+	type fetchUnit struct {
+		backend    string
+		candidates []*config.Account
+		seedIDs    []string
+	}
+	var units []fetchUnit
+	byBackend := map[string]int{}
+	for i := range accounts {
+		acct := &accounts[i]
+		backend := config.GetAccountBackend(acct)
+		if backend == "kiro" {
+			units = append(units, fetchUnit{backend: backend, candidates: []*config.Account{acct}, seedIDs: []string{acct.ID}})
+			continue
+		}
+		if idx, ok := byBackend[backend]; ok {
+			units[idx].candidates = append(units[idx].candidates, acct)
+			units[idx].seedIDs = append(units[idx].seedIDs, acct.ID)
+			continue
+		}
+		byBackend[backend] = len(units)
+		units = append(units, fetchUnit{backend: backend, candidates: []*config.Account{acct}, seedIDs: []string{acct.ID}})
+	}
+
+	type unitResult struct {
 		models   []ModelInfo
 		modelIDs []string
-		account  *config.Account
+		seedIDs  []string
+		backend  string
 		advisory bool
 		err      error
 	}
-	results := make([]accountResult, len(accounts))
+	results := make([]unitResult, len(units))
 	sem := make(chan struct{}, refreshFanoutConcurrency)
 	var wg sync.WaitGroup
 
-	for i := range accounts {
+	for i := range units {
 		i := i
-		account := &accounts[i]
+		unit := units[i]
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -1487,48 +1512,46 @@ func (h *Handler) refreshModelsCache() {
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Errorf("[ModelsCache] refresh worker panic for %s: %v", account.Email, r)
-					results[i] = accountResult{account: account, err: fmt.Errorf("worker panic: %v", r)}
+					results[i] = unitResult{backend: unit.backend, seedIDs: unit.seedIDs, err: fmt.Errorf("worker panic: %v", r)}
 				}
 			}()
-			if err := h.ensureValidToken(account); err != nil {
-				results[i] = accountResult{account: account, err: fmt.Errorf("token refresh failed: %w", err)}
-				return
-			}
-			prov, perr := ProviderForOrErr(account)
-			if perr != nil {
-				results[i] = accountResult{account: account, err: perr}
-				return
-			}
-			// For a generic (data-driven) provider, use FetchModelsForAccount so we
-			// learn whether the ids are LIVE/authoritative (strict routing filter) or
-			// a STATIC fallback (advisory, display-only — never shed). Using the
-			// always-strict ListModels here would overwrite an advisory list seeded by
-			// the per-account path with a strict one on every tick, re-introducing the
-			// "503 for a served-but-unlisted model" shed. Kiro keeps ListModels.
-			if gp, ok := prov.(*genericProvider); ok {
-				ids, advisory, ferr := gp.FetchModelsForAccount(context.Background(), account)
-				if ferr != nil {
-					results[i] = accountResult{account: account, err: ferr}
+			var lastErr error
+			for _, account := range unit.candidates {
+				if err := h.ensureValidToken(account); err != nil {
+					lastErr = fmt.Errorf("token refresh failed: %w", err)
+					continue
+				}
+				prov, perr := ProviderForOrErr(account)
+				if perr != nil {
+					lastErr = perr
+					continue
+				}
+				if gp, ok := prov.(*genericProvider); ok {
+					ids, advisory, ferr := gp.FetchModelsForAccount(context.Background(), account)
+					if ferr != nil {
+						lastErr = ferr
+						continue
+					}
+					models := make([]ModelInfo, 0, len(ids))
+					for _, id := range ids {
+						models = append(models, ModelInfo{ModelId: id})
+					}
+					results[i] = unitResult{models: models, modelIDs: ids, seedIDs: unit.seedIDs, backend: unit.backend, advisory: advisory}
 					return
 				}
-				models := make([]ModelInfo, 0, len(ids))
-				for _, id := range ids {
-					models = append(models, ModelInfo{ModelId: id})
+				models, err := prov.ListModels(account)
+				if err != nil {
+					lastErr = err
+					continue
 				}
-				results[i] = accountResult{models: models, modelIDs: ids, account: account, advisory: advisory}
+				modelIDs := make([]string, 0, len(models))
+				for _, m := range models {
+					modelIDs = append(modelIDs, m.ModelId)
+				}
+				results[i] = unitResult{models: models, modelIDs: modelIDs, seedIDs: unit.seedIDs, backend: unit.backend}
 				return
 			}
-			models, err := prov.ListModels(account)
-			if err != nil {
-				results[i] = accountResult{account: account, err: err}
-				return
-			}
-			modelIDs := make([]string, 0, len(models))
-			for _, m := range models {
-				modelIDs = append(modelIDs, m.ModelId)
-			}
-			results[i] = accountResult{models: models, modelIDs: modelIDs, account: account}
+			results[i] = unitResult{backend: unit.backend, seedIDs: unit.seedIDs, err: lastErr}
 		}()
 	}
 	wg.Wait()
@@ -1536,27 +1559,24 @@ func (h *Handler) refreshModelsCache() {
 	aggregated := make([]ModelInfo, 0)
 	for i := range results {
 		r := &results[i]
-		if r.account == nil {
-			continue
-		}
 		if r.err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", r.account.Email, r.err)
+			logger.Warnf("[ModelsCache] Failed to refresh backend %s: %v", r.backend, r.err)
 			continue
 		}
-		// 缓存每账号可用模型，用于路由时过滤. An advisory list (static fallback for a
-		// no-/models provider) is display-only and must NOT gate routing, so seed it
-		// via SetAdvisoryModelList; a live/authoritative list seeds the strict filter.
-		if r.advisory {
-			h.pool.SetAdvisoryModelList(r.account.ID, r.modelIDs)
-		} else {
-			h.pool.SetModelList(r.account.ID, r.modelIDs)
+		// An advisory list (static fallback for a no-/models provider) is
+		// display-only and must NOT gate routing, so seed it via
+		// SetAdvisoryModelList; a live/authoritative list seeds the strict filter.
+		for _, id := range r.seedIDs {
+			if r.advisory {
+				h.pool.SetAdvisoryModelList(id, r.modelIDs)
+			} else {
+				h.pool.SetModelList(id, r.modelIDs)
+			}
 		}
-		// Aggregate into the SHARED /v1/models catalog ONLY for Kiro accounts.
-		// A non-Kiro provider's bare ids route via the "provider/model" prefix
-		// only, so listing them unprefixed in the global catalog would mis-route
-		// a Kiro client to Kiro. Their per-account routing list (SetModelList
-		// above) is all the pool filter needs.
-		if config.GetAccountBackend(r.account) == "kiro" {
+		// Aggregate into the SHARED /v1/models catalog ONLY for Kiro: a non-Kiro
+		// provider's bare ids route via the "provider/model" prefix, so listing
+		// them unprefixed would mis-route a Kiro client.
+		if r.backend == "kiro" {
 			aggregated = mergeUniqueModels(aggregated, r.models)
 		}
 	}
@@ -3972,6 +3992,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiExportNineRouter(w, r)
 	case path == "/import/9router" && r.Method == "POST":
 		h.apiImportNineRouter(w, r)
+	case path == "/backup" && r.Method == "GET":
+		h.apiBackupConfig(w, r)
+	case path == "/restore" && r.Method == "POST":
+		h.apiRestoreConfig(w, r)
 	case path == "/websearch/probe" && r.Method == "POST":
 		h.apiProbeWebSearch(w, r)
 	default:
@@ -6137,6 +6161,45 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(data)
+}
+
+// apiBackupConfig GET /admin/api/backup — streams the entire config.json
+// (accounts, providers, API keys, settings, AND secrets) as a downloadable file
+// for full disaster recovery. Admin-gated by the /admin/api router.
+func (h *Handler) apiBackupConfig(w http.ResponseWriter, r *http.Request) {
+	data, err := config.SnapshotBytes()
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	filename := fmt.Sprintf("kiro-go-backup-%s.json", time.Now().Format("2006-01-02-150405"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	w.Write(data)
+}
+
+// apiRestoreConfig POST /admin/api/restore — replaces the entire config from an
+// uploaded backup, then reloads the account pool. Destructive: the current
+// config is overwritten. Admin-gated by the /admin/api router.
+func (h *Handler) apiRestoreConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "failed to read body: " + err.Error()})
+		return
+	}
+	if err := config.RestoreFromBytes(body); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid backup: " + err.Error()})
+		return
+	}
+	h.pool.Reload()
+	logger.Infof("[Backup] Config restored from upload (%d bytes); pool reloaded", len(body))
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"accounts": len(config.GetAccounts()),
+	})
 }
 
 func clampInt(v, min, max int) int {

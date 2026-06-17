@@ -85,6 +85,13 @@ func resolveProviderSettings(acct *config.Account) (providerSettings, bool) {
 		ps.dialect = Dialect(strings.ToLower(strings.TrimSpace(acct.CustomDialect)))
 		ps.baseURL = strings.TrimSpace(acct.BaseURLOverride)
 		ps.models = acct.CustomModels
+	} else if sib, ok := config.GetCustomAccountByBackend(backend); ok {
+		// Bulk-added keys on a custom backend store only Backend+APIKey; the inline
+		// dialect/baseURL/models live on the first (single-added) sibling. Inherit
+		// them so every key on the backend resolves instead of "unknown provider".
+		ps.dialect = Dialect(strings.ToLower(strings.TrimSpace(sib.CustomDialect)))
+		ps.baseURL = strings.TrimSpace(sib.BaseURLOverride)
+		ps.models = sib.CustomModels
 	} else {
 		return providerSettings{}, false
 	}
