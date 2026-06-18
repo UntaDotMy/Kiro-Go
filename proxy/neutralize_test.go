@@ -235,3 +235,69 @@ func TestNeutralizeBodySoftensCatalogOnModeratedBackendOnly(t *testing.T) {
 		t.Errorf("non-moderated backend must keep vocabulary verbatim:\n%s", kiro)
 	}
 }
+
+const securityDisclaimerSample = `You are an interactive agent that helps users with software engineering tasks.
+
+IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.
+
+# Harness
+ - Prefer the dedicated file/search tools over shell commands when one fits.
+
+# Doing tasks
+Do software engineering tasks.`
+
+func TestSoftenStripsSecurityDisclaimerOnModeratedPath(t *testing.T) {
+	got := softenModerationVocabulary(securityDisclaimerSample)
+
+	for _, phrase := range []string{
+		"DoS attacks", "supply chain compromise", "detection evasion",
+		"C2 frameworks", "credential testing", "IMPORTANT: Assist with authorized security testing",
+	} {
+		if strings.Contains(got, phrase) {
+			t.Errorf("disclaimer phrase %q survived strip (content_filter risk):\n%s", phrase, got)
+		}
+	}
+	if !strings.Contains(got, "# Harness") || !strings.Contains(got, "dedicated file/search tools") {
+		t.Errorf("harness/tool guidance lost — model would be degraded:\n%s", got)
+	}
+	if !strings.Contains(got, "interactive agent that helps users") {
+		t.Errorf("agent role intro lost:\n%s", got)
+	}
+	if !strings.Contains(got, "# Doing tasks") {
+		t.Errorf("doing-tasks section lost:\n%s", got)
+	}
+}
+
+func TestNeutralizeBodyStripsDisclaimerOnModeratedBackendOnly(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	build := func(backend string) string {
+		body := map[string]interface{}{
+			"model": "glm-5.2",
+			"messages": []interface{}{
+				map[string]interface{}{"role": "system", "content": securityDisclaimerSample},
+				map[string]interface{}{"role": "user", "content": "hi"},
+			},
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(neutralizeProviderBody(raw, backend))
+	}
+
+	cn := build("codebuddy-cn")
+	for _, phrase := range []string{"DoS attacks", "supply chain compromise", "detection evasion", "C2 frameworks", "credential testing"} {
+		if strings.Contains(cn, phrase) {
+			t.Errorf("disclaimer phrase %q survived on moderated backend:\n%s", phrase, cn)
+		}
+	}
+	if !strings.Contains(cn, "# Harness") {
+		t.Errorf("harness lost on moderated backend:\n%s", cn)
+	}
+
+	kiro := build("kiro")
+	if !strings.Contains(kiro, "DoS attacks") || !strings.Contains(kiro, "C2 frameworks") {
+		t.Errorf("non-moderated backend must keep disclaimer verbatim:\n%s", kiro)
+	}
+}
