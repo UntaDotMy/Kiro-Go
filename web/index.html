@@ -295,6 +295,21 @@
                 <button class="btn btn-primary" onclick="saveOverUsageConfig()" data-i18n="common.save"></button>
             </div>
             <div class="card">
+                <div class="card-header"><span class="card-title">Debug Capture</span></div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:10px">
+                        <label class="switch"><input type="checkbox" id="debugCapture"><span class="slider"></span></label>
+                        <span>Enable debug capture</span>
+                    </label>
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block">Writes each upstream request body AND raw upstream response to disk for diagnosing provider issues (CodeBuddy moderation rejections, tool-call shape mismatches). Default off. Captured files contain full prompts — keep off in normal use.</small>
+                </div>
+                <div class="form-group">
+                    <label style="font-size:13px;display:block;margin-bottom:4px">Capture directory (blank = data dir /debug-capture)</label>
+                    <input type="text" id="debugCaptureDir" placeholder="(default)" style="width:100%">
+                </div>
+                <button class="btn btn-primary" onclick="saveDebugCaptureConfig()" data-i18n="common.save"></button>
+            </div>
+            <div class="card">
                 <div class="card-header"><span class="card-title">Web Search</span></div>
                 <div class="form-group">
                     <label style="display:flex;align-items:center;gap:10px">

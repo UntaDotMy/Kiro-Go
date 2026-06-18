@@ -2481,3 +2481,155 @@ func (h *Handler) apiImportCookieProvider(w http.ResponseWriter, r *http.Request
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": acct.ID})
 }
+
+// apiFetchCodeBuddyCNAccounts POST /admin/api/auth/codebuddy-cn/fetch — fetch
+// ck_ API keys from reseller servers given card-keys/phone-urls/sub-keys (one per
+// line), create codebuddy-cn accounts from the returned credentials, and seed the
+// per-account model list from the advisory catalog.
+func (h *Handler) apiFetchCodeBuddyCNAccounts(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Input string   `json:"input"`
+		Lines []string `json:"lines"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	input := strings.TrimSpace(req.Input)
+	var lines []string
+	if input != "" {
+		lines = strings.Split(input, "\n")
+	} else {
+		lines = req.Lines
+	}
+	if len(lines) == 0 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "input or lines is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+	fetched, err := auth.FetchCodeBuddyCNAccounts(ctx, lines)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	type accountResult struct {
+		Phone    string `json:"phone"`
+		APIKey   string `json:"apiKey"`
+		LoginURL string `json:"loginUrl"`
+		ID       string `json:"id"`
+	}
+	var added []accountResult
+	var errors []string
+	for _, f := range fetched {
+		id := auth.GenerateAccountID()
+		acct := config.Account{
+			ID:       id,
+			Backend:  "codebuddy-cn",
+			APIKey:   f.APIKey,
+			Nickname: f.Phone,
+			Enabled:  true,
+		}
+		if f.WebCookie != "" {
+			acct.WebCookie = f.WebCookie
+		}
+		if err := config.AddAccount(acct); err != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", f.Phone, err))
+			continue
+		}
+		keyLen := len(f.APIKey)
+		keyMask := f.APIKey[:min(20, keyLen)] + "..."
+		added = append(added, accountResult{
+			Phone: f.Phone, APIKey: keyMask,
+			LoginURL: f.LoginURL, ID: id,
+		})
+	}
+	h.pool.Reload()
+
+	for _, a := range added {
+		if ids, advisory, ferr := codeBuddyCNInference.FetchModelsForAccount(r.Context(), &config.Account{
+			ID: a.ID, Backend: "codebuddy-cn",
+		}); ferr == nil && len(ids) > 0 {
+			if advisory {
+				h.pool.SetAdvisoryModelList(a.ID, ids)
+			} else {
+				h.pool.SetModelList(a.ID, ids)
+			}
+		}
+	}
+
+	logger.Infof("[CodeBuddyCN] fetched %d accounts from seller (%d added, %d errors)", len(fetched), len(added), len(errors))
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  len(errors) == 0 || len(added) > 0,
+		"added":    len(added),
+		"accounts": added,
+		"errors":   errors,
+	})
+}
+
+// apiSyncCodeBuddyCNQuota POST /admin/api/codebuddy-cn/quota/{id} — re-fetch
+// quota for one codebuddy-cn account using its ck_ API key.
+func (h *Handler) apiSyncCodeBuddyCNQuota(w http.ResponseWriter, r *http.Request, id string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	q, err := SyncCodeBuddyCNQuota(ctx, id)
+	if err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	if q == nil {
+		writeJSONError(w, 400, "not a codebuddy-cn account")
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"plan":      q.Plan,
+		"used":      q.Used,
+		"total":     q.Total,
+		"remaining": q.Remaining,
+		"resetAt":   q.ResetAt,
+		"records":   q.Records,
+	})
+}
+
+// apiCodeBuddyCNCheckin POST /admin/api/codebuddy-cn/checkin/{id} — perform the
+// daily check-in for one codebuddy-cn account and return the result plus refreshed
+// status. A nil result means the id is not a codebuddy-cn account.
+func (h *Handler) apiCodeBuddyCNCheckin(w http.ResponseWriter, r *http.Request, id string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	res, err := DailyCheckinCodeBuddyCN(ctx, id)
+	if err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	if res == nil {
+		writeJSONError(w, 400, "not a codebuddy-cn account")
+		return
+	}
+	out := map[string]interface{}{
+		"status":      "ok",
+		"already":     res.Already,
+		"credit":      res.Credit,
+		"streakDays":  res.StreakDays,
+		"isStreakDay": res.IsStreakDay,
+		"message":     res.Message,
+	}
+	// Best-effort: attach refreshed status (today_checked_in, totals) if available.
+	if st, serr := CheckinStatusCodeBuddyCN(ctx, id); serr == nil && st != nil {
+		out["todayCheckedIn"] = st.TodayCheckedIn
+		out["active"] = st.Active
+		out["dailyCredit"] = st.DailyCredit
+		out["todayCredit"] = st.TodayCredit
+		if st.StreakDays > 0 {
+			out["streakDays"] = st.StreakDays
+		}
+	}
+	json.NewEncoder(w).Encode(out)
+}

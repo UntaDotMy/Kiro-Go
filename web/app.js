@@ -427,9 +427,10 @@
                 const acct = (accountsData || []).find(x => x.id === id);
                 const backend = acct ? (acct.backend || '').toLowerCase() : '';
                 let quotaMsg = '';
-                if (backend === 'codebuddy' || backend === 'codebuddy-ai') {
+                if (backend === 'codebuddy' || backend === 'codebuddy-ai' || backend === 'codebuddy-cn') {
+                    const quotaPath = backend === 'codebuddy-cn' ? '/admin/api/codebuddy-cn/quota/' : '/admin/api/codebuddy/quota/';
                     try {
-                        const qres = await fetch('/admin/api/codebuddy/quota/' + id, {
+                        const qres = await fetch(quotaPath + id, {
                             method: 'POST', headers: { 'X-Admin-Password': password }
                         });
                         const qd = await qres.json();
@@ -450,6 +451,26 @@
                     alert(t('detail.refreshModelCache') + ' OK (' + (d.count || 0) + ' models)' + quotaMsg);
                 } else {
                     alert(t('common.failed') + ': ' + (d.error || '') + quotaMsg);
+                }
+            } catch (e) {
+                alert(t('common.failed'));
+            }
+        }
+        async function checkinCodeBuddyCN(id) {
+            try {
+                const res = await fetch('/admin/api/codebuddy-cn/checkin/' + id, {
+                    method: 'POST', headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                if (res.ok && d.status === 'ok') {
+                    if (d.already) {
+                        alert(t('detail.checkinAlready'));
+                    } else {
+                        alert(t('detail.checkinOk') + ' +' + (d.credit || 0).toFixed(0) + (d.streakDays ? ' (' + d.streakDays + 'd)' : ''));
+                    }
+                    await loadAccounts();
+                } else {
+                    alert(t('common.failed') + ': ' + (d.error || 'unknown'));
                 }
             } catch (e) {
                 alert(t('common.failed'));
@@ -622,6 +643,7 @@
                 '<div class="detail-item"><div class="detail-label">' + t('detail.totalTokens') + '</div><div class="detail-value">' + formatNum(a.totalTokens || 0) + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.totalCredits') + '</div><div class="detail-value">' + (a.totalCredits || 0).toFixed(2) + '</div></div>' +
                 '</div></div>' +
+                ((a.backend || '').toLowerCase() === 'codebuddy-cn' ? '<div class="detail-section"><h4>' + t('detail.dailyCheckin') + ' <button class="btn btn-sm btn-primary" onclick="checkinCodeBuddyCN(\'' + id + '\')" style="margin-left:8px">' + t('detail.checkinNow') + '</button></h4></div>' : '') +
                 '<div class="detail-section"><h4>' + t('detail.models') + ' <button class="btn btn-sm btn-secondary" onclick="loadModels(\'' + id + '\')" style="margin-left:8px">' + t('detail.loadModels') + '</button> <button class="btn btn-sm btn-secondary" onclick="refreshAccountModels(\'' + id + '\')" style="margin-left:4px">' + t('detail.refreshModelCache') + '</button></h4><div id="modelsList" class="model-list"></div></div>';
             document.getElementById('detailModal').classList.add('active');
         }
@@ -1351,6 +1373,10 @@
             document.getElementById('requireApiKey').checked = d.requireApiKey;
             document.getElementById('apiKeyInput').value = d.apiKey || '';
             document.getElementById('allowOverUsage').checked = d.allowOverUsage || false;
+            const dbgCap = document.getElementById('debugCapture');
+            if (dbgCap) dbgCap.checked = d.debugCapture || false;
+            const dbgDir = document.getElementById('debugCaptureDir');
+            if (dbgDir) dbgDir.value = d.debugCaptureDir || '';
             const wsEnabled = document.getElementById('webSearchEnabled');
             if (wsEnabled) {
                 wsEnabled.checked = d.webSearchEnabled || false;
@@ -1602,6 +1628,20 @@
                 body: JSON.stringify({ allowOverUsage })
             });
             alert(t('settings.overUsageSaved'));
+        }
+        async function saveDebugCaptureConfig() {
+            const debugCapture = document.getElementById('debugCapture').checked;
+            const debugCaptureDir = document.getElementById('debugCaptureDir').value.trim();
+            const res = await fetch('/admin/api/settings', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({ debugCapture, debugCaptureDir })
+            });
+            if (res.ok) {
+                alert(debugCapture ? 'Debug capture ON' : 'Debug capture OFF');
+                loadSettings();
+            } else {
+                alert('Failed to save debug capture settings');
+            }
         }
         async function changePassword() {
             const newPwd = document.getElementById('newPassword').value;
@@ -2602,7 +2642,9 @@
                 help: 'Paste your grok.com session cookie (the sso cookie value).' },
             'perplexity-web': { kind: 'cookie', kindLabel: 'session cookie',
                 importPath: '/auth/cookie/import',
-                help: 'Paste your perplexity.ai session cookie value.' }
+                help: 'Paste your perplexity.ai session cookie value.' },
+            'codebuddy-cn': { kind: 'fetch', kindLabel: 'fetch from seller',
+                help: 'Paste card keys, phone----URL lines, or sub-API keys (sk_…) — one per line. The backend fetches ck_ keys from the reseller servers.' }
         };
         let oauthFlowTimer = null;
         let oauthFlowSession = '';
@@ -2697,6 +2739,12 @@
                     '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
                     '<div class="modal-footer">' + back +
                     '<button class="btn btn-primary" onclick="importCookieAccount(\'' + id + '\')">' + t('common.add') + '</button></div>';
+            } else if (flow.kind === 'fetch') {
+                body.innerHTML = help +
+                    '<div class="form-group"><label>Card Keys / Phone-URLs / Sub-Keys</label><textarea id="oauthFetchInput" rows="8" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical" placeholder="1234567890123456&#10;13800138000----https://copilot.tencent.com/login?platform=xxx&#10;sk_abc123def456"></textarea></div>' +
+                    '<p id="oauthStatus" style="color:#64748b;margin:8px 0;font-size:13px;min-height:16px"></p>' +
+                    '<div class="modal-footer">' + back +
+                    '<button class="btn btn-primary" onclick="fetchCodeBuddyCNAccounts()">Fetch & Add</button></div>';
             }
             modal.classList.add('active');
         }
@@ -2800,6 +2848,18 @@
                 const d = await res.json();
                 if (d.success || d.id) { closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
                 if (statusEl) statusEl.textContent = 'Error: ' + (d.error || 'import failed');
+            } catch (e) { if (statusEl) statusEl.textContent = 'Error: request failed'; }
+        }
+        async function fetchCodeBuddyCNAccounts() {
+            const input = document.getElementById('oauthFetchInput').value.trim();
+            if (!input) { alert('Paste card keys, phone----URL lines, or sub-keys first'); return; }
+            const statusEl = document.getElementById('oauthStatus');
+            if (statusEl) statusEl.textContent = 'Fetching from seller servers…';
+            try {
+                const res = await fetch('/admin/api/auth/codebuddy-cn/fetch', { method: 'POST', headers: oauthHeaders(), body: JSON.stringify({ input }) });
+                const d = await res.json();
+                if (d.success) { closeModal(); loadAccounts(); if (activeDashboardTab() === 'providers') loadProviders(); return; }
+                if (statusEl) statusEl.textContent = 'Error: ' + (d.error || 'fetch failed') + (d.errors ? ' (' + d.errors.length + ' failures)' : '');
             } catch (e) { if (statusEl) statusEl.textContent = 'Error: request failed'; }
         }
         function loadLocalFile(input, targetId) {

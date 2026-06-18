@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/http2"
 )
 
@@ -289,7 +290,17 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 			t.ForceAttemptHTTP2 = false
 		}
 	} else {
-		t.Proxy = http.ProxyFromEnvironment
+		// Snapshot the proxy env at build time rather than using
+		// http.ProxyFromEnvironment, which caches the environment ONCE per
+		// process (sync.Once) on its first call. The proxy is configured from
+		// the admin UI / config and the client is rebuilt when it changes, so a
+		// process-global cache would freeze whatever the env was at the first
+		// HTTP call anywhere in the process and ignore later changes. A
+		// per-build snapshot honors the current environment each time.
+		cfg := httpproxy.FromEnvironment()
+		t.Proxy = func(req *http.Request) (*url.URL, error) {
+			return cfg.ProxyFunc()(req.URL)
+		}
 	}
 
 	// Enable HTTP/2 active PING health-checks on the direct (non-proxied)

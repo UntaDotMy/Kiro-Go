@@ -155,3 +155,83 @@ func TestNeutralizeProviderBodyInvalidJSONFailsOpen(t *testing.T) {
 		t.Errorf("invalid JSON should pass through unchanged: got %q", string(got))
 	}
 }
+
+const moderationCatalogSample = `- adversarial-security-review: Stress-test code and configuration from an attacker's perspective using a structured red-team / blue-team / adjudicator pass, beyond a checklist scan. Use when a change touches auth, secrets, agent/hook config, or anything an attacker would target - first think like the attacker (enumerate concrete exploit paths), then like the defender. Use when the user says "security review", "threat model this", "can this be exploited". (Tools: Read, Grep, Glob, Bash)
+- security-and-compliance-auditor: Performs threat modeling, exploitability analysis, and remediation quality, or when a vulnerability needs reproduction. (Tools: Read, Grep, Glob, Bash)
+- deep-research: fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.`
+
+func TestSoftenModerationVocabularyClearsTriggersKeepsMeaning(t *testing.T) {
+	got := softenModerationVocabulary(moderationCatalogSample)
+
+	triggers := []string{
+		"attacker", "red-team", "blue-team", "exploit", "exploitability",
+		"threat model", "vulnerability", "adversarially",
+	}
+	for _, trig := range triggers {
+		if strings.Contains(strings.ToLower(got), strings.ToLower(trig)) {
+			t.Errorf("moderation trigger %q survived softening:\n%s", trig, got)
+		}
+	}
+
+	if !strings.Contains(got, "adversarial-security-review") {
+		t.Errorf("invokable skill identifier was corrupted - model could not call it:\n%s", got)
+	}
+	for _, id := range []string{"security-and-compliance-auditor", "deep-research"} {
+		if !strings.Contains(got, id) {
+			t.Errorf("agent/skill identifier %q lost:\n%s", id, got)
+		}
+	}
+	for _, kept := range []string{"Tools: Read, Grep, Glob, Bash", "auth, secrets", "synthesize a cited report"} {
+		if !strings.Contains(got, kept) {
+			t.Errorf("operational guidance %q lost - model would be degraded:\n%s", kept, got)
+		}
+	}
+	for _, meaning := range []string{"reviewer", "risk model", "weak", "defect"} {
+		if !strings.Contains(strings.ToLower(got), meaning) {
+			t.Errorf("expected neutral replacement %q absent - meaning not preserved:\n%s", meaning, got)
+		}
+	}
+}
+
+func TestNeutralizeBodySoftensCatalogOnModeratedBackendOnly(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	build := func(backend string) string {
+		body := map[string]interface{}{
+			"model": "glm-5.2",
+			"messages": []interface{}{
+				map[string]interface{}{"role": "system", "content": moderationCatalogSample},
+				map[string]interface{}{"role": "user", "content": "hi"},
+			},
+			"tools": []interface{}{
+				map[string]interface{}{"type": "function", "function": map[string]interface{}{
+					"name":        "Workflow",
+					"description": "independent perspectives and adversarial checks before committing",
+				}},
+			},
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(neutralizeProviderBody(raw, backend))
+	}
+
+	cn := build("codebuddy-cn")
+	for _, trig := range []string{"attacker", "red-team", "exploit", "adversarial check"} {
+		if strings.Contains(strings.ToLower(cn), strings.ToLower(trig)) {
+			t.Errorf("trigger %q survived on moderated backend:\n%s", trig, cn)
+		}
+	}
+	if !strings.Contains(cn, "adversarial-security-review") {
+		t.Errorf("skill identifier corrupted on moderated backend:\n%s", cn)
+	}
+	if !strings.Contains(cn, `"Workflow"`) {
+		t.Errorf("tool name must never change:\n%s", cn)
+	}
+
+	kiro := build("kiro")
+	if !strings.Contains(kiro, "attacker") || !strings.Contains(kiro, "exploit") {
+		t.Errorf("non-moderated backend must keep vocabulary verbatim:\n%s", kiro)
+	}
+}

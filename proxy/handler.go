@@ -537,7 +537,11 @@ func (h *Handler) refreshAllAccounts() {
 	var anyFlipped atomic.Bool
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		// Skip disabled accounts and accounts with no usable credential. An
+		// api-key provider (e.g. codebuddy-cn) carries its credential in APIKey,
+		// not AccessToken, so gating on AccessToken alone silently excluded those
+		// accounts from the background sweep — their quota never refreshed.
+		if !account.Enabled || (account.AccessToken == "" && account.APIKey == "") {
 			continue
 		}
 		wg.Add(1)
@@ -3887,6 +3891,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiSyncCodeBuddyQuota(w, r, strings.TrimPrefix(path, "/codebuddy/quota/"))
 	case strings.HasPrefix(path, "/codebuddy/cookie/") && r.Method == "POST":
 		h.apiImportCodeBuddyCookie(w, r, strings.TrimPrefix(path, "/codebuddy/cookie/"))
+	case path == "/auth/codebuddy-cn/fetch" && r.Method == "POST":
+		h.apiFetchCodeBuddyCNAccounts(w, r)
+	case strings.HasPrefix(path, "/codebuddy-cn/quota/") && r.Method == "POST":
+		h.apiSyncCodeBuddyCNQuota(w, r, strings.TrimPrefix(path, "/codebuddy-cn/quota/"))
+	case strings.HasPrefix(path, "/codebuddy-cn/checkin/") && r.Method == "POST":
+		h.apiCodeBuddyCNCheckin(w, r, strings.TrimPrefix(path, "/codebuddy-cn/checkin/"))
 	case path == "/auth/kimi-coding/start" && r.Method == "POST":
 		h.apiStartKimiCodingLogin(w, r)
 	case path == "/auth/kimi-coding/poll" && r.Method == "POST":
@@ -4917,6 +4927,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"webSearchApiKeySet":       config.GetWebSearchAPIKey() != "",
 		"toolSearchEnabled":        config.GetToolSearchEnabled(),
 		"globalRateLimitPerMinute": config.GetGlobalRateLimitPerMinute(),
+		"debugCapture":             config.GetDebugCapture(),
+		"debugCaptureDir":          config.GetDebugCaptureDir(),
 	})
 }
 
@@ -5062,6 +5074,8 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchApiKey          *string `json:"webSearchApiKey,omitempty"`
 		ToolSearchEnabled        *bool   `json:"toolSearchEnabled,omitempty"`
 		GlobalRateLimitPerMinute *int    `json:"globalRateLimitPerMinute,omitempty"`
+		DebugCapture             *bool   `json:"debugCapture,omitempty"`
+		DebugCaptureDir          *string `json:"debugCaptureDir,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5146,6 +5160,16 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// tool_search tool with deferred tools).
 	if req.ToolSearchEnabled != nil {
 		if err := config.UpdateToolSearchEnabled(*req.ToolSearchEnabled); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// Debug capture toggle (default off; writes outbound request + upstream
+	// response bodies to disk for diagnosing provider issues).
+	if req.DebugCapture != nil {
+		if err := config.UpdateDebugCapture(*req.DebugCapture, req.DebugCaptureDir); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
