@@ -33,3 +33,6 @@ kiro-research/
 cbcheck*.png
 utils.py
 
+
+# opencode agent session state
+.omo/

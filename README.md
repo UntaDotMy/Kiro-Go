@@ -103,6 +103,18 @@ The setting takes effect immediately without restarting.
 | `DATA_DIR` | (entrypoint) Path to chown to runtime UID/GID before drop | `/app/data` |
 | `RUN_UID` / `RUN_GID` | (entrypoint) UID/GID to drop privileges to | `1000` / `1000` |
 
+## Scaling (single-instance by design)
+
+Kiro-Go is built to run as **one instance**. All runtime coordination state lives in-process, not in a shared store:
+
+- **Per-key rate limits** (minute/hour windows) and the optional **global rate limit** are tracked in memory / `config.json` per process.
+- **Account-pool state** — in-flight counts, the adaptive-concurrency (AIMD) limit, and cooldown timers — is per process.
+- **Admin brute-force lockout** and the **prompt cache** are per process.
+
+If you run **two or more replicas behind a load balancer**, each replica keeps its own copy of this state, so a per-key limit of N effectively becomes N × (replica count) and the pool's 429-avoidance is weaker because no replica sees the whole traffic picture. There is no Redis/Postgres coordination layer.
+
+**Recommendation:** run a single instance (scale **up**, not out). It comfortably handles a single team's traffic. If you must run multiple replicas, pin each client to one replica with sticky sessions (load-balancer session affinity) so per-key limits stay coherent — or front the pool with your own shared rate limiter. Horizontal active-active HA with shared state is not currently supported.
+
 ## Reverse proxy notes
 
 The realtime dashboard at `/admin/ws/status` requires WebSocket upgrade-header passthrough. Reverse proxies in front of Kiro-Go must forward `Upgrade` and `Connection`:
