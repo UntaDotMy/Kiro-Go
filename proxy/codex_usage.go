@@ -164,4 +164,14 @@ func (h *Handler) backgroundRefreshNonKiro(account *config.Account) {
 			}
 		}
 	}
+
+	// CodeBuddy-CN: quota is fetched from copilot.tencent.com using the ck_ API key.
+	// Reuses the same Usage* fields for dashboard tracking.
+	if config.GetAccountBackend(account) == "codebuddy-cn" {
+		if strings.TrimSpace(account.APIKey) != "" || strings.TrimSpace(account.AccessToken) != "" {
+			if _, err := SyncCodeBuddyCNQuota(context.Background(), account.ID); err != nil {
+				logger.Debugf("[BackgroundRefresh] CodeBuddy-CN quota sync failed for %s: %v", redactForLog(account.Email), err)
+			}
+		}
+	}
 }

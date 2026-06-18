@@ -63,6 +63,7 @@ var brandProfiles = map[string]*brandProfile{
 	), stripIdentityLine: true},
 	"codebuddy":    {replacer: tencentReplacer(), moderateContent: true},
 	"codebuddy-ai": {replacer: tencentReplacer(), moderateContent: true},
+	"codebuddy-cn": {replacer: tencentReplacer(), moderateContent: true},
 	"qoder": {replacer: strings.NewReplacer(
 		"Anthropic's official CLI for Claude", "Qoder's official CLI",
 		"Claude Code", "Qoder",
@@ -124,6 +125,9 @@ func neutralizeHarness(prompt, backend string) string {
 	profile := brandProfileFor(backend)
 	if profile.stripIdentityLine {
 		prompt = harnessIdentityLineRe.ReplaceAllString(prompt, "")
+	}
+	if profile.moderateContent {
+		prompt = softenModerationVocabulary(prompt)
 	}
 	prompt = profile.replacer.Replace(prompt)
 
@@ -192,7 +196,7 @@ func neutralizeProviderBody(body []byte, backend string) []byte {
 func neutralizeBrandValue(v interface{}, profile *brandProfile) interface{} {
 	switch t := v.(type) {
 	case string:
-		return profile.replacer.Replace(t)
+		return profile.replacer.Replace(softenModerationVocabulary(t))
 	case []interface{}:
 		for i := range t {
 			t[i] = neutralizeBrandValue(t[i], profile)

@@ -402,6 +402,8 @@ func (g *genericProvider) Call(ctx context.Context, acct *config.Account, nr *No
 		body = neutralizeProviderBody(body, ps.id)
 	}
 
+	dumpOutboundBody(ps.id, body)
+
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return err

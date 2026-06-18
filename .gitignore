@@ -21,6 +21,7 @@ go.work
 go.work.sum
 
 # Local research / scratch artifacts (cloned competitor repos, analysis output)
+codebuddychina/
 kiro2api/
 kiro-gateway/
 research/

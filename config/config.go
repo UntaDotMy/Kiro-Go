@@ -472,6 +472,18 @@ type Config struct {
 	// set explicitly to false to send requests unmodified.
 	CodeBuddyFilterEnabled *bool `json:"codeBuddyFilterEnabled,omitempty"`
 
+	// DebugCapture, when true, makes the proxy write the final outbound upstream
+	// request body AND the raw upstream response to DebugCaptureDir, one file per
+	// request/response, for diagnosing provider issues (e.g. CodeBuddy moderation
+	// rejections or tool-call shape mismatches). OFF by default — captured bodies
+	// contain full prompts and credentials-adjacent data, so this is operator-gated
+	// and never on in normal use.
+	DebugCapture bool `json:"debugCapture,omitempty"`
+
+	// DebugCaptureDir is the directory debug captures are written to. Empty means
+	// use the default (data dir /debug-capture).
+	DebugCaptureDir string `json:"debugCaptureDir,omitempty"`
+
 	// ToolSearchEnabled turns on proxy-side emulation of Anthropic's Tool Search
 	// feature (the tool_search_tool_regex / tool_search_tool_bm25 server tools).
 	// When a client (e.g. Claude Code with ENABLE_TOOL_SEARCH) sends most of its
@@ -2057,6 +2069,39 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetDebugCapture reports whether outbound/inbound debug capture is enabled.
+func GetDebugCapture() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.DebugCapture
+}
+
+// GetDebugCaptureDir returns the directory debug captures are written to,
+// defaulting to <data dir>/debug-capture when unset.
+func GetDebugCaptureDir() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || strings.TrimSpace(cfg.DebugCaptureDir) == "" {
+		return filepath.Join(filepath.Dir(cfgPath), "debug-capture")
+	}
+	return cfg.DebugCaptureDir
+}
+
+// UpdateDebugCapture sets the debug-capture toggle (and optionally its directory)
+// and persists the change. A nil dir leaves the directory unchanged.
+func UpdateDebugCapture(enabled bool, dir *string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.DebugCapture = enabled
+	if dir != nil {
+		cfg.DebugCaptureDir = strings.TrimSpace(*dir)
+	}
 	return Save()
 }
 

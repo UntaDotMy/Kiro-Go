@@ -77,6 +77,26 @@ var codeBuddyModels = []string{
 	"kimi-k2.6", "kimi-k2.5",
 }
 
+// codeBuddyCNModels is the advisory (display-only) model catalog for the CodeBuddy
+// CN reseller provider (codebuddy-cn), which uses ck_ API keys against the Tencent
+// copilot.tencent.com gateway. This mirrors the reseller tool's own SUPPORTED_MODELS
+// list verbatim (codebuddychina/_internal/src/modules/proxy_server.py), which the
+// tool author marks 已实测验证可用 ("smoke-verified usable") against the gateway — it
+// is the ground truth for what copilot.tencent.com/v2/chat/completions accepts for
+// reseller ck_ keys. CodeBuddy serves no GET /models route, so this ships as an
+// advisory list (a missing id is never shed; the upstream validates at call time).
+var codeBuddyCNModels = []string{
+	"auto",
+	"deepseek-v4-pro", "deepseek-v4-flash",
+	"deepseek-v3-2-volc", "deepseek-v3-1", "deepseek-v3-0324",
+	"deepseek-r1",
+	"glm-5.2", "glm-5.1", "glm-5.0", "glm-5.0-turbo", "glm-5v-turbo",
+	"glm-4.7", "glm-4.6",
+	"minimax-m3", "minimax-m2.7", "minimax-m2.5",
+	"kimi-k2.7", "kimi-k2.6", "kimi-k2.5",
+	"hy3-preview", "hunyuan-chat", "hunyuan-2.0-thinking",
+}
+
 // builtinProviders is the data-only catalog. The OpenAI-compatible rows are all
 // served by genericProvider with no per-provider code. Ported from 9router's
 // open-sse/config/providers.js (the LLM subset; TTS/STT/image/embedding-only
@@ -127,6 +147,7 @@ var builtinProviders = []builtinProvider{
 	// route, so codeBuddyModels is shipped as an advisory list (see above).
 	{ID: "codebuddy", Alias: "cb", Name: "CodeBuddy (Tencent CN)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v2/chat/completions", OAuth: true, Models: codeBuddyModels},
 	{ID: "codebuddy-ai", Alias: "cbai", Name: "CodeBuddy (International)", Dialect: DialectOpenAI, BaseURL: "https://www.codebuddy.ai/v2/chat/completions", OAuth: true, Models: codeBuddyModels},
+	{ID: "codebuddy-cn", Alias: "cbcn", Name: "CodeBuddy (Tencent CN, reseller key)", Dialect: DialectOpenAI, BaseURL: "https://copilot.tencent.com/v2/chat/completions", Models: codeBuddyCNModels},
 	{ID: "qwen", Alias: "qwen", Name: "Qwen (Alibaba)", Dialect: DialectOpenAI, BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", OAuth: true},
 	{ID: "iflow", Alias: "iflow", Name: "iFlow", Dialect: DialectOpenAI, BaseURL: "https://apis.iflow.cn/v1/chat/completions", OAuth: true, Headers: map[string]string{"User-Agent": "iFlow-Cli"},
 		// iFlow's /models endpoint 404s; advisory catalog. Source: iFlow model
