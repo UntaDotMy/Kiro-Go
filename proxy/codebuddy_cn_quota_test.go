@@ -50,6 +50,46 @@ func TestCodeBuddyCNQuota_PostsEmptyBody(t *testing.T) {
 	}
 }
 
+// TestCodeBuddyCNQuota_DerivesUsedFromCycleRemain reproduces the live CN billing
+// shape (verified against copilot.tencent.com): CapacityUsed is 0 on every
+// package while CycleCapacityRemain is decremented. The parser must report the
+// remaining figure from CycleCapacityRemain so the sync layer can derive real
+// usage as Total - Remaining (the seller-visible deduction). With the buggy
+// CapacityUsed-only read, Used stays 0 and the dashboard shows no consumption.
+func TestCodeBuddyCNQuota_DerivesUsedFromCycleRemain(t *testing.T) {
+	ensureRestClient()
+	// Two packages mirroring the live response: a partially-consumed cycle
+	// (500 -> 292.09) and an untouched one (2000). CapacityUsed is 0 throughout.
+	body := `{"data":{"Response":{"Data":{"Accounts":[
+		{"PackageCode":"TCACA_code_008","CapacityUnit":"credits","CapacitySize":500,"CapacityRemain":500,"CapacityUsed":0,"CycleCapacitySize":500,"CycleCapacityRemain":292.09,"CycleCapacitySizePrecise":500,"CycleCapacityRemainPrecise":292.09},
+		{"PackageCode":"TCACA_code_007","CapacityUnit":"credits","CapacitySize":2000,"CapacityRemain":2000,"CapacityUsed":0,"CycleCapacitySize":2000,"CycleCapacityRemain":2000,"CycleCapacitySizePrecise":2000,"CycleCapacityRemainPrecise":2000}
+	]}}}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	q, err := fetchCodeBuddyCNQuotaAt(context.Background(), cnTestAccount(), srv.URL)
+	if err != nil {
+		t.Fatalf("quota fetch error: %v", err)
+	}
+	if q.Total != 2500 {
+		t.Errorf("Total = %v, want 2500", q.Total)
+	}
+	// Remaining must reflect the decremented cycle figure, not the untouched
+	// lifetime CapacityRemain.
+	if q.Remaining < 2292.08 || q.Remaining > 2292.10 {
+		t.Errorf("Remaining = %v, want ~2292.09", q.Remaining)
+	}
+	// CapacityUsed is 0 upstream, so the raw Used is 0 — the sync layer is what
+	// derives real usage from Total - Remaining.
+	derivedUsed := q.Total - q.Remaining
+	if derivedUsed < 207.90 || derivedUsed > 207.92 {
+		t.Errorf("derived used (Total-Remaining) = %v, want ~207.91", derivedUsed)
+	}
+}
+
 // TestDailyCheckinCodeBuddyCN_Success: HTTP 200, code 0, data populated.
 func TestDailyCheckinCodeBuddyCN_Success(t *testing.T) {
 	ensureRestClient()
