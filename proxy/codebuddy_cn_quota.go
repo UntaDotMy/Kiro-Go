@@ -45,9 +45,21 @@ func SyncCodeBuddyCNQuota(ctx context.Context, acctID string) (*CodeBuddyQuota, 
 
 	update := acct
 	update.UsageLimit = q.Total
-	update.UsageCurrent = q.Used
+	// The Tencent CN billing endpoint never populates CapacityUsed (it stays 0 on
+	// every package — verified against copilot.tencent.com): consumption is
+	// reflected ONLY by CycleCapacityRemain decreasing, which the parser folds into
+	// q.Remaining. Mirror the reference client (api_client.py ignores CapacityUsed
+	// and tracks cycle_remain) by deriving usage as total - remaining whenever the
+	// reported used figure is absent/zero, so the dashboard tracks real deduction.
+	used := q.Used
+	if used <= 0 && q.Total > 0 {
+		if derived := q.Total - q.Remaining; derived > 0 {
+			used = derived
+		}
+	}
+	update.UsageCurrent = used
 	if q.Total > 0 {
-		update.UsagePercent = q.Used / q.Total
+		update.UsagePercent = used / q.Total
 	} else {
 		update.UsagePercent = 0
 	}
