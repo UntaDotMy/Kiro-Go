@@ -32,6 +32,28 @@ func TestGetContextWindowSize(t *testing.T) {
 		{"claude-sonnet-4.5", defaultContextWindow},
 		{"claude-haiku-4-5", defaultContextWindow},
 		{"claude-3-5-sonnet", defaultContextWindow},
+		// Provider-prefixed ids resolve on the UPSTREAM model, not the literal
+		// prefixed string: a cbcn/glm-5.2 request must read GLM-5.2's real 200K
+		// window, and a 128K cbcn/glm-4.5 must read 128K — not the flat Kiro
+		// default that the un-stripped id would have fallen through to.
+		{"cbcn/glm-5.2", 200_000},
+		{"cbcn/glm-4.7", 200_000},
+		{"cbcn/glm-4.6", 200_000},
+		{"cbcn/glm-4.5", 131_072},
+		{"glm-5.2", 200_000},
+		{"glm-5.0", 200_000},
+		// Other cbcn families resolve to their documented vendor window, not the
+		// flat Kiro default the un-stripped prefixed id would have hit.
+		{"cbcn/kimi-k2.7", 262_144},
+		{"cbcn/kimi-k2.5", 262_144},
+		{"cbcn/minimax-m2.7", 204_800},
+		{"cbcn/minimax-m3", 204_800},
+		{"cbcn/deepseek-v4-pro", 1_000_000},
+		{"cbcn/deepseek-v4-flash", 1_000_000},
+		{"cbcn/deepseek-v3-1", 131_072},
+		{"cbcn/deepseek-r1", 131_072},
+		{"cbcn/hunyuan-chat", 131_072},
+		{"cbcn/hy3-preview", 131_072},
 		// Unparseable / unknown ids fall back to the safe default.
 		{"unknown-model", defaultContextWindow},
 		{"", defaultContextWindow},

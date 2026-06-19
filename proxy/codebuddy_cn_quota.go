@@ -75,7 +75,7 @@ func SyncCodeBuddyCNQuota(ctx context.Context, acctID string) (*CodeBuddyQuota, 
 	if err := config.UpdateAccount(acctID, update); err != nil {
 		return q, err
 	}
-	logger.Infof("[CodeBuddyCN] quota synced for %s: used=%.0f/%.0f (%s plan, %d records)", acctID, q.Used, q.Total, q.Plan, q.Records)
+	logger.Infof("[CodeBuddyCN] quota synced for %s: used=%.0f/%.0f (%s plan, %d records)", acctID, used, q.Total, q.Plan, q.Records)
 	return q, nil
 }
 

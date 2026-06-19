@@ -60,18 +60,45 @@ var familyContextWindow = map[string]int{
 	"qwq":         131_072,
 	"qwen":        131_072, // unknown Qwen variant: 128K-class is the common floor
 
-	// GLM / ZhipuAI (Anthropic- or OpenAI-compatible hosts)
+	// GLM / ZhipuAI (Anthropic- or OpenAI-compatible hosts). GLM-4.6 lifted the
+	// window from 128K to 200K and GLM-4.7 / GLM-5.x keep that 200K window
+	// (docs.z.ai/guides/llm: glm-4.6/4.7 Context Length 200K; the GLM-5 report
+	// extends mid-training to 200K, 202,752 max). GLM-4.5 and earlier are 128K.
+	"glm-5":   200_000,
+	"glm-4.7": 200_000,
 	"glm-4.6": 200_000,
 	"glm-4.5": 131_072,
 	"glm-4":   131_072,
 	"glm":     131_072,
 
-	// Kimi / Moonshot
+	// Kimi / Moonshot. K2.5/K2.6/K2.7 ship a 256K window (platform.kimi.ai:
+	// "kimi-k2.6, kimi-k2.5, ... all provide a 256K context window"; 256K =
+	// 262,144). The original K2 was 128K, so the bare floor stays 128K for an
+	// unknown/older variant.
+	"kimi-k2.7": 262_144,
+	"kimi-k2.6": 262_144,
+	"kimi-k2.5": 262_144,
 	"kimi":      131_072,
 	"moonshot":  131_072,
 
-	// DeepSeek
-	"deepseek": 131_072,
+	// MiniMax. M2/M2.1/M2.5/M2.7 are 204,800 tokens (platform.minimax.io;
+	// confirmed against OpenRouter). No public M3 window yet — fall to the M2-era
+	// floor, which never over-advertises if M3 turns out larger.
+	"minimax": 204_800,
+
+	// DeepSeek. V3.x and R1 are 128K; V4-Pro/V4-Flash jump to 1M (vendor model
+	// card: "both supporting a context length of one million tokens"). The bare
+	// floor stays 128K for V3/R1 and any unknown variant. NOTE: the codebuddy-cn
+	// reseller gateway may enforce a lower cap than the native 1M; a live
+	// tokenLimits value would override this, but cbcn serves no /models route.
+	"deepseek-v4": 1_000_000,
+	"deepseek":    131_072,
+
+	// Tencent Hunyuan. Instruct/chat serving is documented up to 128K (the larger
+	// 256K figure is the pretrained-only ceiling), so 128K is the safe
+	// advertised floor for the hunyuan-chat / hy3 ids the CN gateway serves.
+	"hunyuan": 131_072,
+	"hy3":     131_072,
 }
 
 // familyContextWindowFor returns the documented fallback context window for a
