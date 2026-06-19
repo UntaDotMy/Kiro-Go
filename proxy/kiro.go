@@ -1266,6 +1266,15 @@ const defaultContextWindow = 200_000
 // This is a fallback only: when Kiro reports tokenLimits for the model, that
 // authoritative value wins and this function is never reached.
 func getContextWindowSize(model string) int {
+	// A prefix-routed id ("cbcn/glm-5.2", "or/anthropic/...") must resolve on its
+	// UPSTREAM model, not the literal prefixed string: "cbcn/glm-5.2" matches no
+	// Claude version parse and no family prefix, so it would fall to the flat
+	// Kiro default (200K) and a real GLM 128K request would over-report its
+	// context window. ParseModelBackend strips the provider prefix (and leaves an
+	// unprefixed Kiro id untouched), so the resolution below sees "glm-5.2".
+	if _, upstream := ParseModelBackend(model); upstream != model {
+		model = upstream
+	}
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}
@@ -1301,10 +1310,17 @@ func isLargeContextModel(model string) bool {
 		}
 		return false
 	}
-	// Fallback for ids that don't match the family-version shape.
-	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
-		if strings.Contains(m, tag) {
-			return true
+	// Substring fallback for non-standard CLAUDE ids that parseClaudeVersion
+	// can't split. It is gated to Claude-family ids: a non-Claude provider model
+	// whose name merely CONTAINS a Claude-looking version token (e.g. GLM's
+	// "glm-4.7", which has a documented 200K window, not 1M) must NOT be misread
+	// as a 1M Claude — that id is resolved by the per-family table instead.
+	if strings.Contains(m, "claude") || strings.Contains(m, "opus") ||
+		strings.Contains(m, "sonnet") || strings.Contains(m, "haiku") {
+		for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
+			if strings.Contains(m, tag) {
+				return true
+			}
 		}
 	}
 	return false
