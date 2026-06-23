@@ -182,8 +182,16 @@ func TestCallKiroAPIReturnsUpstreamStreamReset(t *testing.T) {
 
 	cause := &http2.StreamError{Code: http2.ErrCodeInternal, StreamID: 7}
 	prevStore := kiroHttpStore.Load()
-	kiroHttpStore.Store(&http.Client{Transport: &streamResetRoundTripper{err: cause}})
-	t.Cleanup(func() { kiroHttpStore.Store(prevStore) })
+	stubClient := &http.Client{Transport: &streamResetRoundTripper{err: cause}}
+	kiroHttpStore.Store(stubClient)
+	prevPool := kiroHttpPool.Load()
+	kiroHttpPool.Store([]*http.Client{stubClient})
+	t.Cleanup(func() {
+		kiroHttpStore.Store(prevStore)
+		if prevPool != nil {
+			kiroHttpPool.Store(prevPool)
+		}
+	})
 
 	// swapKiroEndpoints requires exactly 3 URLs; the other two are
 	// empty-200 no-ops since our stub transport short-circuits.
