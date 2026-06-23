@@ -64,6 +64,7 @@ var brandProfiles = map[string]*brandProfile{
 	"codebuddy":    {replacer: tencentReplacer(), moderateContent: true},
 	"codebuddy-ai": {replacer: tencentReplacer(), moderateContent: true},
 	"codebuddy-cn": {replacer: tencentReplacer(), moderateContent: true},
+	"rcodebuddycn": {replacer: tencentReplacer(), moderateContent: true},
 	"qoder": {replacer: strings.NewReplacer(
 		"Anthropic's official CLI for Claude", "Qoder's official CLI",
 		"Claude Code", "Qoder",
@@ -150,6 +151,18 @@ func neutralizeProviderBody(body []byte, backend string) []byte {
 	}
 	profile := brandProfileFor(backend)
 
+	if sys, ok := root["system"]; ok {
+		if s, ok := sys.(string); ok {
+			if isClaudeCodeSystemPrompt(s) {
+				root["system"] = neutralizeHarness(s, backend)
+			} else if profile.moderateContent {
+				root["system"] = neutralizeBrandValue(s, profile)
+			}
+		} else if profile.moderateContent {
+			root["system"] = neutralizeBrandValue(sys, profile)
+		}
+	}
+
 	if msgs, ok := root["messages"].([]interface{}); ok {
 		for _, m := range msgs {
 			msg, ok := m.(map[string]interface{})
@@ -158,6 +171,15 @@ func neutralizeProviderBody(body []byte, backend string) []byte {
 			}
 			role, _ := msg["role"].(string)
 			if role == "system" || role == "developer" {
+				// Rewrite the non-standard "developer" role to the universally
+				// accepted "system" role so that upstream providers (notably
+				// Chinese gateways with active content moderation) do not flag
+				// or reject the request on role alone.  The semantic meaning is
+				// identical — both carry developer/system instructions — and
+				// "system" is the role every OpenAI-compatible backend expects.
+				if role == "developer" {
+					msg["role"] = "system"
+				}
 				if s, ok := msg["content"].(string); ok {
 					if isClaudeCodeSystemPrompt(s) {
 						msg["content"] = neutralizeHarness(s, backend)
