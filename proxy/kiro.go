@@ -177,6 +177,17 @@ const (
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
 
+// kiroHttpPool is a round-robin pool of HTTP clients for the Kiro (and
+// non-proxy) path. Each client owns its own http.Transport, which maintains
+// separate TCP connections. When 50 concurrent requests arrive, they spread
+// across 10 transports × N TCP connections instead of all jamming onto one
+// HTTP/2 connection — eliminating the "timeout awaiting response headers"
+// bottleneck that occurs when streams pile up on a single socket.
+var (
+	kiroHttpPool atomic.Value // []*http.Client
+	kiroPoolIdx  atomic.Uint64
+)
+
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
@@ -185,9 +196,14 @@ func init() {
 }
 
 // GetClientForProxy returns an http.Client configured for the given proxy URL.
-// If proxyURL is empty, returns the global kiro HTTP client.
+// If proxyURL is empty, returns the next client from the round-robin pool
+// (spreading concurrent requests across multiple TCP connections).
 func GetClientForProxy(proxyURL string) *http.Client {
 	if proxyURL == "" {
+		if pool, ok := kiroHttpPool.Load().([]*http.Client); ok && len(pool) > 0 {
+			idx := kiroPoolIdx.Add(1) - 1
+			return pool[idx%uint64(len(pool))]
+		}
 		return kiroHttpStore.Load()
 	}
 	if cached, ok := proxyClientCache.Load(proxyURL); ok {
@@ -340,6 +356,8 @@ func enableHTTP2Pings(t *http.Transport) (*http2.Transport, error) {
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
+	const poolSize = 10
+
 	client := &http.Client{
 		// No Timeout: streaming bodies handle their own idle timeout
 		// (idleTimeoutReader). ResponseHeaderTimeout in the transport
@@ -347,6 +365,16 @@ func InitKiroHttpClient(proxyURL string) {
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
+
+	clients := make([]*http.Client, poolSize)
+	clients[0] = client
+	for i := 1; i < poolSize; i++ {
+		clients[i] = &http.Client{
+			Transport: buildKiroTransport(proxyURL),
+		}
+	}
+	kiroHttpPool.Store(clients)
+	kiroPoolIdx.Store(0)
 
 	restClient := &http.Client{
 		Timeout:   restRequestTimeout,
