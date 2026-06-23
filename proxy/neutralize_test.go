@@ -301,3 +301,150 @@ func TestNeutralizeBodyStripsDisclaimerOnModeratedBackendOnly(t *testing.T) {
 		t.Errorf("non-moderated backend must keep disclaimer verbatim:\n%s", kiro)
 	}
 }
+
+func TestNeutralizeProviderBodyAnthropicTopLevelSystemUsesHarnessPath(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	body := map[string]interface{}{
+		"model":  "glm-5.2",
+		"system": neutralizeHarnessSample,
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": "hello"},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	out := neutralizeProviderBody(raw, "codebuddy-cn")
+	var got map[string]interface{}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	sys, _ := got["system"].(string)
+	if !strings.Contains(sys, "Do software engineering tasks.") {
+		t.Fatalf("system contract lost: %s", sys)
+	}
+	if strings.Contains(strings.ToLower(sys), "claude") || strings.Contains(strings.ToLower(sys), "anthropic") {
+		t.Fatalf("top-level system still contains blocked brand tokens: %s", sys)
+	}
+	if strings.Contains(sys, "x-anthropic-billing-header") {
+		t.Fatalf("top-level system still contains billing header: %s", sys)
+	}
+}
+
+func TestNeutralizeProviderBodyCustomCodeBuddyAliasUsesModeratedProfile(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	body := map[string]interface{}{
+		"model": "glm-5.2",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "system", "content": moderationCatalogSample},
+			map[string]interface{}{"role": "user", "content": "hi"},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	out := string(neutralizeProviderBody(raw, "rcodebuddycn"))
+	for _, trig := range []string{"attacker", "red-team", "exploit", "adversarially"} {
+		if strings.Contains(strings.ToLower(out), strings.ToLower(trig)) {
+			t.Fatalf("trigger %q survived on rcodebuddycn alias:\n%s", trig, out)
+		}
+	}
+}
+
+func TestNeutralizeProviderBodyDeveloperRoleRewrittenToSystem(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	body := map[string]interface{}{
+		"model": "glm-5.2",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "developer", "content": "You are a coding assistant."},
+			map[string]interface{}{"role": "user", "content": "hello"},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	out := neutralizeProviderBody(raw, "rcodebuddycn")
+	var got map[string]interface{}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	msgs, ok := got["messages"].([]interface{})
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %v", got["messages"])
+	}
+	first, _ := msgs[0].(map[string]interface{})
+	role, _ := first["role"].(string)
+	if role != "system" {
+		t.Fatalf("developer role not rewritten to system; got %q", role)
+	}
+	if strings.Contains(string(out), `"developer"`) {
+		t.Fatalf("output still contains literal \"developer\": %s", string(out))
+	}
+}
+
+func TestNeutralizeProviderBodyDeveloperRoleRewrittenForAnyBackend(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	body := map[string]interface{}{
+		"model": "glm-5.2",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "developer", "content": "You are a coding assistant."},
+			map[string]interface{}{"role": "user", "content": "hello"},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	for _, backend := range []string{"rcodebuddycn", "codebuddy-cn", "random-unknown-chinese-provider"} {
+		out := neutralizeProviderBody(raw, backend)
+		var got map[string]interface{}
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("unmarshal output for backend %q: %v", backend, err)
+		}
+		msgs, _ := got["messages"].([]interface{})
+		first, _ := msgs[0].(map[string]interface{})
+		role, _ := first["role"].(string)
+		if role != "system" {
+			t.Fatalf("backend %q: developer role not rewritten to system; got %q", backend, role)
+		}
+	}
+}
+
+func TestNeutralizeProviderBodySystemRoleNotChanged(t *testing.T) {
+	enableFiltersForNeutralize(t)
+
+	body := map[string]interface{}{
+		"model": "glm-5.2",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "system", "content": "You are a coding assistant."},
+			map[string]interface{}{"role": "user", "content": "hello"},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	out := neutralizeProviderBody(raw, "rcodebuddycn")
+	var got map[string]interface{}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	msgs, _ := got["messages"].([]interface{})
+	first, _ := msgs[0].(map[string]interface{})
+	role, _ := first["role"].(string)
+	if role != "system" {
+		t.Fatalf("system role should not be changed; got %q", role)
+	}
+}
