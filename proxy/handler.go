@@ -1304,7 +1304,16 @@ func buildModelInfo(id, ownedBy string, supportsImage bool, contextWindow int) m
 	}
 	supportsExtendedThinking := thinkingSuffix != "" && strings.HasSuffix(id, thinkingSuffix)
 	if contextWindow <= 0 {
-		contextWindow = getContextWindowSize(id)
+		// Static dictionary first (precise per-model windows for OpenAI/Gemini/
+		// Anthropic/Grok/DeepSeek/GLM/MiMo/MiniMax + CLI provider ids), then the
+		// Claude version parse + family table. A prefixed id ("cbcn/glm-5.2") is
+		// de-prefixed inside staticContextWindowForModel so non-Kiro provider
+		// models advertise their real window instead of the flat 200K default.
+		if w := staticContextWindowForModel(id); w > 0 {
+			contextWindow = w
+		} else {
+			contextWindow = getContextWindowSize(id)
+		}
 	}
 	maxOutputTokens := 8192
 	if strings.Contains(strings.ToLower(id), "opus") {
@@ -1520,6 +1529,22 @@ func (h *Handler) refreshModelsCache() {
 				}
 			}()
 			var lastErr error
+			// Static-only backends (no working GET /models endpoint — e.g. CodeBuddy,
+			// CodeBuddy-CN, iFlow, Perplexity, the Alibaba "alicode" hosts) ship a
+			// hardcoded advisory catalog. A live /models fetch will always 404/error
+			// for them, so re-fetching every background tick just wastes a network
+			// round-trip and re-logs the same advisory fallback. Seed the static
+			// catalog directly; quota is refreshed separately by refreshAllAccounts.
+			if backendShipsStaticCatalog(unit.backend) {
+				if ps, ok := resolveProviderSettings(unit.candidates[0]); ok && len(ps.models) > 0 {
+					models := make([]ModelInfo, 0, len(ps.models))
+					for _, id := range ps.models {
+						models = append(models, ModelInfo{ModelId: id})
+					}
+					results[i] = unitResult{models: models, modelIDs: ps.models, seedIDs: unit.seedIDs, backend: unit.backend, advisory: true}
+					return
+				}
+			}
 			for _, account := range unit.candidates {
 				if err := h.ensureValidToken(account); err != nil {
 					lastErr = fmt.Errorf("token refresh failed: %w", err)
@@ -1803,13 +1828,25 @@ func (h *Handler) effortLevelsForModel(modelID string) []string {
 		return nil
 	}
 	h.modelsCacheMu.RLock()
-	defer h.modelsCacheMu.RUnlock()
 	for i := range h.cachedModels {
 		if strings.ToLower(strings.TrimSpace(h.cachedModels[i].ModelId)) == key {
-			return modelEffortLevels(h.cachedModels[i].AdditionalModelRequestFieldsSchema)
+			// The model IS in the live cache. Its schema is authoritative — even an
+		// empty schema means the upstream explicitly advertises no effort
+		// support (e.g. Haiku 4.5 on the Kiro backend), so do NOT fall back to
+		// the static dictionary here.
+			levels := modelEffortLevels(h.cachedModels[i].AdditionalModelRequestFieldsSchema)
+			h.modelsCacheMu.RUnlock()
+			return levels
 		}
 	}
-	return nil
+	h.modelsCacheMu.RUnlock()
+	// The model is NOT in the live cache: this is a non-Kiro provider model
+	// (codebuddy-cn/glm-5.2, grok-4, gpt-5-codex, ...) or the post-restart
+	// window before the first models refresh. Fall back to the static dictionary
+	// so a graded effort request is satisfied (or at least engaged as thinking)
+	// instead of warn-dropped with a false "no effort support" message. Returns
+	// nil when the model has no graded knob.
+	return staticEffortLevelsForModel(modelID)
 }
 
 // contextWindowForModel resolves the authoritative context window (in tokens)
@@ -1836,6 +1873,13 @@ func (h *Handler) contextWindowForModel(model string) int {
 			}
 		}
 		h.modelsCacheMu.RUnlock()
+	}
+	// Non-Kiro provider models and the post-restart window miss the live
+	// tokenLimits cache. Fall back to the static per-model / per-family
+	// dictionary (covers OpenAI, Gemini, Anthropic, Grok, DeepSeek, GLM, MiMo,
+	// MiniMax, and the CLI provider model ids) before the Claude version parse.
+	if w := staticContextWindowForModel(model); w > 0 {
+		return w
 	}
 	return getContextWindowSize(model)
 }

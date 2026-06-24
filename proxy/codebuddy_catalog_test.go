@@ -68,6 +68,24 @@ func TestCodeBuddyModelsAdvisory(t *testing.T) {
 	}
 }
 
+// TestBackendShipsStaticCatalog pins that no-/models backends are flagged as
+// static-only so the background model refresh skips re-fetching their catalog
+// (a live GET /models would always 404 and just re-log the advisory fallback).
+// Only quota is refreshed for these backends.
+func TestBackendShipsStaticCatalog(t *testing.T) {
+	for _, b := range []string{"codebuddy", "codebuddy-ai", "codebuddy-cn", "perplexity", "iflow", "alicode", "alicode-intl"} {
+		if !backendShipsStaticCatalog(b) {
+			t.Errorf("backend %q should be flagged static-only (it has no working /models endpoint)", b)
+		}
+	}
+	// Backends WITH a working /models endpoint must NOT be flagged.
+	for _, b := range []string{"openai", "openrouter", "groq", "deepseek", "anthropic", "gemini", "dashscope"} {
+		if backendShipsStaticCatalog(b) {
+			t.Errorf("backend %q should NOT be flagged static-only (it has a working /models endpoint)", b)
+		}
+	}
+}
+
 // TestCodeBuddyRoutingPrefix confirms both the id and alias route to the backend
 // so "cb/..." and "codebuddy/..." both reach CodeBuddy.
 func TestCodeBuddyRoutingPrefix(t *testing.T) {

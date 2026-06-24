@@ -61,15 +61,20 @@ var familyContextWindow = map[string]int{
 	"qwen":        131_072, // unknown Qwen variant: 128K-class is the common floor
 
 	// GLM / ZhipuAI (Anthropic- or OpenAI-compatible hosts). GLM-4.6 lifted the
-	// window from 128K to 200K and GLM-4.7 / GLM-5.x keep that 200K window
-	// (docs.z.ai/guides/llm: glm-4.6/4.7 Context Length 200K; the GLM-5 report
-	// extends mid-training to 200K, 202,752 max). GLM-4.5 and earlier are 128K.
-	"glm-5":   200_000,
-	"glm-4.7": 200_000,
-	"glm-4.6": 200_000,
-	"glm-4.5": 131_072,
-	"glm-4":   131_072,
-	"glm":     131_072,
+	// window from 128K to 200K and GLM-4.7 / GLM-5 / GLM-5.1 / GLM-5-Turbo keep that
+	// 200K window (docs.z.ai/guides/llm spec tables). GLM-5.2 is the 1M-window
+	// flagship ("truly usable 1M-token context"); it MUST be listed before the
+	// bare "glm-5" prefix so longest-prefix match picks 1M, not 200K. GLM-4.5 and
+	// earlier are 128K.
+	"glm-5.2":     1_000_000,
+	"glm-5.1":     200_000,
+	"glm-5-turbo": 200_000,
+	"glm-5":       200_000,
+	"glm-4.7":     200_000,
+	"glm-4.6":     200_000,
+	"glm-4.5":     131_072,
+	"glm-4":       131_072,
+	"glm":         131_072,
 
 	// Kimi / Moonshot. K2.5/K2.6/K2.7 ship a 256K window (platform.kimi.ai:
 	// "kimi-k2.6, kimi-k2.5, ... all provide a 256K context window"; 256K =

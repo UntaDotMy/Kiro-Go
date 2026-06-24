@@ -33,14 +33,15 @@ func TestGetContextWindowSize(t *testing.T) {
 		{"claude-haiku-4-5", defaultContextWindow},
 		{"claude-3-5-sonnet", defaultContextWindow},
 		// Provider-prefixed ids resolve on the UPSTREAM model, not the literal
-		// prefixed string: a cbcn/glm-5.2 request must read GLM-5.2's real 200K
-		// window, and a 128K cbcn/glm-4.5 must read 128K — not the flat Kiro
-		// default that the un-stripped id would have fallen through to.
-		{"cbcn/glm-5.2", 200_000},
+		// prefixed string. GLM windows verified from docs.z.ai/guides/llm spec
+		// tables: GLM-5.2 = 1M ("truly usable 1M-token context"), GLM-4.6/4.7/
+		// 5/5.1/5-Turbo = 200K, GLM-4.5 = 128K. A 128K cbcn/glm-4.5 must read
+		// 128K — not the flat Kiro default the un-stripped id would fall through to.
+		{"cbcn/glm-5.2", 1_000_000},
 		{"cbcn/glm-4.7", 200_000},
 		{"cbcn/glm-4.6", 200_000},
 		{"cbcn/glm-4.5", 131_072},
-		{"glm-5.2", 200_000},
+		{"glm-5.2", 1_000_000},
 		{"glm-5.0", 200_000},
 		// Other cbcn families resolve to their documented vendor window, not the
 		// flat Kiro default the un-stripped prefixed id would have hit.

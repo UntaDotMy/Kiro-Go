@@ -305,6 +305,31 @@ func resolveBuiltinProvider(id string) (builtinProvider, bool) {
 	return bp, ok
 }
 
+// backendShipsStaticCatalog reports whether a backend id resolves to a provider
+// that has NO working GET /models endpoint and therefore ships a hardcoded
+// advisory catalog (builtinProvider.Models). For these backends a live /models
+// fetch will always 404/error, so the background model refresh must NOT keep
+// hitting the upstream every tick — it just wastes a network round-trip and
+// re-logs the same advisory fallback. The static list is seeded once (on add /
+// cold start); thereafter only quota is refreshed.
+//
+// For a built-in catalog entry, a non-empty Models field IS the signal: it is
+// populated only for no-/models providers (see provider_catalog.go comments).
+// For a user-defined config.ProviderConfig we require Models AND NOT FetchModels
+// — a config that pins Models as extra ids but also sets FetchModels has a
+// working /models endpoint whose live list is unioned with the pinned ids, so we
+// must keep refreshing it.
+func backendShipsStaticCatalog(backend string) bool {
+	key := strings.ToLower(strings.TrimSpace(backend))
+	if bp, ok := builtinByID[key]; ok && len(bp.Models) > 0 {
+		return true
+	}
+	if pc, ok := config.GetProviderConfig(key); ok && len(pc.Models) > 0 && !pc.FetchModels {
+		return true
+	}
+	return false
+}
+
 // dialectFor resolves the wire dialect for a backend id: a built-in catalog
 // entry's Dialect, or a user-defined config.ProviderConfig's dialect, or "" if
 // unknown.
