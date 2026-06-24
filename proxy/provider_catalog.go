@@ -327,6 +327,15 @@ func backendShipsStaticCatalog(backend string) bool {
 	if pc, ok := config.GetProviderConfig(key); ok && len(pc.Models) > 0 && !pc.FetchModels {
 		return true
 	}
+	// Self-contained custom account (backend id is its own routing prefix):
+	// the static catalog lives on the account as CustomModels. Custom accounts
+	// have no FetchModels toggle, so a non-empty CustomModels IS the static-only
+	// signal — skip the pointless live /models fetch that always 404s. The
+	// sibling lookup (GetCustomAccountByBackend) covers bulk-added keys on the
+	// same backend whose inline fields live on the first-added sibling.
+	if acct, ok := config.GetCustomAccountByBackend(key); ok && len(acct.CustomModels) > 0 {
+		return true
+	}
 	return false
 }
 
