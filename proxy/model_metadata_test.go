@@ -140,3 +140,36 @@ func TestEffortLevelsForModelFallsBackToStaticDictWhenNotCached(t *testing.T) {
 		t.Errorf("non-cached gpt-4o has no effort knob, want nil, got %v", got)
 	}
 }
+
+// TestModelIsKnownNoKnob pins the binary-thinking / no-graded-knob classifier
+// used by applyReasoningEffort to keep GLM/DeepSeek requests SILENT (Debug)
+// instead of warning every request. A graded request for these models engages
+// the thinking on/off path by design — the warning is noise.
+func TestModelIsKnownNoKnob(t *testing.T) {
+	for _, m := range []string{
+		"glm-5.2", "glm-5.1", "glm-4.7", "glm-4.6", // GLM family (binary thinking)
+		"rcodebuddycn/glm-5.2",                       // prefixed client id
+		"deepseek-r1", "deepseek-reasoner",           // DeepSeek always-on CoT
+		"deepseek-v4-pro", "deepseek-chat",
+		"cbcn/deepseek-v4-pro",                       // prefixed
+	} {
+		if !modelIsKnownNoKnob(stripRoutingPrefix(m)) {
+			t.Errorf("modelIsKnownNoKnob(%q) = false, want true (known binary/no-knob thinker)", m)
+		}
+	}
+	// Models WITH a graded knob, or genuinely unknown, must NOT be classified
+	// as no-knob (so the transient-miss warning still fires for them).
+	for _, m := range []string{
+		"grok-4",            // has graded effort
+		"gpt-5",             // has graded effort
+		"claude-opus-4-7",   // has graded effort
+		"gemini-2.5-pro",    // has (proxy) graded effort
+		"gpt-4o",            // unknown to the no-knob set
+		"totally-unknown-xyz",
+		"",
+	} {
+		if modelIsKnownNoKnob(stripRoutingPrefix(m)) {
+			t.Errorf("modelIsKnownNoKnob(%q) = true, want false", m)
+		}
+	}
+}
