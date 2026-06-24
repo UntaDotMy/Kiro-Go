@@ -1,55 +1,66 @@
 ## Problem
-After PR #47, the background refresh still logged every 5 minutes for a
-custom-account reseller backend:
+Every request to a GLM or DeepSeek model with a graded effort (e.g.
+`xhigh`) logged a WARN:
 
 ```
-INFO [rcodebuddycn] /models fetch failed (HTTP 404 from https://dpc-tcb.chicross.cn/api/v2/models); using static catalog of 5 models (advisory)
+WARN [Effort] Requested "xhigh" for model "rcodebuddycn/glm-5.2" but it advertises no effort support (or the model cache has not been populated yet) — sending WITHOUT graded effort, falling back to thinking on/off
 ```
 
-The static-catalog skip added in #47 was meant to kill exactly this noise,
-but it never fired for `rcodebuddycn`.
+…every single request, forever. The message reads like a transient
+post-restart cache-miss, but for GLM/DeepSeek it's the **steady state**.
 
 ## Root cause
-`backendShipsStaticCatalog()` only checked:
-1. builtin catalog entries with a non-empty `Models` field, and
-2. user `ProviderConfig`s with `Models` AND NOT `FetchModels`.
+GLM and DeepSeek have **no graded `reasoning_effort` knob** (verified from
+official docs in PR #47):
 
-It missed the **self-contained custom-account** path: a user-added account
-whose `backend` id is its own routing prefix and whose pinned model list
-lives INLINE on the account as `CustomModels` (no shared `ProviderConfig`,
-no builtin catalog row). That's exactly the shape of a reseller endpoint
-like `rcodebuddycn -> dpc-tcb.chicross.cn`:
+- **GLM** (`docs.z.ai/guides/capabilities/thinking-mode`): binary
+  `thinking:{type:enabled|disabled}` toggle.
+- **DeepSeek** (`api-docs.deepseek.com/guides/reasoning_model`): always-on
+  CoT via `reasoning_content`.
 
-```json
-{
-  "backend": "rcodebuddycn",
-  "baseURLOverride": "https://dpc-tcb.chicross.cn/api/v2",
-  "customDialect": "openai",
-  "customModels": ["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "minimax-m3", "kimi-k2.7"]
-}
-```
+So the static effort dict (`modelEffortDict` in `model_metadata.go`)
+deliberately has **no** GLM/DeepSeek entry. When `applyReasoningEffort`
+can't map the requested level, `len(levels)==0` and it fires the WARN.
 
-So `backendShipsStaticCatalog("rcodebuddycn")` returned false → the
-fast-path in `refreshModelsCache` was never entered → the live
-`FetchModelsForAccount` ran, 404'd, and re-logged the advisory fallback
-every tick.
+But this is the **intended path**, not a bug: `resolveThinkingWithEffort`
+runs *before* `applyReasoningEffort` and correctly engages thinking on/off
+for `low/medium/high/xhigh/max`. The request is handled correctly — the
+warning is pure noise.
 
 ## Fix
-Extend `backendShipsStaticCatalog` to also return true when
-`config.GetCustomAccountByBackend(backend)` yields an account with a
-non-empty `CustomModels`. Custom accounts have no `FetchModels` toggle, so
-a pinned `CustomModels` list IS the static-only signal. The sibling lookup
-in `GetCustomAccountByBackend` covers bulk-added keys whose inline fields
-live on the first-added sibling.
+Add a data-driven set of known binary-thinking / no-graded-knob model
+families:
+
+- `modelNoEffortKnob` — `{glm-*, glm-4*, deepseek-r*, deepseek-reasoner,
+  deepseek-v*, deepseek}` (longest-prefix matched, lower-cased).
+- `modelIsKnownNoKnob(upstreamModel)` — the classifier.
+
+In `applyReasoningEffort`, when a graded request can't be mapped AND
+`len(levels)==0`:
+- **known no-knob model** → `logger.Debugf` (silent; thinking path
+  engaged correctly).
+- **genuinely unrecognized model** → keep the `Warnf` (real transient
+  post-restart cache-miss case still surfaces).
+
+The de-prefixed upstream id is passed to the classifier
+(`stripRoutingPrefix(modelID)`), so `rcodebuddycn/glm-5.2` resolves to
+`glm-5.2` → matches `glm-5`.
+
+## Behavior after fix
+- `xhigh` on `rcodebuddycn/glm-5.2`: thinking engages (unchanged), no
+  WARN. Stats `effort=none` is correct — no graded level is forwarded
+  because GLM has no `output_config.effort` field.
+- `xhigh` on a truly unknown model (e.g. a brand-new model before the
+  first models refresh): WARN still fires.
 
 ## Tests
-- `TestBackendShipsStaticCatalogCustomAccount` — the rcodebuddycn shape
-  (5-model custom account) is now flagged static-only.
-- `TestBackendShipsStaticCatalogCustomAccountNoModels` — a custom account
-  with NO `CustomModels` is NOT flagged (it needs the live fetch).
-- Existing `TestBackendShipsStaticCatalog` (builtins) still passes.
+- `TestModelIsKnownNoKnob` — GLM/DeepSeek (incl. prefixed
+  `rcodebuddycn/glm-5.2`, `cbcn/deepseek-v4-pro`) classify as no-knob;
+  grok/gpt-5/claude/gemini/gpt-4o/unknown do NOT.
+- Existing effort tests unchanged.
 - `go build`, `go vet`, `go test ./...` all green.
 
 ## Files
-- `proxy/provider_catalog.go` — extend `backendShipsStaticCatalog`
-- `proxy/codebuddy_catalog_test.go` — two new tests
+- `proxy/model_metadata.go` — `modelNoEffortKnob` + `modelIsKnownNoKnob`
+- `proxy/handler.go` — `applyReasoningEffort` Debug-vs-Warn split
+- `proxy/model_metadata_test.go` — `TestModelIsKnownNoKnob`
