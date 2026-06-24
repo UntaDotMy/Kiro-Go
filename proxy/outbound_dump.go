@@ -97,3 +97,51 @@ func dumpRandHex(n int) string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// boundedBuffer is a goroutine-unsafe byte buffer that caps total capacity:
+// writes past the cap are dropped (not errored), keeping the most recent bytes
+// when the cap is exceeded. It implements io.Writer for use as an io.TeeReader
+// sink so a raw upstream SSE stream can be captured for diagnosis without
+// risking unbounded memory on a long generation. Bytes() returns a copy safe
+// to hand to dumpUpstreamResponse after the stream ends.
+type boundedBuffer struct {
+	cap   int
+	buf   []byte
+	dropped int
+}
+
+// newBoundedBuffer returns a buffer that holds at most capBytes bytes; once full
+// it evicts the oldest data to make room for new writes (ring-style) so the
+// TAIL of a long stream is preserved (the tail is where truncation/completion
+// behavior is most visible).
+func newBoundedBuffer(capBytes int) *boundedBuffer {
+	if capBytes <= 0 {
+		capBytes = 1 << 20
+	}
+	return &boundedBuffer{cap: capBytes, buf: make([]byte, 0, capBytes)}
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if len(b.buf)+n <= b.cap {
+		b.buf = append(b.buf, p...)
+		return n, nil
+	}
+	// Over cap: keep the most recent b.cap bytes. Append what fits after evicting
+	// the oldest excess.
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.cap {
+		evict := len(b.buf) - b.cap
+		b.dropped += evict
+		// Copy the tail to the front and reslice.
+		copy(b.buf, b.buf[evict:])
+		b.buf = b.buf[:b.cap]
+	}
+	return n, nil
+}
+
+// Bytes returns the captured bytes (the buffer's own slice; do not retain across
+// further writes). Caller may pass it to dumpUpstreamResponse.
+func (b *boundedBuffer) Bytes() []byte {
+	return b.buf
+}

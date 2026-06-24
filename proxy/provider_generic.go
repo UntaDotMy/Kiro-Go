@@ -430,8 +430,24 @@ func (g *genericProvider) Call(ctx context.Context, acct *config.Account, nr *No
 
 	streamErr := func() error {
 		defer resp.Body.Close()
-		body := newIdleTimeoutReader(resp.Body, streamIdleTimeout, func() {})
-		return g.parseStream(ps, body, cb)
+		var body io.Reader = newIdleTimeoutReader(resp.Body, streamIdleTimeout, func() {})
+		// Diagnostic capture: when debug capture is on (admin Debug Mode or
+		// CODEBUDDY_CN_DUMP), tee the RAW upstream SSE into a bounded buffer and
+		// dump it after the stream ends. This is what makes a mid-stream
+		// truncation / burst-delivery regression diagnosable for ANY generic
+		// provider (grok/deepseek/glm/...), not just codebuddy-cn: the exact
+		// bytes the parser saw — including any gzip-deflate block boundaries or
+		// out-of-order content/finish chunks — are preserved for inspection.
+		var captured *boundedBuffer
+		if debugCaptureDir() != "" {
+			captured = newBoundedBuffer(8 << 20) // 8 MiB cap; long streams keep the tail
+			body = io.TeeReader(body, captured)
+		}
+		parseErr := g.parseStream(ps, body, cb)
+		if captured != nil {
+			dumpUpstreamResponse(ps.id, captured.Bytes())
+		}
+		return parseErr
 	}()
 	return classifyStreamError(streamErr)
 }
