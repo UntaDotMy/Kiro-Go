@@ -191,6 +191,33 @@ var (
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
+// closeIdleKiroConnections purges idle HTTP/2 connections from the transport
+// pool. When the upstream server sends an INTERNAL_ERROR RST_STREAM, the TCP
+// connection may still be valid but the HTTP/2 stream state is corrupted. Force
+// fresh TCP/TLS handshakes for the next request by evicting all idle keep-alive
+// connections across the streaming pool, REST client, and proxy-cached clients.
+// Active/in-flight connections are unaffected.
+func closeIdleKiroConnections() {
+	if c := kiroHttpStore.Load(); c != nil {
+		c.CloseIdleConnections()
+	}
+	if c := kiroRestHttpStore.Load(); c != nil {
+		c.CloseIdleConnections()
+	}
+	proxyClientCache.Range(func(key, value any) bool {
+		if client, ok := value.(*http.Client); ok {
+			client.CloseIdleConnections()
+		}
+		return true
+	})
+	// Also flush the round-robin pool.
+	if pool, ok := kiroHttpPool.Load().([]*http.Client); ok {
+		for _, c := range pool {
+			c.CloseIdleConnections()
+		}
+	}
+}
+
 func init() {
 	InitKiroHttpClient("")
 }

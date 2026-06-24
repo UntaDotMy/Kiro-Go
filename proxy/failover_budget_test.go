@@ -3,9 +3,10 @@ package proxy
 import "testing"
 
 // Story s5: the per-request failover budget must scale to the addressable pool
-// — min(eligibleAccounts, maxFailoverAttempts), floored at minFailoverAttempts —
-// instead of a fixed cap of 3, so a burst of dead accounts in a large pool no
-// longer surfaces a 503/429 while healthy accounts go untried.
+// — min(eligibleAccounts, maxFailoverAttempts) — instead of a fixed cap of 3,
+// so a burst of dead accounts in a large pool no longer surfaces a 503/429
+// while healthy accounts go untried. With only 1 eligible account, rotating is
+// meaningless and just wastes latency on retries, so budget = 1.
 
 func TestFailoverBudgetScalesToPool(t *testing.T) {
 	cases := []struct {
@@ -14,10 +15,10 @@ func TestFailoverBudgetScalesToPool(t *testing.T) {
 		wantMin int // budget must be at least this
 		wantMax int // and at most this
 	}{
-		// Small pool: floored at minFailoverAttempts (historical headroom).
-		{"single account floored", []string{"a"}, minFailoverAttempts, minFailoverAttempts},
-		{"two accounts floored", []string{"a", "b"}, minFailoverAttempts, minFailoverAttempts},
-		{"exactly floor", []string{"a", "b", "c"}, minFailoverAttempts, minFailoverAttempts},
+		// Single/two accounts: budget tracks eligible count (no floor).
+		{"single account", []string{"a"}, 1, 1},
+		{"two accounts", []string{"a", "b"}, 2, 2},
+		{"three accounts", []string{"a", "b", "c"}, 3, 3},
 		// Mid pool: budget tracks the eligible count above the floor.
 		{"five accounts", []string{"a", "b", "c", "d", "e"}, 5, 5},
 		// Large pool: capped at the ceiling, not unbounded.
@@ -31,13 +32,8 @@ func TestFailoverBudgetScalesToPool(t *testing.T) {
 				t.Fatalf("failoverBudget for %d accounts = %d, want in [%d,%d]",
 					len(tc.ids), got, tc.wantMin, tc.wantMax)
 			}
-			// The budget must never exceed the ceiling, ever.
 			if got > maxFailoverAttempts {
 				t.Fatalf("budget %d exceeds ceiling %d", got, maxFailoverAttempts)
-			}
-			// The budget must never drop below the floor, ever.
-			if got < minFailoverAttempts {
-				t.Fatalf("budget %d below floor %d", got, minFailoverAttempts)
 			}
 		})
 	}
