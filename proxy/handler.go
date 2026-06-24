@@ -1950,12 +1950,21 @@ func (h *Handler) applyReasoningEffort(payload *KiroPayload, rawEffort string) s
 	level, ok := resolveModelEffort(rawEffort, levels)
 	if !ok {
 		if clientWantedGraded {
-			// The client asked for a graded level but none was forwarded. Make it
-			// visible: either the model advertises no effort schema (often the
-			// transient post-restart window before the first models refresh) or it
-			// supports effort but not even a lower tier than requested.
+			// The client asked for a graded level but none was forwarded. Two cases:
+			//  (a) the model is a KNOWN binary-thinking / no-graded-knob model (GLM,
+			//      DeepSeek-R1, ...) — the thinking on/off path already engaged via
+			//      resolveThinkingWithEffort, so this is the INTENDED path. Stay
+			//      quiet (Debug) instead of spamming a Warn every request.
+			//  (b) the model is genuinely unrecognized (not in the live cache and not
+			//      in the static dict) — often the transient post-restart window
+			//      before the first models refresh. Keep the Warn visible so a real
+			//      misconfiguration surfaces.
 			if len(levels) == 0 {
-				logger.Warnf("[Effort] Requested %q for model %q but it advertises no effort support (or the model cache has not been populated yet) — sending WITHOUT graded effort, falling back to thinking on/off", rawEffort, modelID)
+				if modelIsKnownNoKnob(stripRoutingPrefix(modelID)) {
+					logger.Debugf("[Effort] Requested %q for model %q; this model has no graded effort knob (binary thinking), engaging the thinking on/off path", rawEffort, modelID)
+				} else {
+					logger.Warnf("[Effort] Requested %q for model %q but it advertises no effort support (or the model cache has not been populated yet) — sending WITHOUT graded effort, falling back to thinking on/off", rawEffort, modelID)
+				}
 			} else {
 				logger.Warnf("[Effort] Requested %q for model %q but it could not be mapped to any supported level %v — sending WITHOUT graded effort", rawEffort, modelID, levels)
 			}

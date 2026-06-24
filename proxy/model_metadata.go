@@ -134,6 +134,50 @@ var modelEffortDict = map[string][]string{
 	"claude-haiku-4.5": {"low", "medium", "high", "max"},
 }
 
+// modelNoEffortKnob lists model families that are KNOWN to have NO graded
+// reasoning_effort knob — they use a binary thinking on/off toggle (or an
+// always-on CoT) instead. This is the data-driven counterpart to the "NOT
+// listed" comments above: a graded effort request for one of these models is
+// the INTENDED thinking path, not a missing-cache transient, so the caller
+// (applyReasoningEffort) MUST stay silent instead of emitting the
+// "advertises no effort support" warning every request.
+//
+// Entries are longest-prefix matched (lower-cased) against the de-prefixed
+// upstream id, same as modelEffortDict.
+var modelNoEffortKnob = map[string]bool{
+	// GLM / Zhipu (zai): binary thinking:{type:enabled|disabled} toggle
+	// (verified docs.z.ai/guides/capabilities/thinking-mode). GLM-4.6/4.7/5/5.1/
+	// 5-Turbo/5.2 all share this — no graded enum on any of them.
+	"glm-5": true,
+	"glm-4": true,
+	"glm":   true,
+
+	// DeepSeek: always-on CoT via reasoning_content; no reasoning_effort knob
+	// (verified api-docs.deepseek.com/guides/reasoning_model). Covers R1/reasoner
+	// and the v3.x reasoner variants.
+	"deepseek-r":       true,
+	"deepseek-reasoner": true,
+	"deepseek-v":       true, // deepseek-v4-pro/-flash route here; chat variants too
+	"deepseek":         true,
+}
+
+// modelIsKnownNoKnob reports whether the (de-prefixed, lower-cased) upstream
+// model id is a KNOWN binary-thinking / no-graded-knob model. Used by
+// applyReasoningEffort to distinguish "intended thinking path" (silent) from
+// "genuinely unrecognized model" (warn: maybe cache not populated yet).
+func modelIsKnownNoKnob(upstreamModel string) bool {
+	m := strings.ToLower(strings.TrimSpace(upstreamModel))
+	if m == "" {
+		return false
+	}
+	for prefix, ok := range modelNoEffortKnob {
+		if ok && strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // stripRoutingPrefix reduces a possibly-prefixed client model id to its
 // UPSTREAM model id for dictionary lookup. It first consults
 // ParseModelBackend (which knows every provider id/alias, including
