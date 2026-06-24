@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"time"
@@ -240,6 +241,14 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 		accepted = false
 		logger.Infof("[Failover] Account %s failed with retryable error (attempt %d/%d), rotating: %v",
 			redactForLog(account.Email), attempt+1, budget, workErr)
+		// On stream-reset errors (RST_STREAM, GOAWAY, connection lost), close
+		// idle connections to force fresh TCP/TLS handshakes for the next
+		// attempt. A stale or poisoned HTTP/2 connection can cause repeated
+		// failures even on a peer account sharing the same transport pool.
+		var sre *ErrUpstreamStreamReset
+		if errors.As(workErr, &sre) {
+			closeIdleKiroConnections()
+		}
 	}
 
 	recordTerminal()
@@ -247,23 +256,22 @@ func (h *Handler) runWithFailoverCountedBackend(backend, model, apiKeyID, effort
 }
 
 // failoverBudget sizes the per-request attempt budget to the addressable pool:
-// min(eligibleAccounts, maxFailoverAttempts), floored at minFailoverAttempts.
-// This replaces the old fixed cap of 3 so a large pool doesn't surface a 503/429
-// while many untried healthy accounts remain, while the ceiling still bounds
-// worst-case latency and a stampede on a pathological pool. When the pool can't
-// report a count (nil pool, or a bespoke test pool returning 0), we fall back to
-// the floor — preserving the historical behavior.
+// min(eligibleAccounts, maxFailoverAttempts). When the pool can't report a
+// count (nil pool, or a bespoke test pool returning 0), we fall back to
+// minFailoverAttempts as historical headroom. This avoids retrying the same
+// account when there's only 1 eligible — with 1 account, rotating is
+// meaningless and just wastes latency on retries.
 func (h *Handler) failoverBudget(backend, model string) int {
 	if h.pool == nil {
 		return minFailoverAttempts
 	}
 	eligible := h.pool.EligibleCountForBackendModel(backend, model)
+	if eligible == 0 {
+		return minFailoverAttempts
+	}
 	budget := eligible
 	if budget > maxFailoverAttempts {
 		budget = maxFailoverAttempts
-	}
-	if budget < minFailoverAttempts {
-		budget = minFailoverAttempts
 	}
 	return budget
 }
