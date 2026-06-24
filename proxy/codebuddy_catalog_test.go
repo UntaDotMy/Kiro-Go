@@ -1,8 +1,10 @@
 package proxy
 
 import (
-	"kiro-go/config"
+	"path/filepath"
 	"testing"
+
+	"kiro-go/config"
 )
 
 // TestCodeBuddyCatalogEndpoints locks in the CodeBuddy routing fix.
@@ -83,6 +85,68 @@ func TestBackendShipsStaticCatalog(t *testing.T) {
 		if backendShipsStaticCatalog(b) {
 			t.Errorf("backend %q should NOT be flagged static-only (it has a working /models endpoint)", b)
 		}
+	}
+}
+
+// TestBackendShipsStaticCatalogCustomAccount pins the self-contained custom
+// account case: a user-added account whose backend id is its own routing
+// prefix and whose pinned model list lives INLINE on the account as CustomModels
+// (no shared ProviderConfig, no builtin catalog row). This is the shape of a
+// reseller endpoint like rcodebuddycn -> dpc-tcb.chicross.cn that has no working
+// /models endpoint; the background refresh must skip the live fetch that would
+// always 404 and instead seed directly from CustomModels.
+func TestBackendShipsStaticCatalogCustomAccount(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	const backend = "rcodebuddycn"
+	acct := config.Account{
+		ID:              "acc-rcb",
+		Backend:         backend,
+		Nickname:        backend,
+		CustomDialect:   "openai",
+		BaseURLOverride: "https://dpc-tcb.chicross.cn/api/v2",
+		CustomModels:    []string{"glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "minimax-m3", "kimi-k2.7"},
+		APIKey:          "ck-test",
+		Enabled:         true,
+	}
+	if err := config.AddAccount(acct); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if !backendShipsStaticCatalog(backend) {
+		t.Errorf("custom account backend %q with non-empty CustomModels should be flagged static-only "+
+			"(it has no working /models endpoint; the live fetch 404s every refresh tick)", backend)
+	}
+	// Sanity: the helper sees the 5 pinned models.
+	sib, ok := config.GetCustomAccountByBackend(backend)
+	if !ok || len(sib.CustomModels) != 5 {
+		t.Fatalf("GetCustomAccountByBackend(%q) = (%+v, %v), want 5 CustomModels", backend, sib, ok)
+	}
+}
+
+// TestBackendShipsStaticCatalogCustomAccountNoModels pins the negative: a
+// custom account with NO CustomModels is NOT flagged static-only, because a
+// live /models fetch is the only way to populate its catalog.
+func TestBackendShipsStaticCatalogCustomAccountNoModels(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	const backend = "livegw"
+	acct := config.Account{
+		ID:              "acc-live",
+		Backend:         backend,
+		CustomDialect:   "openai",
+		BaseURLOverride: "https://api.example.com/v1",
+		CustomModels:    nil, // no pinned list -> rely on live /models
+		APIKey:          "sk-test",
+		Enabled:         true,
+	}
+	if err := config.AddAccount(acct); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if backendShipsStaticCatalog(backend) {
+		t.Errorf("custom account backend %q with no CustomModels should NOT be flagged static-only "+
+			"(it needs the live /models fetch to populate its catalog)", backend)
 	}
 }
 
